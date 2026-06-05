@@ -49,6 +49,14 @@ class ContiguousKVCache:
 
         k, v shape: [B, n_kv_heads, S_new, head_dim]
         """
+        if k.dtype != self.spec.k_dtype:
+            raise ValueError(
+                f"k dtype mismatch: {k.dtype} vs spec k_dtype {self.spec.k_dtype}"
+            )
+        if v.dtype != self.spec.v_dtype:
+            raise ValueError(
+                f"v dtype mismatch: {v.dtype} vs spec v_dtype {self.spec.v_dtype}"
+            )
         s_new = k.shape[2]
         end_pos = start_pos + s_new
         if end_pos > self.max_seq:

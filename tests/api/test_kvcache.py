@@ -52,6 +52,21 @@ def test_kvcache_decode_appends():
     assert cache.seq_len == 6
 
 
+def test_kvcache_write_rejects_dtype_mismatch():
+    spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+        ownership=types.CacheOwnership.EXPLICIT_PASS,
+    )
+    cache = kvcache.ContiguousKVCache(spec, batch_size=1, n_kv_heads=2,
+                                      head_dim=4, max_seq=8)
+    k_bad = torch.randn(1, 2, 5, 4, dtype=torch.bfloat16)
+    v_ok = torch.randn(1, 2, 5, 4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="k dtype mismatch"):
+        cache.write(k_bad, v_ok, start_pos=0)
+
+
 def test_kvcache_overflow_raises():
     spec = _make_spec()
     cache = kvcache.ContiguousKVCache(spec, batch_size=1, n_kv_heads=2,
