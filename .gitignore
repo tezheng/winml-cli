@@ -7,6 +7,10 @@ __pycache__/
 .mypy_cache/
 *.safetensors
 *.bin
+*.pt
+*.pth
 hf_cache/
+dist/
+build/
 .coverage
 htmlcov/
