@@ -89,10 +89,21 @@ class Attention(nn.Module):
         cache.write(k, v, start_pos=start_pos)
         k_full, v_full = cache.read(seq_len=start_pos + S)
 
-        is_causal = (S > 1)
         scale = spec.attn_scale if spec.attn_scale is not None else (Dh ** -0.5)
+        # Build an explicit additive causal mask. Query token i has absolute
+        # position (start_pos + i) and may attend to key positions j <= start_pos + i.
+        # `is_causal=True` on SDPA would mis-align here when start_pos > 0 because
+        # it assumes the diagonal at the top-left of [S_q × S_k].
+        T = start_pos + S
+        device = q.device
+        i_idx = torch.arange(S, device=device).unsqueeze(1)        # [S, 1]
+        j_idx = torch.arange(T, device=device).unsqueeze(0)        # [1, T]
+        allowed = j_idx <= (start_pos + i_idx)                     # [S, T]
+        attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
+        attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
         attn_out = ops.sdpa(q, k_full, v_full,
-                            is_causal=is_causal, scale=scale)
+                            attn_mask=attn_mask, scale=scale)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, S, Hq * Dh)
         return self.o_proj(attn_out)

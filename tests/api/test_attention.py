@@ -67,6 +67,68 @@ def test_attention_decode_step_appends_to_cache():
     assert cache.seq_len == 6
 
 
+def test_attention_chunked_prefill_matches_full_prefill():
+    """Chunked prefill (S>1 from start_pos>0) must equal full prefill output for the same range."""
+    spec = _qwen3_like_attention_spec(qk_norm=False)
+    attn = attention.Attention(spec, hidden_size=256, max_seq=32,
+                               dtype=torch.float32)
+    torch.manual_seed(0)
+    B, S_total, D = 1, 6, 256
+    x_full = torch.randn(B, S_total, D)
+    pos_full = torch.arange(S_total)
+
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    # Full prefill: one shot, 6 tokens.
+    cache_full = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_kv_heads, head_dim=spec.head_dim, max_seq=32,
+    )
+    out_full = attn(x_full, position_ids=pos_full, cache=cache_full, start_pos=0)
+
+    # Chunked: prefill first 2 tokens, then 4 tokens as a chunk.
+    cache_chunk = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_kv_heads, head_dim=spec.head_dim, max_seq=32,
+    )
+    _ = attn(x_full[:, :2], position_ids=pos_full[:2], cache=cache_chunk, start_pos=0)
+    out_chunk_tail = attn(x_full[:, 2:], position_ids=pos_full[2:], cache=cache_chunk, start_pos=2)
+    assert torch.allclose(out_full[:, 2:], out_chunk_tail, atol=1e-5)
+
+
+def test_attention_causal_actually_masks_future():
+    """Perturbing token at position T must not change outputs at positions < T."""
+    spec = _qwen3_like_attention_spec(qk_norm=False)
+    attn = attention.Attention(spec, hidden_size=128, max_seq=16,
+                               dtype=torch.float32)
+    torch.manual_seed(0)
+    B, S, D = 1, 5, 128
+    x_a = torch.randn(B, S, D)
+    x_b = x_a.clone()
+    x_b[:, 3] += 100.0  # large perturbation at position 3
+
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_a = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_kv_heads, head_dim=spec.head_dim, max_seq=16,
+    )
+    cache_b = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_kv_heads, head_dim=spec.head_dim, max_seq=16,
+    )
+    out_a = attn(x_a, position_ids=torch.arange(S), cache=cache_a, start_pos=0)
+    out_b = attn(x_b, position_ids=torch.arange(S), cache=cache_b, start_pos=0)
+    # Positions 0..2 should be identical (no leak from position 3).
+    assert torch.allclose(out_a[:, :3], out_b[:, :3], atol=1e-5)
+
+
 def test_attention_causal_mask_for_prefill():
     spec = _qwen3_like_attention_spec(qk_norm=False)
     attn = attention.Attention(spec, hidden_size=256, max_seq=16,
