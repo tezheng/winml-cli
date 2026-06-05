@@ -49,6 +49,19 @@ class Qwen3Config:
             dtype = dt_raw
         else:
             dtype = _TORCH_DTYPE_MAP.get(dt_raw, torch.float32)
+
+        # transformers 5.x nests rope_theta under `rope_parameters`; older flat
+        # `rope_theta` key is still accepted for backward compatibility.
+        if "rope_theta" in hf:
+            rope_theta = float(hf["rope_theta"])
+        elif (
+            isinstance(hf.get("rope_parameters"), dict)
+            and "rope_theta" in hf["rope_parameters"]
+        ):
+            rope_theta = float(hf["rope_parameters"]["rope_theta"])
+        else:
+            rope_theta = 10000.0
+
         return cls(
             hidden_size=hf["hidden_size"],
             num_attention_heads=hf["num_attention_heads"],
@@ -59,7 +72,7 @@ class Qwen3Config:
             ),
             intermediate_size=hf["intermediate_size"],
             num_hidden_layers=hf["num_hidden_layers"],
-            rope_theta=float(hf["rope_theta"]),
+            rope_theta=rope_theta,
             rms_norm_eps=float(hf.get("rms_norm_eps", 1e-6)),
             vocab_size=hf["vocab_size"],
             max_position_embeddings=hf["max_position_embeddings"],
