@@ -138,3 +138,54 @@ def sdpa(
     return F.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
     )
+
+
+def layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Standard LayerNorm. Compute in fp32, return in x's dtype."""
+    orig = x.dtype
+    return F.layer_norm(x.float(), x.shape[-1:], weight.float(),
+                        bias.float(), eps).to(orig)
+
+
+def softmax(x: torch.Tensor, dim: int = -1, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    if dtype is None:
+        return F.softmax(x, dim=dim)
+    return F.softmax(x, dim=dim, dtype=dtype)
+
+
+def top_k(x: torch.Tensor, k: int, dim: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (values, indices). MoE router uses this."""
+    return torch.topk(x, k, dim=dim)
+
+
+def gather(x: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
+    return torch.gather(x, dim, index)
+
+
+def scatter(x: torch.Tensor, dim: int, index: torch.Tensor,
+            src: torch.Tensor) -> torch.Tensor:
+    """Non-in-place scatter — returns a new tensor."""
+    out = x.clone()
+    return out.scatter(dim, index, src)
+
+
+def conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: int = 1,
+    padding: int = 0,
+    groups: int = 1,
+) -> torch.Tensor:
+    """1D conv — Mamba uses this for its causal conv."""
+    return F.conv1d(x, weight, bias=bias, stride=stride, padding=padding, groups=groups)
+
+
+def selective_scan(*args, **kwargs):
+    """Mamba selective-scan op. Lands fully in the M2 SSM batch."""
+    raise NotImplementedError("selective_scan is reserved for the M2 SSM batch")

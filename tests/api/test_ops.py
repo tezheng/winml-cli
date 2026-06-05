@@ -178,3 +178,53 @@ def test_sdpa_custom_scale():
     out = ops.sdpa(q, k, v, is_causal=False, scale=custom_scale)
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=custom_scale)
     assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_layer_norm_matches_torch():
+    x = torch.randn(2, 4, 8, dtype=torch.float32)
+    w = torch.randn(8); b = torch.randn(8)
+    out = ops.layer_norm(x, w, b, 1e-5)
+    ref = F.layer_norm(x, (8,), w, b, 1e-5)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_softmax_matches_torch():
+    x = torch.randn(2, 4, 8)
+    assert torch.allclose(ops.softmax(x, dim=-1), F.softmax(x, dim=-1), atol=1e-6)
+
+
+def test_top_k_returns_values_and_indices():
+    x = torch.tensor([[1.0, 3.0, 2.0, 5.0, 4.0]])
+    vals, idx = ops.top_k(x, k=2)
+    assert torch.equal(vals, torch.tensor([[5.0, 4.0]]))
+    assert torch.equal(idx, torch.tensor([[3, 4]]))
+
+
+def test_gather_works():
+    x = torch.arange(12).reshape(3, 4).float()
+    idx = torch.tensor([[0, 2], [1, 3], [0, 1]])
+    out = ops.gather(x, dim=1, index=idx)
+    assert torch.equal(out, torch.tensor([[0., 2.], [5., 7.], [8., 9.]]))
+
+
+def test_scatter_returns_new_tensor():
+    x = torch.zeros(2, 4)
+    idx = torch.tensor([[0, 2], [1, 3]])
+    src = torch.tensor([[10., 20.], [30., 40.]])
+    out = ops.scatter(x, dim=1, index=idx, src=src)
+    assert torch.equal(out, torch.tensor([[10., 0., 20., 0.], [0., 30., 0., 40.]]))
+    # Input is unchanged.
+    assert torch.equal(x, torch.zeros(2, 4))
+
+
+def test_conv1d_matches_torch():
+    x = torch.randn(1, 4, 16)        # [B, C_in, L]
+    w = torch.randn(4, 4, 3)         # [C_out, C_in / groups, K]
+    out = ops.conv1d(x, w, padding=1)
+    ref = F.conv1d(x, w, padding=1)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_selective_scan_raises_until_m2():
+    with pytest.raises(NotImplementedError, match="M2"):
+        ops.selective_scan()
