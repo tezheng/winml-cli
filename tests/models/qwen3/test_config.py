@@ -28,6 +28,32 @@ def test_qwen3_config_from_hf_dict():
     assert c.tie_word_embeddings is True
 
 
+def test_qwen3_config_handles_dtype_key():
+    """transformers 5.x emits 'dtype', not 'torch_dtype' — must handle both."""
+    hf = {
+        "hidden_size": 1024, "num_attention_heads": 16, "num_key_value_heads": 8,
+        "head_dim": 128, "intermediate_size": 3072, "num_hidden_layers": 28,
+        "rope_theta": 1_000_000.0, "rms_norm_eps": 1e-6,
+        "vocab_size": 151936, "max_position_embeddings": 32768,
+        "tie_word_embeddings": True, "dtype": "bfloat16",   # 5.x key
+    }
+    c = config.Qwen3Config.from_hf_dict(hf)
+    assert c.dtype == torch.bfloat16
+
+
+def test_qwen3_config_legacy_torch_dtype_key_still_works():
+    """Backward compat: old configs that have torch_dtype still work."""
+    hf = {
+        "hidden_size": 1024, "num_attention_heads": 16, "num_key_value_heads": 8,
+        "head_dim": 128, "intermediate_size": 3072, "num_hidden_layers": 28,
+        "rope_theta": 1_000_000.0, "rms_norm_eps": 1e-6,
+        "vocab_size": 151936, "max_position_embeddings": 32768,
+        "tie_word_embeddings": True, "torch_dtype": "bfloat16",  # 4.x key
+    }
+    c = config.Qwen3Config.from_hf_dict(hf)
+    assert c.dtype == torch.bfloat16
+
+
 def test_qwen3_config_to_block_spec():
     c = config.Qwen3Config(
         hidden_size=1024, num_attention_heads=16, num_key_value_heads=8,

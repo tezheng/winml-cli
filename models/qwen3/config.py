@@ -44,7 +44,7 @@ class Qwen3Config:
 
     @classmethod
     def from_hf_dict(cls, hf: dict) -> "Qwen3Config":
-        dt_raw = hf.get("torch_dtype", "float32")
+        dt_raw = hf.get("dtype", hf.get("torch_dtype", "float32"))
         if isinstance(dt_raw, torch.dtype):
             dtype = dt_raw
         else:
