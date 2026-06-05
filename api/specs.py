@@ -3,8 +3,8 @@
 No behaviour — pure data. Behaviour lives in api/{norm,rope,attention,...}.py.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
