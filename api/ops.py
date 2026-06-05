@@ -33,3 +33,50 @@ def linear(x: torch.Tensor, weight: torch.Tensor,
            bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Standard linear; quantization is handled in api.quant via wrapper modules."""
     return F.linear(x, weight, bias)
+
+
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    mode: str = "standard_w",
+) -> torch.Tensor:
+    """RMSNorm with optional Gemma 1+w mode.
+
+    Compute in fp32 for numerical stability, return in x's dtype.
+    """
+    if mode not in ("standard_w", "one_plus_w"):
+        raise ValueError(f"unknown mode: {mode!r}")
+    orig_dtype = x.dtype
+    x32 = x.float()
+    variance = x32.pow(2).mean(-1, keepdim=True)
+    x_normed = x32 * torch.rsqrt(variance + eps)
+    w = weight.float()
+    if mode == "one_plus_w":
+        w = 1.0 + w
+    return (x_normed * w).to(orig_dtype)
+
+
+def embed(
+    ids: torch.Tensor,
+    weight: torch.Tensor,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    out = F.embedding(ids, weight)
+    if scale is not None:
+        out = out * scale
+    return out
+
+
+def lm_head(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: Optional[float] = None,
+    softcap: Optional[float] = None,
+) -> torch.Tensor:
+    logits = F.linear(x, weight)
+    if scale is not None:
+        logits = logits * scale
+    if softcap is not None:
+        logits = softcap * torch.tanh(logits / softcap)
+    return logits
