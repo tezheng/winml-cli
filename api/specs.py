@@ -98,6 +98,69 @@ class KVCacheSpec:
 
 
 @dataclass(frozen=True)
+class ConvSpec:
+    """1D causal conv (Mamba)."""
+    kernel_size: int
+    bias: bool = True
+    activation: Optional[types.Activation] = None
+
+
+@dataclass(frozen=True)
+class SSMSpec:
+    """Mamba-1 SSM (state-space) parameters."""
+    d_state: int
+    d_conv: int
+    d_inner: int
+    expand_factor: int = 2
+    dt_rank: int = -1                  # -1 means "auto" (= hidden // 16)
+    dt_min: float = 0.001
+    dt_max: float = 0.1
+    dt_init_floor: float = 1e-4
+    conv_bias: bool = True
+    bias: bool = False
+    use_fast_path: bool = True
+
+
+@dataclass(frozen=True)
+class SSDSpec:
+    """Mamba-2 SSD form. Composition over SSMSpec via base; not inheritance, to keep frozen semantics clean."""
+    base: SSMSpec
+    chunk_size: int = 256
+    headdim: int = 64
+    ngroups: int = 1
+
+
+@dataclass(frozen=True)
+class GroupRoutingSpec:
+    """DeepSeek-V3 group-limited routing."""
+    n_groups: int
+    topk_per_group: int
+    routed_expert_grouping: bool = True
+
+
+@dataclass(frozen=True)
+class MoESpec:
+    """MoE channel mixer."""
+    n_experts: int
+    top_k: int
+    n_shared_experts: int = 0
+    router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias"
+    router_norm: bool = False
+    score_correction_bias: bool = False
+    group_routing: Optional[GroupRoutingSpec] = None
+    routed_scaling_factor: float = 1.0
+    expert_ffn: Optional[FFNSpec] = None
+
+
+@dataclass(frozen=True)
+class LayerScaleSpec:
+    """OpenELM-style per-layer scaling - list of overrides indexed by layer."""
+    num_q_heads_per_layer: tuple[int, ...]
+    num_kv_heads_per_layer: tuple[int, ...]
+    ffn_multipliers_per_layer: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class DecoderBlockSpec:
     attn_norm_position: types.NormPosition
     ffn_norm_position: types.NormPosition

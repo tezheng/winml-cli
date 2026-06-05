@@ -58,6 +58,32 @@ def test_quant_spec_awq():
     assert spec.codebook is None
 
 
+def test_new_specs_frozen_and_default_consistent():
+    """The 6 newly-added specs are reserved for M2 batches but must instantiate cleanly today."""
+    conv = specs.ConvSpec(kernel_size=4)
+    assert conv.bias is True
+    ssm = specs.SSMSpec(d_state=16, d_conv=4, d_inner=64)
+    assert ssm.dt_rank == -1
+    ssd = specs.SSDSpec(base=ssm)
+    assert ssd.chunk_size == 256
+    group = specs.GroupRoutingSpec(n_groups=8, topk_per_group=2)
+    moe = specs.MoESpec(n_experts=8, top_k=2, group_routing=group)
+    assert moe.router_kind == "softmax"
+    ls = specs.LayerScaleSpec(
+        num_q_heads_per_layer=(16,) * 28,
+        num_kv_heads_per_layer=(8,) * 28,
+        ffn_multipliers_per_layer=(1.0,) * 28,
+    )
+    assert len(ls.num_q_heads_per_layer) == 28
+
+
+def test_new_specs_are_frozen():
+    import dataclasses as _dc
+    conv = specs.ConvSpec(kernel_size=4)
+    with pytest.raises(_dc.FrozenInstanceError):
+        conv.kernel_size = 6  # type: ignore
+
+
 def test_decoder_block_spec_composition():
     norm = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
                           weight_mode=types.NormWeightMode.STANDARD_W)
