@@ -9,10 +9,10 @@ Layer index dispatch:
   model-assembly layer (out of scope for B0.5); the layer factory itself is
   unaware of sharing - the cache instance dispatches.
 
-Weight-loader contract: at load time we absorb the Gemma 4 QK fixed-scale and
-1/sqrt(Dh) into the ONE_PLUS_W norm weight so that the runtime attention path
-keeps effective_scale=1.0 (no per-step rescale needed). This matches
-api.attention.Attention's contract when AttentionSpec.qk_norm_fixed_scale is set.
+Weight-loader contract (B0.6 correction): weights load straight from HF, no
+absorb. HF Gemma 4 attention sets `self.scaling = 1.0` and the QK norms are
+plain STANDARD_W RMSNorm (no fixed scale). Speculative qk_norm_fixed_scale
+absorption from B0.5 has been removed.
 """
 from __future__ import annotations
 from typing import Optional
@@ -66,28 +66,15 @@ def load_hf_gemma4_layer(
       model.layers.{i}.mlp.up_proj.weight
       model.layers.{i}.mlp.down_proj.weight
 
-    QK-norm fixed-scale absorption (Gemma 4 specific):
-    - HF Gemma 4 QKNorm uses RMSNorm with ONE_PLUS_W weight mode, with a
-      multiplicative fixed scale (~0.99 local / ~1.02 global) applied OUTSIDE
-      the norm, AND attention then divides by sqrt(Dh).
-    - To collapse all this into a single weight gain at load time we set
-      effective_gain = (1 + w_on_disk) * fixed_scale * sqrt(Dh)
-      and write back w_new = effective_gain - 1 (ONE_PLUS_W mode).
-    - The runtime attention path then sets effective_scale = 1.0 (no /sqrt(Dh))
-      and skips the fixed-scale multiplication.
+    B0.6 correction: HF Gemma 4 attention (`modeling_gemma4.py:1195`) sets
+    `self.scaling = 1.0` and the QK norms are vanilla STANDARD_W RMSNorm —
+    no fixed scale, no `1 +` term, no absorb. All QK-norm weights load
+    straight from the HF state dict.
     """
     prefix = f"model.layers.{layer_idx}."
 
-    is_global = cfg.is_global_layer(layer_idx)
-    head_dim_eff = cfg.global_head_dim if is_global else cfg.head_dim
-    fixed_scale = (cfg.qk_norm_global_fixed_scale if is_global
-                   else cfg.qk_norm_local_fixed_scale)
-
-    # absorb = fixed_scale / (1/sqrt(Dh)) = fixed_scale * sqrt(Dh)
-    absorb = fixed_scale * (head_dim_eff ** 0.5)
-
-    # Build the explicit HF-name -> tensor slot mapping (excluding QK-norm,
-    # which gets the absorb transform).
+    # Build the explicit HF-name -> tensor slot mapping. Every tensor (incl.
+    # q_norm/k_norm) loads straight — no absorb.
     mapping = {
         prefix + "input_layernorm.weight":             blk.pre_attn_norm.weight,
         prefix + "post_attention_layernorm.weight":    blk.post_attn_sublayer_norm.weight,
@@ -103,6 +90,9 @@ def load_hf_gemma4_layer(
     # v_proj is absent only when this layer aliases V := K (12B+ global only).
     if blk.attention.v_proj is not None:
         mapping[prefix + "self_attn.v_proj.weight"] = blk.attention.v_proj.weight
+    if blk.attention.q_norm is not None:
+        mapping[prefix + "self_attn.q_norm.weight"] = blk.attention.q_norm.weight
+        mapping[prefix + "self_attn.k_norm.weight"] = blk.attention.k_norm.weight
 
     missing = [k for k in mapping if k not in hf_state_dict]
     if missing:
@@ -116,16 +106,3 @@ def load_hf_gemma4_layer(
                     f"shape mismatch for {hf_name}: src {src.shape} vs slot {slot.shape}"
                 )
             slot.copy_(src.to(slot.dtype))
-
-        # QK norms: absorb fixed_scale * sqrt(Dh) into ONE_PLUS_W weight.
-        # On disk Gemma stores `w` such that gain = (1 + w). We want effective
-        # gain = (1 + w_on_disk) * absorb, so the stored w_new = (1+w)*absorb - 1.
-        if blk.attention.q_norm is not None:
-            q_key = prefix + "self_attn.q_norm.weight"
-            k_key = prefix + "self_attn.k_norm.weight"
-            if q_key not in hf_state_dict or k_key not in hf_state_dict:
-                raise KeyError(f"missing QK-norm weights: {q_key} or {k_key}")
-            learned_q = hf_state_dict[q_key].to(blk.attention.q_norm.weight.dtype)
-            learned_k = hf_state_dict[k_key].to(blk.attention.k_norm.weight.dtype)
-            blk.attention.q_norm.weight.copy_((learned_q + 1.0) * absorb - 1.0)
-            blk.attention.k_norm.weight.copy_((learned_k + 1.0) * absorb - 1.0)

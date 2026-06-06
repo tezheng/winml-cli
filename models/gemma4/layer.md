@@ -39,8 +39,9 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
             |    |                              global: theta=1e6, partial=0.25)
             |    +-- KVCache write/read         (local: ContiguousKVCache + SWA mask
             |    |                              shared layers: SharedLayerKVCache)
-            |    +-- SDPA                       (effective_scale=1.0; SWA mask on
-            |    |                              local, full causal on global)
+            |    +-- SDPA                       (attn_scale=1.0 — HF runtime
+            |    |                              `self.scaling = 1.0`, no /sqrt(Dh);
+            |    |                              SWA mask on local, full causal on global)
             |    +-- o_proj                     (no bias)
             |           |
             |    post_attn_sublayer_norm (RMSNorm STANDARD_W)
@@ -166,7 +167,8 @@ DecoderBlockSpec(
                          weight_mode=NormWeightMode.STANDARD_W),
         qk_norm_phase=QKNormPhase.PRE_ROPE,
         qk_norm_shape=QKNormShape.PER_HEAD_DH,
-        qk_norm_fixed_scale=0.9916,           # local
+        qk_norm_fixed_scale=None,             # B0.6: no absorb on Gemma 4
+        attn_scale=1.0,                       # B0.6: HF runtime scaling = 1.0
         attention_k_eq_v=False,
         rope=RoPESpec(base_theta=10_000.0,
                       basis=RoPEBasis.SPLIT_HALF,
@@ -194,7 +196,8 @@ token_mixer=AttentionSpec(
     head_dim=512,                              # global_head_dim (E2B-only doubling)
     mask_kind=MaskKind.CAUSAL,
     sliding_window=None,
-    qk_norm_fixed_scale=1.0228,                # global
+    qk_norm_fixed_scale=None,                  # B0.6: no absorb (unchanged from local)
+    attn_scale=1.0,                            # B0.6 (unchanged from local)
     attention_k_eq_v=False,                    # would be True on 12B/26B/31B; E2B has split K/V
     rope=RoPESpec(base_theta=1_000_000.0,
                   basis=RoPEBasis.SPLIT_HALF,
@@ -272,8 +275,8 @@ For decoder layer L of an HF-format Gemma 4 checkpoint:
 | `model.layers.{L}.self_attn.k_proj.weight` | `blk.attention.k_proj.weight` | shape [Hk*Dh_eff, D] |
 | `model.layers.{L}.self_attn.v_proj.weight` | `blk.attention.v_proj.weight` | absent on 12B+ global (K=V) |
 | `model.layers.{L}.self_attn.o_proj.weight` | `blk.attention.o_proj.weight` | shape [D, Hq*Dh_eff] |
-| `model.layers.{L}.self_attn.q_norm.weight` | `blk.attention.q_norm.weight` | absorb: `(1+w)*fixed*sqrt(Dh) - 1` |
-| `model.layers.{L}.self_attn.k_norm.weight` | `blk.attention.k_norm.weight` | absorb: `(1+w)*fixed*sqrt(Dh) - 1` |
+| `model.layers.{L}.self_attn.q_norm.weight` | `blk.attention.q_norm.weight` | load straight (STANDARD_W RMSNorm, no absorb) |
+| `model.layers.{L}.self_attn.k_norm.weight` | `blk.attention.k_norm.weight` | load straight (STANDARD_W RMSNorm, no absorb) |
 | `model.layers.{L}.post_attention_layernorm.weight` | `blk.post_attn_sublayer_norm.weight` | post-attn (sandwich) |
 | `model.layers.{L}.pre_feedforward_layernorm.weight` | `blk.pre_ffn_norm.weight` | pre-FFN |
 | `model.layers.{L}.post_feedforward_layernorm.weight` | `blk.post_ffn_sublayer_norm.weight` | post-FFN (sandwich) |
@@ -282,9 +285,10 @@ For decoder layer L of an HF-format Gemma 4 checkpoint:
 | `model.layers.{L}.mlp.down_proj.weight` | `blk.feedforward.down_proj.weight` | GeGLU down |
 
 `Dh_eff = global_head_dim` on global layers (E2B: 512), else local `head_dim`
-(E2B: 256). `fixed = qk_norm_global_fixed_scale` on global layers else
-`qk_norm_local_fixed_scale`. The loader function `load_hf_gemma4_layer`
-performs the absorb arithmetic before `copy_` on the QK-norm weights.
+(E2B: 256). The loader function `load_hf_gemma4_layer` copies all tensors
+straight from the HF state dict — there is no absorb arithmetic (per B0.6
+correction; HF Gemma 4 attention has `self.scaling = 1.0` and plain
+STANDARD_W QK norms with no fixed scale).
 
 Model-level tensors (NOT loaded by `load_hf_gemma4_layer` — owned by the
 model assembly):

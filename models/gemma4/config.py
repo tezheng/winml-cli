@@ -122,8 +122,12 @@ class Gemma4Config:
         is_global = self.is_global_layer(layer_idx)
         head_dim_eff = self.global_head_dim if is_global else self.head_dim
         attention_k_eq_v_eff = self.attention_k_eq_v and is_global
-        qk_fixed = (self.qk_norm_global_fixed_scale if is_global
-                    else self.qk_norm_local_fixed_scale)
+        # B0.6: drop the speculative qk_norm_fixed_scale absorption. HF Gemma 4
+        # attention (`modeling_gemma4.py:1195`) sets `self.scaling = 1.0` and
+        # the QK norms are plain Gemma4RMSNorm (no fixed-scale gain). The B0.5
+        # IR baked sqrt(Dh) * fixed_scale into the QK weight at load time; that
+        # absorb is being removed in commit 6 (weight loader). Here we surface
+        # the spec change.
         rope_theta_eff = self.rope_theta_global if is_global else self.rope_theta_local
         partial_eff = self.partial_rotary_factor_global if is_global else 1.0
         mask_eff = types.MaskKind.CAUSAL if is_global else types.MaskKind.SWA
@@ -149,7 +153,8 @@ class Gemma4Config:
             qk_norm=qk_norm_spec,
             qk_norm_phase=types.QKNormPhase.PRE_ROPE,
             qk_norm_shape=types.QKNormShape.PER_HEAD_DH,
-            qk_norm_fixed_scale=qk_fixed,
+            qk_norm_fixed_scale=None,            # B0.6: no absorb — HF scaling = 1.0
+            attn_scale=1.0,                      # explicit 1.0 instead of 1/sqrt(Dh)
             attention_k_eq_v=attention_k_eq_v_eff,
             rope=specs.RoPESpec(
                 base_theta=rope_theta_eff,

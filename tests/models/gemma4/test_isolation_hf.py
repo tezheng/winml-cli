@@ -197,21 +197,20 @@ def test_gemma4_config_norm_weight_mode_matches_hf():
     assert block_spec.token_mixer.qk_norm.weight_mode == types.NormWeightMode.STANDARD_W
 
 
-@pytest.mark.xfail(
-    reason="B0.5 IR drift: Gemma 4 attention has NO qk_norm_fixed_scale absorption "
-    "in the HF source — `self.scaling = 1.0` is the only scale and the QK norms "
-    "have plain unit-init weights. The fixed-scale absorption pathway in B0.5 "
-    "Attention.effective_scale was based on pre-release speculation; the IR "
-    "should set qk_norm_fixed_scale=None and attn_scale=1.0 directly.",
-    strict=True,
-)
-def test_gemma4_no_qk_fixed_scale_matches_hf_xfail():
-    """HF Gemma 4 attention scaling is just 1.0 — no fixed_scale on QK norms."""
+def test_gemma4_no_qk_fixed_scale_matches_hf():
+    """B0.6 fixed: HF Gemma 4 attention scaling is 1.0 — no fixed_scale on QK
+    norms. Per modeling_gemma4.py:1195 (`self.scaling = 1.0`) and the QK norms
+    are plain Gemma4RMSNorm (eps, with_scale=True) at modeling_gemma4.py:1210/1214.
+    """
     from models.gemma4 import config as gemma4_config
 
     cfg = _smallified_for_norm_check()
     block_spec = cfg.to_block_spec(layer_idx=0)
     assert block_spec.token_mixer.qk_norm_fixed_scale is None
+    assert block_spec.token_mixer.attn_scale == 1.0
+    block_spec_g = cfg.to_block_spec(layer_idx=4)
+    assert block_spec_g.token_mixer.qk_norm_fixed_scale is None
+    assert block_spec_g.token_mixer.attn_scale == 1.0
 
 
 @pytest.mark.xfail(

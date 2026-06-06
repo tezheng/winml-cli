@@ -1,5 +1,3 @@
-import math
-
 import torch
 
 from api import kvcache, specs, types
@@ -49,45 +47,37 @@ def test_weight_loader_round_trip_random_state_dict_global_layer():
     assert out.shape == (1, 3, cfg.hidden_size)
 
 
-def test_weight_loader_qk_norm_absorb_math_local():
-    """The loader must store w_new = (1 + w_disk) * fixed_scale * sqrt(Dh) - 1."""
+def test_weight_loader_qk_norm_loads_straight_local():
+    """B0.6: QK-norm weights load straight from HF — no absorb.
+
+    Pre-B0.6 the loader baked `(1 + w) * fixed_scale * sqrt(Dh) - 1` into the
+    weight to absorb the attention scale. HF Gemma 4 has no fixed scale and
+    runtime scaling = 1.0 (modeling_gemma4.py:1195), so the weight loads as-is.
+    """
     cfg = _smallified()
     blk = gemma4_layer.build_gemma4_decoder_layer(cfg, layer_idx=0)  # local
     sd = _random_state_dict(cfg, layer_idx=0, is_global=False)
-    # Set known w_disk: pick all-zeros (so effective gain pre-absorb = 1.0)
-    sd[f"model.layers.0.self_attn.q_norm.weight"] = torch.zeros(cfg.head_dim)
-    sd[f"model.layers.0.self_attn.k_norm.weight"] = torch.zeros(cfg.head_dim)
+    expected_q = torch.randn(cfg.head_dim)
+    expected_k = torch.randn(cfg.head_dim)
+    sd[f"model.layers.0.self_attn.q_norm.weight"] = expected_q.clone()
+    sd[f"model.layers.0.self_attn.k_norm.weight"] = expected_k.clone()
     gemma4_layer.load_hf_gemma4_layer(blk, sd, layer_idx=0, cfg=cfg)
-    expected_absorb = cfg.qk_norm_local_fixed_scale * math.sqrt(cfg.head_dim)
-    # After absorb: w_new = (1 + 0) * absorb - 1 = absorb - 1
-    expected_w = expected_absorb - 1.0
-    assert torch.allclose(
-        blk.attention.q_norm.weight,
-        torch.full_like(blk.attention.q_norm.weight, expected_w),
-        atol=1e-6,
-    )
-    assert torch.allclose(
-        blk.attention.k_norm.weight,
-        torch.full_like(blk.attention.k_norm.weight, expected_w),
-        atol=1e-6,
-    )
+    assert torch.allclose(blk.attention.q_norm.weight, expected_q, atol=1e-6)
+    assert torch.allclose(blk.attention.k_norm.weight, expected_k, atol=1e-6)
 
 
-def test_weight_loader_qk_norm_absorb_math_global():
-    """Global layer uses global_head_dim and the global fixed_scale."""
+def test_weight_loader_qk_norm_loads_straight_global():
+    """Global layer also loads QK-norm straight (Dh=global_head_dim)."""
     cfg = _smallified()
     blk = gemma4_layer.build_gemma4_decoder_layer(cfg, layer_idx=4)  # global
     sd = _random_state_dict(cfg, layer_idx=4, is_global=True)
-    sd[f"model.layers.4.self_attn.q_norm.weight"] = torch.zeros(cfg.global_head_dim)
-    sd[f"model.layers.4.self_attn.k_norm.weight"] = torch.zeros(cfg.global_head_dim)
+    expected_q = torch.randn(cfg.global_head_dim)
+    expected_k = torch.randn(cfg.global_head_dim)
+    sd[f"model.layers.4.self_attn.q_norm.weight"] = expected_q.clone()
+    sd[f"model.layers.4.self_attn.k_norm.weight"] = expected_k.clone()
     gemma4_layer.load_hf_gemma4_layer(blk, sd, layer_idx=4, cfg=cfg)
-    expected_absorb = cfg.qk_norm_global_fixed_scale * math.sqrt(cfg.global_head_dim)
-    expected_w = expected_absorb - 1.0
-    assert torch.allclose(
-        blk.attention.q_norm.weight,
-        torch.full_like(blk.attention.q_norm.weight, expected_w),
-        atol=1e-6,
-    )
+    assert torch.allclose(blk.attention.q_norm.weight, expected_q, atol=1e-6)
+    assert torch.allclose(blk.attention.k_norm.weight, expected_k, atol=1e-6)
 
 
 def _smallified():
