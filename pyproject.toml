@@ -40,3 +40,6 @@ warn_return_any = true
 testpaths = ["tests"]
 python_files = "test_*.py"
 addopts = "-ra"
+markers = [
+    "gate: HF numerical-equivalence gate test (requires HF weights, skip-friendly).",
+]
