@@ -1,8 +1,23 @@
 """DecoderBlock — assembles token mixer + channel mixer with residual structure.
 
 M1 supports PRE-norm (Qwen3 / Llama default). B0.5 adds PRE_AND_POST (sandwich
-norm — Gemma 2/3/4) and an optional `per_layer_residual` argument carrying the
-PLE injection at each layer.
+norm — Gemma 2/3/4).
+
+B0.6 adds the Gemma 4 PLE-at-END injection: when `spec.per_layer_embedding`
+is set, after the FFN residual add we apply:
+    residual_pe = x
+    x = per_layer_input_gate(x)         # Linear hidden → ple_dim
+    x = gelu_pytorch_tanh(x)
+    x = x * per_layer_input             # broadcast multiply
+    x = per_layer_projection(x)         # Linear ple_dim → hidden
+    x = post_per_layer_input_norm(x)    # RMSNorm
+    x = residual_pe + x
+Finally we apply a per-layer scalar buffer `layer_scalar` (initialised to 1.0,
+loaded from state dict): `x = x * layer_scalar`.
+
+Verified against `modeling_gemma4.py:1382` (layer_scalar buffer),
+`modeling_gemma4.py:1384-1389` (PLE module init), and
+`modeling_gemma4.py:1446-1455` (forward PLE+layer_scalar block).
 """
 from __future__ import annotations
 from typing import Optional
@@ -73,14 +88,52 @@ class DecoderBlock(nn.Module):
         self.feedforward = feedforward.FeedForward(spec.channel_mixer, hidden_size,
                                                    dtype=dtype)
 
+        # B0.6: Per-Layer Embedding AT-END injection (Gemma 4 E2B/E4B).
+        # When `spec.per_layer_embedding` is set, the block owns 3 extra tensors:
+        # - per_layer_input_gate: Linear(hidden → ple_dim)
+        # - per_layer_projection: Linear(ple_dim → hidden)
+        # - post_per_layer_input_norm: RMSNorm(hidden)
+        # plus a `layer_scalar` buffer of shape [1], multiplied as the final
+        # output regardless of whether PLE is on or off (per HF — it's
+        # initialised to ones and loaded from the state dict).
+        self.per_layer_input_gate: Optional[nn.Linear] = None
+        self.per_layer_projection: Optional[nn.Linear] = None
+        self.post_per_layer_input_norm: Optional[norm.RMSNorm] = None
+        if spec.per_layer_embedding is not None:
+            ple = spec.per_layer_embedding
+            self.per_layer_input_gate = nn.Linear(
+                hidden_size, ple.ple_dim, bias=False, dtype=dtype,
+            )
+            self.per_layer_projection = nn.Linear(
+                ple.ple_dim, hidden_size, bias=False, dtype=dtype,
+            )
+            self.post_per_layer_input_norm = norm.RMSNorm(
+                ple.injection_norm, hidden_size, dtype=dtype,
+            )
+        # layer_scalar: HF registers it on EVERY Gemma 4 decoder layer
+        # (modeling_gemma4.py:1382), even when PLE is disabled. Default 1.
+        self.register_buffer(
+            "layer_scalar", torch.ones(1, dtype=dtype), persistent=True,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
         cache: kvcache.ContiguousKVCache,
         start_pos: int,
-        per_layer_residual: Optional[torch.Tensor] = None,
+        per_layer_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Forward.
+
+        Args:
+            x: [B, S, hidden_size]
+            per_layer_input: optional [B, S, ple_dim] tensor. When the block
+                was built with `spec.per_layer_embedding` set, this is the
+                PLE table lookup for the current layer; it is REQUIRED to be
+                non-None (HF accepts None, with zero-fill semantics in our
+                tests handled at the call site).
+        """
         # Attention sublayer
         attn_in = self.pre_attn_norm(x)
         attn_out = self.attention(attn_in, position_ids=position_ids,
@@ -96,7 +149,17 @@ class DecoderBlock(nn.Module):
             ffn_out = self.post_ffn_sublayer_norm(ffn_out)
         x = ops.add(x, ffn_out)
 
-        # PLE residual injection (Gemma 4) — supplied by the model assembly
-        if per_layer_residual is not None:
-            x = ops.add(x, per_layer_residual)
+        # B0.6: PLE injection AT END (Gemma 4 only). Mirror modeling_gemma4.py:1446-1453.
+        if self.per_layer_input_gate is not None and per_layer_input is not None:
+            residual = x
+            gated = self.per_layer_input_gate(x)
+            gated = ops.gelu_pytorch_tanh(gated)
+            gated = ops.mul(gated, per_layer_input)
+            gated = self.per_layer_projection(gated)
+            gated = self.post_per_layer_input_norm(gated)
+            x = ops.add(residual, gated)
+
+        # B0.6: trailing per-layer scalar multiply (HF modeling_gemma4.py:1455).
+        # Applied to EVERY layer regardless of PLE.
+        x = x * self.layer_scalar
         return x
