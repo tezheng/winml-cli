@@ -74,3 +74,36 @@ def test_kvcache_overflow_raises():
     k = torch.randn(1, 2, 5, 4); v = torch.randn(1, 2, 5, 4)
     with pytest.raises(ValueError, match="exceeds max_seq"):
         cache.write(k, v, start_pos=0)
+
+
+def test_shared_layer_kv_cache_aliases_source():
+    """Gemma 4 E2B: layer i with i in shared range reads K/V from layer kv_source_idx[i]."""
+    spec_base = _make_spec()
+    source = kvcache.ContiguousKVCache(spec_base, batch_size=1, n_kv_heads=2,
+                                       head_dim=4, max_seq=8)
+    k = torch.randn(1, 2, 5, 4); v = torch.randn(1, 2, 5, 4)
+    source.write(k, v, start_pos=0)
+
+    shared = kvcache.SharedLayerKVCache(source_cache=source)
+    k_out, v_out = shared.read(seq_len=5)
+    assert torch.allclose(k_out, k)
+    assert torch.allclose(v_out, v)
+    assert shared.seq_len == 5
+
+
+def test_shared_layer_kv_cache_write_is_noop():
+    """Writes to a shared cache do NOT modify the source — the writing layer's K/V
+    is computed but discarded (Gemma 4 shared-layer behavior: just consume the source)."""
+    spec_base = _make_spec()
+    source = kvcache.ContiguousKVCache(spec_base, batch_size=1, n_kv_heads=2,
+                                       head_dim=4, max_seq=8)
+    k_src = torch.randn(1, 2, 3, 4); v_src = torch.randn(1, 2, 3, 4)
+    source.write(k_src, v_src, start_pos=0)
+
+    shared = kvcache.SharedLayerKVCache(source_cache=source)
+    k_new = torch.randn(1, 2, 1, 4); v_new = torch.randn(1, 2, 1, 4)
+    shared.write(k_new, v_new, start_pos=3)  # should be no-op
+
+    k_out, v_out = source.read(seq_len=3)
+    assert torch.allclose(k_out, k_src)  # source unchanged
+    assert torch.allclose(v_out, v_src)

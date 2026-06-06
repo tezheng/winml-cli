@@ -72,3 +72,40 @@ class ContiguousKVCache:
 
     def reset(self) -> None:
         self.seq_len = 0
+
+
+class SharedLayerKVCache:
+    """A read-only alias to another layer's ContiguousKVCache.
+
+    Used by Gemma 4 E2B/E4B layers that reuse a prior same-type layer's K/V.
+    `write` is a no-op for the shared layer because the K/V tensors it
+    *would* have produced are discarded — the source cache is shared.
+
+    For correctness, the source cache must have been written to before this
+    layer's forward (i.e. the source layer must be earlier in the decoder
+    stack).
+    """
+
+    def __init__(self, source_cache: "ContiguousKVCache"):
+        self.source = source_cache
+        # Mirror attributes the attention block reads
+        self.spec = source_cache.spec
+        self.k = source_cache.k
+        self.v = source_cache.v
+
+    @property
+    def seq_len(self) -> int:
+        return self.source.seq_len
+
+    def write(self, k, v, start_pos):
+        # No-op: the source layer is responsible for filling the cache.
+        # We do not validate shapes here — the attention block still computes
+        # its own K/V tensors but discards them.
+        return
+
+    def read(self, seq_len):
+        return self.source.read(seq_len)
+
+    def reset(self):
+        # Resetting the shared cache is also a no-op (the source owns the buffer).
+        return
