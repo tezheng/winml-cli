@@ -129,9 +129,13 @@ class Gemma4Config:
         mask_eff = types.MaskKind.CAUSAL if is_global else types.MaskKind.SWA
         sw_eff = None if is_global else self.sliding_window
 
+        # Gemma 4 RMSNorm uses STANDARD_W (y = x_normed * w), NOT the Gemma 1/2/3
+        # ONE_PLUS_W mode. Verified against transformers
+        # `modeling_gemma4.py:193-211` (Gemma4RMSNorm.forward) which applies
+        # `normed_output * self.weight` with no `1 +` term.
         norm_spec = specs.NormSpec(
             kind=types.NormKind.RMS, eps=self.rms_norm_eps,
-            weight_mode=types.NormWeightMode.ONE_PLUS_W,
+            weight_mode=types.NormWeightMode.STANDARD_W,
         )
         qk_norm_spec = norm_spec
         attn = specs.AttentionSpec(

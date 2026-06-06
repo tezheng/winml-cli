@@ -27,13 +27,14 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
                   |
             +-----+-----+
             |           |
-            |    pre_attn_norm (RMSNorm ONE_PLUS_W)
+            |    pre_attn_norm (RMSNorm STANDARD_W)
             |           |
             |    attention(token_mixer)
             |    +-- q_proj, k_proj, v_proj    (split QKV, no bias)
             |    +-- q_norm, k_norm            (QKNorm PRE-RoPE, PER_HEAD_DH,
-            |    |                              ONE_PLUS_W; fixed-scale absorbed
-            |    |                              into weight at load time)
+            |    |                              STANDARD_W; no fixed-scale absorption
+            |    |                              - HF Gemma 4 attention uses runtime
+            |    |                              scaling = 1.0 directly)
             |    +-- RoPE                       (local: theta=1e4, partial=1.0
             |    |                              global: theta=1e6, partial=0.25)
             |    +-- KVCache write/read         (local: ContiguousKVCache + SWA mask
@@ -42,13 +43,13 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
             |    |                              local, full causal on global)
             |    +-- o_proj                     (no bias)
             |           |
-            |    post_attn_sublayer_norm (RMSNorm ONE_PLUS_W)
+            |    post_attn_sublayer_norm (RMSNorm STANDARD_W)
             |           |
             +-----> add (residual 1)
                   |
             +-----+-----+
             |           |
-            |    pre_ffn_norm (RMSNorm ONE_PLUS_W)
+            |    pre_ffn_norm (RMSNorm STANDARD_W)
             |           |
             |    feedforward(channel_mixer)
             |    +-- gate_proj                  (GeGLU gate, no bias)
@@ -56,7 +57,7 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
             |    +-- gelu_pytorch_tanh(gate) * up
             |    +-- down_proj                  (no bias)
             |           |
-            |    post_ffn_sublayer_norm (RMSNorm ONE_PLUS_W)
+            |    post_ffn_sublayer_norm (RMSNorm STANDARD_W)
             |           |
             +-----> add (residual 2)
                   |
@@ -120,25 +121,25 @@ Same shape table, except:
 
 Local layer (index 0):
 ```
-x_in    = rms_norm(x, pre_attn_norm.weight, eps, "one_plus_w")
+x_in    = rms_norm(x, pre_attn_norm.weight, eps, "standard_w")
 q       = linear(x_in, q_proj.weight); reshape to [B, S, 8, 256]
 k       = linear(x_in, k_proj.weight); reshape to [B, S, 1, 256]
 v       = linear(x_in, v_proj.weight); reshape to [B, S, 1, 256]
-q       = rms_norm(q, q_norm.weight, eps, "one_plus_w")    # PER_HEAD_DH; weight pre-absorbed
-k       = rms_norm(k, k_norm.weight, eps, "one_plus_w")
+q       = rms_norm(q, q_norm.weight, eps, "standard_w")    # PER_HEAD_DH
+k       = rms_norm(k, k_norm.weight, eps, "standard_w")
 q, k    = rope_apply_partial(q, k, cos, sin, basis="split_half", partial=1.0)
 # cache.write(k, v, start_pos); k_full, v_full = cache.read(start_pos + S)
 a       = sdpa(q, k_full, v_full, attn_mask=SWA_mask(W=512), scale=1.0)
 attn_out = linear(a, o_proj.weight)
-attn_out = rms_norm(attn_out, post_attn_sublayer_norm.weight, eps, "one_plus_w")
+attn_out = rms_norm(attn_out, post_attn_sublayer_norm.weight, eps, "standard_w")
 x       = add(x, attn_out)
 
-h       = rms_norm(x, pre_ffn_norm.weight, eps, "one_plus_w")
+h       = rms_norm(x, pre_ffn_norm.weight, eps, "standard_w")
 g       = linear(h, gate_proj.weight)
 u       = linear(h, up_proj.weight)
 h_act   = mul(gelu_pytorch_tanh(g), u)
 ffn_out = linear(h_act, down_proj.weight)
-ffn_out = rms_norm(ffn_out, post_ffn_sublayer_norm.weight, eps, "one_plus_w")
+ffn_out = rms_norm(ffn_out, post_ffn_sublayer_norm.weight, eps, "standard_w")
 y       = add(x, ffn_out)
 # Optional PLE injection (model-level): y = add(y, per_layer_residual)
 ```
@@ -162,7 +163,7 @@ DecoderBlockSpec(
         kind=AttentionKind.STANDARD, qkv_layout=QKVLayout.SPLIT,
         mask_kind=MaskKind.SWA, sliding_window=512,
         qk_norm=NormSpec(kind=NormKind.RMS, eps=1e-6,
-                         weight_mode=NormWeightMode.ONE_PLUS_W),
+                         weight_mode=NormWeightMode.STANDARD_W),
         qk_norm_phase=QKNormPhase.PRE_ROPE,
         qk_norm_shape=QKNormShape.PER_HEAD_DH,
         qk_norm_fixed_scale=0.9916,           # local
@@ -176,12 +177,12 @@ DecoderBlockSpec(
         activation=Activation.GELU,
         gate_kind=GateKind.GEGLU,
     ),
-    pre_attn_norm=NormSpec(...ONE_PLUS_W...),
-    post_attn_norm=NormSpec(...ONE_PLUS_W...),
-    pre_ffn_norm=NormSpec(...ONE_PLUS_W...),
-    post_ffn_norm=NormSpec(...ONE_PLUS_W...),
+    pre_attn_norm=NormSpec(...STANDARD_W...),
+    post_attn_norm=NormSpec(...STANDARD_W...),
+    pre_ffn_norm=NormSpec(...STANDARD_W...),
+    post_ffn_norm=NormSpec(...STANDARD_W...),
     per_layer_embedding=PLESpec(ple_dim=256, residual_scale=1/sqrt(2),
-                                injection_norm=NormSpec(...ONE_PLUS_W...)),
+                                injection_norm=NormSpec(...STANDARD_W...)),
     final_logit_softcap=30.0,
     embedding_scale=sqrt(1536),
 )
@@ -205,18 +206,10 @@ token_mixer=AttentionSpec(
 ## 6. Quirks
 
 - **Sandwich norm (PRE_AND_POST):** both the attention and FFN sublayers have a
-  norm AFTER the sublayer output as well as before, all RMSNorm with the Gemma
-  ONE_PLUS_W weight mode. There are FOUR norms per decoder block, not two.
-- **ONE_PLUS_W RMSNorm baking foot-gun:** Gemma's RMSNorm stores `w` such that
-  the effective gain is `(1 + w)`. Our QK-norm weight loader absorbs the
-  Gemma 4 fixed scale AND `sqrt(Dh)` into the weight, so the on-disk
-  `learned_w` is transformed to `w_new = (1 + learned_w) * fixed_scale * sqrt(Dh) - 1`.
-  This lets the attention runtime use `effective_scale = 1.0` (no per-step
-  divide by `sqrt(Dh)`) and skip the fixed-scale multiplication entirely.
-  Math justification: pre-baking, attention computes
-  `softmax( ((g_q * q) @ (g_k * k).T) / sqrt(Dh) )` where `g_q, g_k`
-  include the fixed scales. Post-baking, the gain itself carries the
-  `1/sqrt(Dh)` so we softmax `((g'_q * q) @ (g'_k * k).T)` with no extra scale.
+  norm AFTER the sublayer output as well as before, all RMSNorm with the Gemma 4
+  STANDARD_W weight mode (`y = x_normed * w`, NOT the Gemma 1/2/3 ONE_PLUS_W
+  variant). Verified against `transformers/models/gemma4/modeling_gemma4.py:193-211`
+  (`Gemma4RMSNorm.forward`). There are FOUR norms per decoder block, not two.
 - **Per-layer-type partial RoPE on global only:** local layers rotate the full
   head dim (partial=1.0); global layers rotate only the first 25% of channel
   pairs (partial=0.25). The remaining channels pass through unchanged.
@@ -274,7 +267,7 @@ For decoder layer L of an HF-format Gemma 4 checkpoint:
 
 | HF tensor name (Gemma 4) | API tensor slot | Notes |
 |---|---|---|
-| `model.layers.{L}.input_layernorm.weight` | `blk.pre_attn_norm.weight` | RMSNorm ONE_PLUS_W |
+| `model.layers.{L}.input_layernorm.weight` | `blk.pre_attn_norm.weight` | RMSNorm STANDARD_W |
 | `model.layers.{L}.self_attn.q_proj.weight` | `blk.attention.q_proj.weight` | shape [Hq*Dh_eff, D] |
 | `model.layers.{L}.self_attn.k_proj.weight` | `blk.attention.k_proj.weight` | shape [Hk*Dh_eff, D] |
 | `model.layers.{L}.self_attn.v_proj.weight` | `blk.attention.v_proj.weight` | absent on 12B+ global (K=V) |
@@ -299,7 +292,7 @@ model assembly):
 | HF tensor name | API location |
 |---|---|
 | `model.embed_tokens.weight` | model-level Embedding (with `embedding_scale=sqrt(D)`) |
-| `model.norm.weight` | model-level final RMSNorm (ONE_PLUS_W) |
+| `model.norm.weight` | model-level final RMSNorm (STANDARD_W) |
 | `model.per_layer_embeddings.weight` | `PerLayerEmbedding.ple_table.weight` |
 | `model.per_layer_projections.{L}.weight` | `PerLayerEmbedding.layer_projs[L].weight` |
 | `model.per_layer_input_norm.weight` | `PerLayerEmbedding.inj_norm.weight` |

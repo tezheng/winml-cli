@@ -182,18 +182,19 @@ def test_partial_rope_inv_freq_structure_matches_hf_proportional():
 # ---------- 2. IR-DIVERGENCE SUB-OPS (xfail, with documented reason) ----------
 
 
-@pytest.mark.xfail(
-    reason="B0.5 IR drift: Gemma 4 RMSNorm uses STANDARD_W, but Gemma4Config "
-    "currently emits NormSpec.weight_mode=ONE_PLUS_W. Will be fixed in B0.6.",
-    strict=True,
-)
-def test_gemma4_config_norm_weight_mode_matches_hf_xfail():
-    """Records the IR drift: weight_mode should be STANDARD_W for Gemma 4."""
+def test_gemma4_config_norm_weight_mode_matches_hf():
+    """B0.6 fixed: weight_mode is STANDARD_W for Gemma 4 (was the IR drift in
+    B0.5; corrected per modeling_gemma4.py:193-211 Gemma4RMSNorm.forward).
+    """
     from models.gemma4 import config as gemma4_config
 
     cfg = _smallified_for_norm_check()
     block_spec = cfg.to_block_spec(layer_idx=0)
     assert block_spec.pre_attn_norm.weight_mode == types.NormWeightMode.STANDARD_W
+    assert block_spec.post_attn_norm.weight_mode == types.NormWeightMode.STANDARD_W
+    assert block_spec.pre_ffn_norm.weight_mode == types.NormWeightMode.STANDARD_W
+    assert block_spec.post_ffn_norm.weight_mode == types.NormWeightMode.STANDARD_W
+    assert block_spec.token_mixer.qk_norm.weight_mode == types.NormWeightMode.STANDARD_W
 
 
 @pytest.mark.xfail(
