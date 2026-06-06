@@ -105,3 +105,20 @@ def test_decoder_block_spec_composition():
         pre_attn_norm=norm, pre_ffn_norm=norm,
     )
     assert block.residual_scale is None
+
+
+def test_share_scheme_enum_values_exist():
+    assert types.ShareScheme.NONE
+    assert types.ShareScheme.SAME_BLOCK_SHARED       # Gemma 4 E2B / E4B
+    assert types.ShareScheme.CROSS_BLOCK_SHARED      # Apple AFM (deferred but enumerated)
+
+
+def test_qk_norm_phase_has_pre_rope_fixed_scale():
+    # Gemma 4 uses PRE_ROPE QK-norm with a fixed-scale (non-learned-absorbing-1/sqrt(Dh)).
+    # We model this as the existing PRE_ROPE phase plus a fixed_scale field on AttentionSpec.
+    assert types.QKNormPhase.PRE_ROPE
+
+
+def test_mask_kind_has_swa_global_alt():
+    # Gemma 3 / 4 alternate SWA local with full-attention global layers at 5:1.
+    assert types.MaskKind.SWA_GLOBAL_ALT
