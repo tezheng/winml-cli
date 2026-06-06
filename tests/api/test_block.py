@@ -26,7 +26,6 @@ def _qwen3_like_block_spec(hidden_size: int = 256):
         ffn_norm_position=types.NormPosition.PRE,
         token_mixer=attn_spec,
         channel_mixer=ffn_spec,
-        input_norm=norm_spec,
         pre_attn_norm=norm_spec,
         pre_ffn_norm=norm_spec,
     )

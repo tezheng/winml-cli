@@ -31,25 +31,25 @@ def load_hf_qwen3_layer(
 
     Mapping table (HF tensor name -> API tensor slot):
         model.layers.{L}.input_layernorm.weight
-            -> blk.input_norm.weight
+            -> blk.pre_attn_norm.weight
         model.layers.{L}.self_attn.{q,k,v,o}_proj.weight
             -> blk.attention.{q,k,v,o}_proj.weight
         model.layers.{L}.self_attn.{q,k}_norm.weight
             -> blk.attention.{q,k}_norm.weight
         model.layers.{L}.post_attention_layernorm.weight
-            -> blk.post_attn_norm.weight
+            -> blk.pre_ffn_norm.weight
         model.layers.{L}.mlp.{gate,up,down}_proj.weight
             -> blk.feedforward.{gate,up,down}_proj.weight
     """
     L = layer_idx
     prefix = f"model.layers.{L}"
     mapping = {
-        f"{prefix}.input_layernorm.weight":             blk.input_norm.weight,
+        f"{prefix}.input_layernorm.weight":             blk.pre_attn_norm.weight,
         f"{prefix}.self_attn.q_proj.weight":            blk.attention.q_proj.weight,
         f"{prefix}.self_attn.k_proj.weight":            blk.attention.k_proj.weight,
         f"{prefix}.self_attn.v_proj.weight":            blk.attention.v_proj.weight,
         f"{prefix}.self_attn.o_proj.weight":            blk.attention.o_proj.weight,
-        f"{prefix}.post_attention_layernorm.weight":    blk.post_attn_norm.weight,
+        f"{prefix}.post_attention_layernorm.weight":    blk.pre_ffn_norm.weight,
         f"{prefix}.mlp.gate_proj.weight":               blk.feedforward.gate_proj.weight,
         f"{prefix}.mlp.up_proj.weight":                 blk.feedforward.up_proj.weight,
         f"{prefix}.mlp.down_proj.weight":               blk.feedforward.down_proj.weight,

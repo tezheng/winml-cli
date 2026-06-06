@@ -102,6 +102,6 @@ def test_decoder_block_spec_composition():
         attn_norm_position=types.NormPosition.PRE,
         ffn_norm_position=types.NormPosition.PRE,
         token_mixer=attn, channel_mixer=ffn,
-        input_norm=norm, pre_attn_norm=norm, pre_ffn_norm=norm,
+        pre_attn_norm=norm, pre_ffn_norm=norm,
     )
     assert block.residual_scale is None

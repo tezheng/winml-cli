@@ -166,7 +166,6 @@ class DecoderBlockSpec:
     ffn_norm_position: types.NormPosition
     token_mixer: AttentionSpec           # only AttentionSpec for M1 (Qwen3 dense)
     channel_mixer: FFNSpec               # only FFNSpec for M1
-    input_norm: NormSpec
     pre_attn_norm: Optional[NormSpec] = None
     post_attn_norm: Optional[NormSpec] = None
     pre_ffn_norm: Optional[NormSpec] = None
