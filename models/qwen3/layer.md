@@ -16,7 +16,7 @@
         |
    +----+----+
    |         |
-   |     input_norm (RMSNorm STANDARD_W)
+   |     pre_attn_norm (RMSNorm STANDARD_W)
    |         |
    |    attention(token_mixer)
    |    ├── q_proj, k_proj, v_proj   (split QKV, no bias)
@@ -30,7 +30,7 @@
         |
    +----+----+
    |         |
-   |     post_attn_norm (RMSNorm STANDARD_W)
+   |     pre_ffn_norm (RMSNorm STANDARD_W)
    |         |
    |    feedforward(channel_mixer)
    |    ├── gate_proj                (SwiGLU gate, no bias)
@@ -50,7 +50,7 @@ For Qwen3-0.6B (D=1024, n_q=16, n_kv=8, head_dim=128, I=3072):
 | Step | Tensor | Shape | dtype |
 |---|---|---|---|
 | input | x | [B, S, 1024] | bf16 |
-| input_norm | x_in | [B, S, 1024] | bf16 |
+| pre_attn_norm | x_in | [B, S, 1024] | bf16 |
 | q_proj | q | [B, S, 16*128]=[B, S, 2048] | bf16 |
 | k_proj | k | [B, S, 8*128]=[B, S, 1024] | bf16 |
 | v_proj | v | [B, S, 8*128]=[B, S, 1024] | bf16 |
@@ -67,7 +67,7 @@ For Qwen3-0.6B (D=1024, n_q=16, n_kv=8, head_dim=128, I=3072):
 | transpose+reshape | a | [B, S, 2048] | bf16 |
 | o_proj | attn_out | [B, S, 1024] | bf16 |
 | residual add | x | [B, S, 1024] | bf16 |
-| post_attn_norm | h | [B, S, 1024] | bf16 |
+| pre_ffn_norm | h | [B, S, 1024] | bf16 |
 | gate_proj | g | [B, S, 3072] | bf16 |
 | up_proj | u | [B, S, 3072] | bf16 |
 | silu+mul | h_act | [B, S, 3072] | bf16 |
@@ -77,7 +77,7 @@ For Qwen3-0.6B (D=1024, n_q=16, n_kv=8, head_dim=128, I=3072):
 ## 4. Op trace (api.ops sequence)
 
 ```
-x_in    = rms_norm(x, input_norm.weight, eps, "standard_w")
+x_in    = rms_norm(x, pre_attn_norm.weight, eps, "standard_w")
 q       = linear(x_in, q_proj.weight)         # reshape to [B, S, 16, 128]
 k       = linear(x_in, k_proj.weight)         # reshape to [B, S, 8, 128]
 v       = linear(x_in, v_proj.weight)         # reshape to [B, S, 8, 128]
@@ -89,7 +89,7 @@ a       = sdpa(q, k_full, v_full, is_causal=(S > 1), scale=head_dim ** -0.5)
 attn_out = linear(a, o_proj.weight)
 x       = add(x, attn_out)
 
-h       = rms_norm(x, post_attn_norm.weight, eps, "standard_w")
+h       = rms_norm(x, pre_ffn_norm.weight, eps, "standard_w")
 g       = linear(h, gate_proj.weight)
 u       = linear(h, up_proj.weight)
 h_act   = mul(silu(g), u)
@@ -123,7 +123,7 @@ DecoderBlockSpec(
         activation=Activation.SILU,
         gate_kind=GateKind.SWIGLU,
     ),
-    input_norm=NormSpec(...), pre_attn_norm=..., pre_ffn_norm=...,
+    pre_attn_norm=NormSpec(...), pre_ffn_norm=NormSpec(...),
 )
 ```
 
@@ -144,7 +144,25 @@ DecoderBlockSpec(
   attribute — it lives under `cfg.rope_parameters["rope_theta"]`. `from_hf_dict`
   handles both shapes.
 
-## 7. Source citations
+## 7. Weight-name mapping (HF → API)
+
+| HF tensor name (Qwen3) | API tensor slot |
+|---|---|
+| `model.layers.{L}.input_layernorm.weight` | `blk.pre_attn_norm.weight` |
+| `model.layers.{L}.self_attn.q_proj.weight` | `blk.attention.q_proj.weight` |
+| `model.layers.{L}.self_attn.k_proj.weight` | `blk.attention.k_proj.weight` |
+| `model.layers.{L}.self_attn.v_proj.weight` | `blk.attention.v_proj.weight` |
+| `model.layers.{L}.self_attn.o_proj.weight` | `blk.attention.o_proj.weight` |
+| `model.layers.{L}.self_attn.q_norm.weight` | `blk.attention.q_norm.weight` |
+| `model.layers.{L}.self_attn.k_norm.weight` | `blk.attention.k_norm.weight` |
+| `model.layers.{L}.post_attention_layernorm.weight` | `blk.pre_ffn_norm.weight` |
+| `model.layers.{L}.mlp.gate_proj.weight` | `blk.feedforward.gate_proj.weight` |
+| `model.layers.{L}.mlp.up_proj.weight` | `blk.feedforward.up_proj.weight` |
+| `model.layers.{L}.mlp.down_proj.weight` | `blk.feedforward.down_proj.weight` |
+
+See `models/qwen3/layer.py::load_hf_qwen3_layer` for the loader.
+
+## 8. Source citations
 
 - HF reference: `transformers/src/transformers/models/qwen3/modeling_qwen3.py:Qwen3DecoderLayer`
 - HF config: `transformers/src/transformers/models/qwen3/configuration_qwen3.py`
@@ -153,7 +171,7 @@ DecoderBlockSpec(
 - Survey: `research/02-layer-sources.v2.md` §3 (Qwen3 section)
 - Cache+attention: `research/05-kvcache-attention.v2.md` §3 (Qwen3 entry), §9.1 attention arc
 
-## 8. M1 validation status
+## 9. M1 validation status
 
 - ✅ Shape tests at 3 size variants (`test_layer_shape.py`) — 4 tests
 - ✅ Determinism (`test_layer_shape.py`)
