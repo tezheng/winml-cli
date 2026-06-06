@@ -86,3 +86,27 @@ def test_llama3_scaling_matches_hf_compute_llama3_parameters():
 
     assert torch.allclose(api_rope.cos_cached, cos_ref, atol=1e-5)
     assert torch.allclose(api_rope.sin_cached, sin_ref, atol=1e-5)
+
+
+def test_rope_module_partial_rotary_factor():
+    """RoPE module with partial_rotary_factor=0.25 should only rotate the first quarter."""
+    spec = specs.RoPESpec(
+        base_theta=1_000_000.0,
+        basis=types.RoPEBasis.SPLIT_HALF,
+        partial_rotary_factor=0.25,
+    )
+    head_dim = 64
+    max_seq = 32
+    module = rope.RoPE(spec, head_dim=head_dim, max_seq=max_seq, dtype=torch.float32)
+    # cos/sin tables should be sized for the rotated dim only
+    Dh_rot = int(head_dim * 0.25)
+    assert module.cos_cached.shape == (max_seq, Dh_rot)
+
+    B, S, H = 1, 8, 4
+    q = torch.randn(B, S, H, head_dim)
+    k = torch.randn(B, S, H, head_dim)
+    pos = torch.arange(S)
+    q_rot, k_rot = module(q, k, pos)
+    assert q_rot.shape == q.shape
+    # Non-rotated tail (channels Dh_rot..Dh) should be identical
+    assert torch.allclose(q_rot[..., Dh_rot:], q[..., Dh_rot:], atol=1e-6)

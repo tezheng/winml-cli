@@ -47,10 +47,13 @@ class RoPE(nn.Module):
             raise ValueError(f"head_dim must be even, got {head_dim}")
         self.spec = spec
         self.head_dim = head_dim
+        self.head_dim_rot = int(head_dim * spec.partial_rotary_factor)
+        if self.head_dim_rot % 2 != 0:
+            raise ValueError(f"rotated head_dim ({self.head_dim_rot}) must be even")
         self.max_seq = max_seq
 
         inv_freq = 1.0 / (
-            spec.base_theta ** (torch.arange(0, head_dim, 2).float() / head_dim)
+            spec.base_theta ** (torch.arange(0, self.head_dim_rot, 2).float() / self.head_dim_rot)
         )
         if spec.scaling == types.RoPEScaling.LLAMA3:
             if spec.llama3_extra is None:
@@ -74,9 +77,14 @@ class RoPE(nn.Module):
         k: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if position_ids.dim() == 1:
-            cos = self.cos_cached[position_ids]
-            sin = self.sin_cached[position_ids]
-        else:
+        if position_ids.dim() != 1:
             raise NotImplementedError("M1 supports 1D position_ids only")
-        return ops.rope_apply(q, k, cos, sin, basis="split_half")
+        cos = self.cos_cached[position_ids]
+        sin = self.sin_cached[position_ids]
+        if self.spec.partial_rotary_factor == 1.0:
+            return ops.rope_apply(q, k, cos, sin, basis="split_half")
+        return ops.rope_apply_partial(
+            q, k, cos, sin,
+            partial_rotary_factor=self.spec.partial_rotary_factor,
+            basis="split_half",
+        )
