@@ -42,3 +42,16 @@ def test_qknorm_full_hdh_shape():
                          shape=types.QKNormShape.FULL_HDH,
                          dtype=torch.float32)
     assert qknorm.weight.shape == (n_heads * head_dim,)
+
+
+def test_rmsnorm_module_one_plus_w():
+    """Gemma 4 RMSNorm: y = x_normed * (1 + w), w init to zero so gain=1.0."""
+    spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                          weight_mode=types.NormWeightMode.ONE_PLUS_W)
+    module = norm.RMSNorm(spec, hidden_size=16, dtype=torch.float32)
+    with torch.no_grad():
+        module.weight.zero_()  # init to zero — gain effectively = 1.0
+    x = torch.randn(2, 4, 16)
+    out = module(x)
+    ref = F.rms_norm(x, (16,), torch.ones(16), 1e-6)
+    assert torch.allclose(out, ref, atol=1e-5)
