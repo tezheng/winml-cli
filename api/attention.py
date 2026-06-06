@@ -2,6 +2,12 @@
 
 M1 supports the Qwen3 shape: STANDARD (GQA) with split QKV, optional QK-norm
 PRE_ROPE PER_HEAD_DH, RoPE SPLIT_HALF, contiguous KV cache, causal mask.
+
+B0.5 (Gemma 4) extensions:
+- attention_k_eq_v: skip v_proj allocation; alias V := K (Gemma 4 12B+ global).
+- qk_norm_fixed_scale: when set, effective_scale becomes 1.0 (the QKNorm absorbs
+  the 1/sqrt(Dh) factor into its learned weight at load time).
+- mask_kind=SWA: sliding-window attention mask with sliding_window=W.
 """
 from __future__ import annotations
 from typing import Optional
@@ -25,8 +31,10 @@ class Attention(nn.Module):
             raise NotImplementedError(f"M1: STANDARD only, got {spec.kind}")
         if spec.qkv_layout != types.QKVLayout.SPLIT:
             raise NotImplementedError(f"M1: SPLIT QKV only, got {spec.qkv_layout}")
-        if spec.mask_kind != types.MaskKind.CAUSAL:
-            raise NotImplementedError(f"M1: CAUSAL mask only, got {spec.mask_kind}")
+        if spec.mask_kind not in (types.MaskKind.CAUSAL, types.MaskKind.SWA):
+            raise NotImplementedError(
+                f"B0.5: CAUSAL and SWA masks only, got {spec.mask_kind}"
+            )
         self.spec = spec
         self.hidden_size = hidden_size
 
@@ -34,8 +42,22 @@ class Attention(nn.Module):
         kv_proj_out = spec.n_kv_heads * spec.head_dim
         self.q_proj = nn.Linear(hidden_size, q_proj_out, bias=spec.q_bias, dtype=dtype)
         self.k_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.k_bias, dtype=dtype)
-        self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
+        # v_proj is skipped when attention_k_eq_v=True (Gemma 4 12B+ global)
+        if spec.attention_k_eq_v:
+            self.v_proj = None
+        else:
+            self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
         self.o_proj = nn.Linear(q_proj_out, hidden_size, bias=spec.o_bias, dtype=dtype)
+
+        # effective_scale: when qk_norm_fixed_scale is set, the norm absorbs
+        # 1/sqrt(Dh) and the effective scale is 1.0 (Gemma 4). Otherwise honor
+        # spec.attn_scale or default to 1/sqrt(Dh).
+        if spec.qk_norm_fixed_scale is not None:
+            self.effective_scale = 1.0
+        elif spec.attn_scale is not None:
+            self.effective_scale = spec.attn_scale
+        else:
+            self.effective_scale = spec.head_dim ** -0.5
 
         if spec.qk_norm is not None:
             if spec.qk_norm_phase != types.QKNormPhase.PRE_ROPE:
@@ -74,7 +96,11 @@ class Attention(nn.Module):
 
         q = self.q_proj(x).view(B, S, Hq, Dh)
         k = self.k_proj(x).view(B, S, Hk, Dh)
-        v = self.v_proj(x).view(B, S, Hk, Dh)
+        # K = V branch: alias the K tensor as V (after the same projection)
+        if spec.attention_k_eq_v:
+            v = k
+        else:
+            v = self.v_proj(x).view(B, S, Hk, Dh)
 
         if self.q_norm is not None:
             q = self.q_norm(q)
@@ -89,19 +115,31 @@ class Attention(nn.Module):
         cache.write(k, v, start_pos=start_pos)
         k_full, v_full = cache.read(seq_len=start_pos + S)
 
-        scale = spec.attn_scale if spec.attn_scale is not None else (Dh ** -0.5)
-        # Build an explicit additive causal mask. Query token i has absolute
-        # position (start_pos + i) and may attend to key positions j <= start_pos + i.
-        # `is_causal=True` on SDPA would mis-align here when start_pos > 0 because
-        # it assumes the diagonal at the top-left of [S_q × S_k].
+        scale = self.effective_scale
         T = start_pos + S
         device = q.device
-        i_idx = torch.arange(S, device=device).unsqueeze(1)        # [S, 1]
-        j_idx = torch.arange(T, device=device).unsqueeze(0)        # [1, T]
-        allowed = j_idx <= (start_pos + i_idx)                     # [S, T]
-        attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
-        attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
+        if spec.mask_kind == types.MaskKind.SWA and spec.sliding_window is not None:
+            # SWA mask: (i, j) is kept iff j <= start_pos+i (causal) AND
+            # (start_pos+i) - j <= W (within window).
+            W = spec.sliding_window
+            q_pos = torch.arange(start_pos, start_pos + S, device=device).view(S, 1)
+            k_pos = torch.arange(T, device=device).view(1, T)
+            keep = (k_pos <= q_pos) & (q_pos - k_pos <= W)
+            attn_mask = torch.where(keep,
+                                    torch.zeros((), dtype=q.dtype, device=device),
+                                    torch.full((), float("-inf"), dtype=q.dtype, device=device))
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+        else:
+            # Build an explicit additive causal mask. Query token i has absolute
+            # position (start_pos + i) and may attend to key positions j <= start_pos + i.
+            # `is_causal=True` on SDPA would mis-align here when start_pos > 0 because
+            # it assumes the diagonal at the top-left of [S_q × S_k].
+            i_idx = torch.arange(S, device=device).unsqueeze(1)        # [S, 1]
+            j_idx = torch.arange(T, device=device).unsqueeze(0)        # [1, T]
+            allowed = j_idx <= (start_pos + i_idx)                     # [S, T]
+            attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
+            attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
         attn_out = ops.sdpa(q, k_full, v_full,
                             attn_mask=attn_mask, scale=scale)
 

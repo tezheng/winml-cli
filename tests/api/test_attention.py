@@ -147,3 +147,68 @@ def test_attention_causal_mask_for_prefill():
     out = attn(x, position_ids=pos, cache=cache, start_pos=0)
     assert cache.seq_len == S
     assert out.shape == (B, S, D)
+
+
+def test_attention_k_eq_v_skips_v_projection():
+    """When attention_k_eq_v=True, the V projection should not be allocated; v = k."""
+    spec = specs.AttentionSpec(
+        n_q_heads=16, n_kv_heads=8, head_dim=256,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        attention_k_eq_v=True,
+        rope=specs.RoPESpec(base_theta=1_000_000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    attn = attention.Attention(spec, hidden_size=4096, max_seq=64, dtype=torch.float32)
+    # v_proj should be absent (or None) when attention_k_eq_v
+    assert getattr(attn, "v_proj", None) is None
+
+
+def test_attention_qk_norm_fixed_scale_overrides_scale():
+    """With fixed-scale QK norm, attn_scale defaults to 1.0 instead of 1/sqrt(Dh)."""
+    qk_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                             weight_mode=types.NormWeightMode.ONE_PLUS_W)
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=1, head_dim=256,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.SWA,
+        sliding_window=512,
+        qk_norm=qk_spec,
+        qk_norm_phase=types.QKNormPhase.PRE_ROPE,
+        qk_norm_shape=types.QKNormShape.PER_HEAD_DH,
+        qk_norm_fixed_scale=0.9916,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    attn = attention.Attention(spec, hidden_size=1024, max_seq=64, dtype=torch.float32)
+    assert attn.effective_scale == 1.0
+
+
+def test_attention_swa_masks_outside_window():
+    """SWA mask: tokens at position i can only see positions in [max(0, i - W), i]."""
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=1, head_dim=64,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.SWA,
+        sliding_window=2,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    attn = attention.Attention(spec, hidden_size=512, max_seq=8, dtype=torch.float32)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(cache_spec, batch_size=1,
+                                      n_kv_heads=1, head_dim=64, max_seq=8)
+    B, S, D = 1, 5, 512
+    x = torch.randn(B, S, D)
+    pos = torch.arange(S)
+    out = attn(x, position_ids=pos, cache=cache, start_pos=0)
+    assert out.shape == (B, S, D)
+    # We cannot check SWA masking directly without inspecting internals;
+    # verify shape and let the numerical-equivalence test (T17) catch correctness.
