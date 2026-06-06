@@ -67,6 +67,15 @@ class AttentionSpec:
     attention_k_eq_v: bool = False             # Gemma 4 12B/26B/31B global: K and V projections aliased
     qk_norm_fixed_scale: Optional[float] = None # Gemma 4 fixed-scale gain absorbing 1/sqrt(Dh); when set, attn_scale should be 1.0
 
+    # B0.6: Gemma 4 v_norm. A per-head RMSNorm applied to V after the V
+    # projection, before transpose+cache.write. On HF Gemma 4 it is
+    # `Gemma4RMSNorm(head_dim, with_scale=False)`, i.e. a unit RMSNorm with
+    # no learnable weight (verified at modeling_gemma4.py:1215, 1265).
+    # When set with `with_scale=False`, the runtime instantiates a frozen
+    # ones-vector that is NOT in the state dict.
+    v_norm: Optional[NormSpec] = None
+    v_norm_with_scale: bool = True             # False for Gemma 4 (unit RMSNorm)
+
 
 @dataclass(frozen=True)
 class FFNSpec:

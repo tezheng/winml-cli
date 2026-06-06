@@ -156,6 +156,11 @@ class Gemma4Config:
             qk_norm_fixed_scale=None,            # B0.6: no absorb — HF scaling = 1.0
             attn_scale=1.0,                      # explicit 1.0 instead of 1/sqrt(Dh)
             attention_k_eq_v=attention_k_eq_v_eff,
+            # B0.6: v_norm — HF Gemma 4 applies Gemma4RMSNorm(head_dim,
+            # eps=rms_norm_eps, with_scale=False) to V before transpose+cache.
+            # Verified at modeling_gemma4.py:1215 (__init__) and 1265 (forward).
+            v_norm=norm_spec,
+            v_norm_with_scale=False,
             rope=specs.RoPESpec(
                 base_theta=rope_theta_eff,
                 basis=types.RoPEBasis.SPLIT_HALF,

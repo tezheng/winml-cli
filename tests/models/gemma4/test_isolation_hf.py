@@ -213,22 +213,28 @@ def test_gemma4_no_qk_fixed_scale_matches_hf():
     assert block_spec_g.token_mixer.attn_scale == 1.0
 
 
-@pytest.mark.xfail(
-    reason="B0.5 IR drift: Gemma 4 attention has a v_norm (unit RMSNorm with "
-    "with_scale=False) applied to V before the cache write. Our AttentionSpec "
-    "has no v_norm field; V is currently passed through unnormalized. To be "
-    "added in B0.6 as AttentionSpec.v_norm or a fixed unit-RMSNorm post-projection.",
-    strict=True,
-)
-def test_gemma4_v_norm_supported_xfail():
-    """Documents the missing v_norm. Test fails because AttentionSpec lacks the field."""
-    # No v_norm attribute exists on AttentionSpec yet.
+def test_gemma4_v_norm_supported():
+    """B0.6 fixed: AttentionSpec has a v_norm field (unit RMSNorm with
+    with_scale=False) applied to V before the cache write. Verified against
+    `modeling_gemma4.py:1215` (Gemma4Attention.__init__ -> v_norm =
+    Gemma4RMSNorm(head_dim, eps, with_scale=False)) and `modeling_gemma4.py:1265`
+    (forward -> value_states = self.v_norm(value_states) before transpose).
+    """
     spec = specs.AttentionSpec(
         n_q_heads=2, n_kv_heads=1, head_dim=8,
         kind=types.AttentionKind.STANDARD, qkv_layout=types.QKVLayout.SPLIT,
         mask_kind=types.MaskKind.CAUSAL,
     )
     assert hasattr(spec, "v_norm")
+    assert hasattr(spec, "v_norm_with_scale")
+
+    from models.gemma4 import config as gemma4_config
+    cfg = _smallified_for_norm_check()
+    block_spec = cfg.to_block_spec(layer_idx=0)
+    assert block_spec.token_mixer.v_norm is not None
+    assert block_spec.token_mixer.v_norm.kind == types.NormKind.RMS
+    assert block_spec.token_mixer.v_norm.weight_mode == types.NormWeightMode.STANDARD_W
+    assert block_spec.token_mixer.v_norm_with_scale is False
 
 
 @pytest.mark.xfail(

@@ -35,6 +35,9 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
             |    |                              STANDARD_W; no fixed-scale absorption
             |    |                              - HF Gemma 4 attention uses runtime
             |    |                              scaling = 1.0 directly)
+            |    +-- v_norm                     (unit RMSNorm, with_scale=False —
+            |    |                              non-persistent buffer; applied to V
+            |    |                              after V projection, before transpose+cache)
             |    +-- RoPE                       (local: theta=1e4, partial=1.0
             |    |                              global: theta=1e6, partial=0.25)
             |    +-- KVCache write/read         (local: ContiguousKVCache + SWA mask
@@ -87,6 +90,7 @@ For Gemma 4 E2B (D=1536, Hq=8, Hk=1, Dh_local=256, Dh_global=512, I=8192, ple_di
 | q_norm | q | [B, S, 8, 256] | bf16 (fp32 norm) |
 | k_norm | k | [B, S, 1, 256] | bf16 (fp32 norm) |
 | RoPE (partial=1.0, θ=1e4) | q, k | [B, S, *, 256] | bf16 |
+| v_norm (unit RMS, with_scale=False) | v | [B, S, 1, 256] | bf16 (fp32 norm) |
 | transpose | q | [B, 8, S, 256] | bf16 |
 | transpose | k, v | [B, 1, S, 256] | bf16 |
 | cache.write | KVCache.k/v | [B, 1, max_seq, 256] | bf16 |
@@ -129,6 +133,7 @@ v       = linear(x_in, v_proj.weight); reshape to [B, S, 1, 256]
 q       = rms_norm(q, q_norm.weight, eps, "standard_w")    # PER_HEAD_DH
 k       = rms_norm(k, k_norm.weight, eps, "standard_w")
 q, k    = rope_apply_partial(q, k, cos, sin, basis="split_half", partial=1.0)
+v       = rms_norm(v, v_norm_weight, eps, "standard_w")    # B0.6: unit RMSNorm, weight is frozen ones
 # cache.write(k, v, start_pos); k_full, v_full = cache.read(start_pos + S)
 a       = sdpa(q, k_full, v_full, attn_mask=SWA_mask(W=512), scale=1.0)
 attn_out = linear(a, o_proj.weight)
@@ -213,6 +218,14 @@ token_mixer=AttentionSpec(
   STANDARD_W weight mode (`y = x_normed * w`, NOT the Gemma 1/2/3 ONE_PLUS_W
   variant). Verified against `transformers/models/gemma4/modeling_gemma4.py:193-211`
   (`Gemma4RMSNorm.forward`). There are FOUR norms per decoder block, not two.
+- **V norm with `with_scale=False`:** Gemma 4 attention runs a unit RMSNorm
+  on V (`Gemma4RMSNorm(head_dim, with_scale=False)`) after the V projection
+  and before the cache write. Because `with_scale=False`, there is no
+  learnable weight — we store a frozen ones-buffer (non-persistent, NOT in
+  the state dict). Verified at `modeling_gemma4.py:1215` (init) and 1265
+  (forward). This applies even when `attention_k_eq_v=True`: V is aliased
+  to the raw K projection, then K and V go through separate `k_norm` and
+  `v_norm` paths.
 - **Per-layer-type partial RoPE on global only:** local layers rotate the full
   head dim (partial=1.0); global layers rotate only the first 25% of channel
   pairs (partial=0.25). The remaining channels pass through unchanged.

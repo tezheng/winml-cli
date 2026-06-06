@@ -212,3 +212,73 @@ def test_attention_swa_masks_outside_window():
     assert out.shape == (B, S, D)
     # We cannot check SWA masking directly without inspecting internals;
     # verify shape and let the numerical-equivalence test (T17) catch correctness.
+
+
+def test_attention_v_norm_with_scale_false_no_state_dict_entry():
+    """B0.6: v_norm with `with_scale=False` (Gemma 4) registers a non-persistent
+    buffer of ones — there must be NO weight in the state_dict, and the buffer
+    must equal a vector of ones (no learnable scale)."""
+    v_norm_spec = specs.NormSpec(
+        kind=types.NormKind.RMS, eps=1e-6,
+        weight_mode=types.NormWeightMode.STANDARD_W,
+    )
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=1, head_dim=32,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        v_norm=v_norm_spec, v_norm_with_scale=False,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    attn = attention.Attention(spec, hidden_size=128, max_seq=8, dtype=torch.float32)
+    # v_norm_weight must be a buffer (not a Parameter) and not in state_dict.
+    sd = attn.state_dict()
+    assert "v_norm_weight" not in sd
+    # and equal to ones
+    assert torch.allclose(attn.v_norm_weight,
+                          torch.ones(spec.head_dim, dtype=torch.float32))
+
+
+def test_attention_v_norm_changes_output():
+    """Sanity: enabling v_norm must change the attention output vs no-v_norm."""
+    common = dict(
+        n_q_heads=4, n_kv_heads=1, head_dim=16,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    no_vn = specs.AttentionSpec(**common)
+    v_norm_spec = specs.NormSpec(
+        kind=types.NormKind.RMS, eps=1e-6,
+        weight_mode=types.NormWeightMode.STANDARD_W,
+    )
+    with_vn = specs.AttentionSpec(**common, v_norm=v_norm_spec,
+                                  v_norm_with_scale=False)
+    torch.manual_seed(7)
+    H = 64
+    a = attention.Attention(no_vn, hidden_size=H, max_seq=8, dtype=torch.float32)
+    b = attention.Attention(with_vn, hidden_size=H, max_seq=8, dtype=torch.float32)
+    # Copy weights so the only difference is the v_norm path
+    b.q_proj.load_state_dict(a.q_proj.state_dict())
+    b.k_proj.load_state_dict(a.k_proj.state_dict())
+    b.v_proj.load_state_dict(a.v_proj.state_dict())
+    b.o_proj.load_state_dict(a.o_proj.state_dict())
+
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_a = kvcache.ContiguousKVCache(cache_spec, batch_size=1,
+                                        n_kv_heads=1, head_dim=16, max_seq=8)
+    cache_b = kvcache.ContiguousKVCache(cache_spec, batch_size=1,
+                                        n_kv_heads=1, head_dim=16, max_seq=8)
+    x = torch.randn(1, 4, H)
+    pos = torch.arange(4)
+    out_a = a(x, position_ids=pos, cache=cache_a, start_pos=0)
+    out_b = b(x, position_ids=pos, cache=cache_b, start_pos=0)
+    # Outputs must differ (RMS-normalised V is different from raw V in general).
+    assert not torch.allclose(out_a, out_b, atol=1e-5)

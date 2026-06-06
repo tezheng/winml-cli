@@ -78,6 +78,36 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+        # B0.6: Gemma 4 v_norm. Unit RMSNorm on V with `with_scale=False` —
+        # no learnable parameter, no state-dict entry. We use a register_buffer
+        # so it travels with the module on `.to(device)` and is excluded from
+        # `parameters()`.
+        if spec.v_norm is not None:
+            if spec.v_norm.kind != types.NormKind.RMS:
+                raise ValueError("v_norm: RMS kind only")
+            self._v_norm_eps = spec.v_norm.eps
+            self._v_norm_mode = ("one_plus_w"
+                                 if spec.v_norm.weight_mode == types.NormWeightMode.ONE_PLUS_W
+                                 else "standard_w")
+            if spec.v_norm_with_scale:
+                # learnable weight goes in state_dict
+                self.v_norm_weight = nn.Parameter(
+                    torch.ones(spec.head_dim, dtype=dtype)
+                )
+                self._v_norm_with_scale = True
+            else:
+                # frozen ones, no state_dict entry — buffer (non-persistent).
+                self.register_buffer(
+                    "v_norm_weight",
+                    torch.ones(spec.head_dim, dtype=dtype),
+                    persistent=False,
+                )
+                self._v_norm_with_scale = False
+        else:
+            self._v_norm_eps = None
+            self._v_norm_mode = None
+            self._v_norm_with_scale = None
+
         if spec.rope is None:
             raise NotImplementedError("M1: RoPE required")
         self.rope = _rope.RoPE(spec.rope, head_dim=spec.head_dim,
@@ -107,6 +137,15 @@ class Attention(nn.Module):
             k = self.k_norm(k)
 
         q, k = self.rope(q, k, position_ids)
+
+        # B0.6: v_norm applied to V before transpose+cache.write (per HF
+        # `modeling_gemma4.py:1265`). When `attention_k_eq_v=True` (v aliased
+        # to raw K projection), this is what HF does too — k_norm and v_norm
+        # are applied to the SAME tensor identity (raw K projection output)
+        # in separate paths.
+        if self._v_norm_mode is not None:
+            v = ops.rms_norm(v, self.v_norm_weight, self._v_norm_eps,
+                             mode=self._v_norm_mode)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
