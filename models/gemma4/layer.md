@@ -65,9 +65,20 @@ dimension, RoPE θ, partial-rotary factor, and QK fixed-scale differ.
             |           |
             +-----> add (residual 2)
                   |
-            (+ per_layer_residual from PerLayerEmbedding, when PLE enabled —
-             scaled by 1/sqrt(2); injected by the model-assembly loop, not
-             by build_gemma4_decoder_layer)
+            (B0.6 PLE-at-END injection, when PLE enabled and per_layer_input
+             [B, S, ple_dim] is supplied:
+                  residual_pe = x
+                  x = per_layer_input_gate(x)         # Linear D → ple_dim
+                  x = gelu_pytorch_tanh(x)
+                  x = x * per_layer_input             # broadcast multiply
+                  x = per_layer_projection(x)         # Linear ple_dim → D
+                  x = post_per_layer_input_norm(x)    # RMSNorm STANDARD_W
+                  x = residual_pe + x
+             Model assembly is responsible for computing per_layer_input from
+             the model-level PLE table + context-aware projection.)
+                  |
+            x = x * layer_scalar                      # B0.6 trailing per-layer
+                                                      # scalar (init = 1.0)
                   |
                   y  [B, S, D]
 ```
@@ -107,7 +118,12 @@ For Gemma 4 E2B (D=1536, Hq=8, Hk=1, Dh_local=256, Dh_global=512, I=8192, ple_di
 | down_proj | ffn_out | [B, S, 1536] | bf16 |
 | post_ffn_sublayer_norm | ffn_out | [B, S, 1536] | bf16 |
 | residual add | x | [B, S, 1536] | bf16 |
-| PLE residual add (optional) | y | [B, S, 1536] | bf16 |
+| per_layer_input_gate (optional, PLE) | h_ple | [B, S, 256] | bf16 |
+| gelu_pytorch_tanh + mul by per_layer_input | h_ple | [B, S, 256] | bf16 |
+| per_layer_projection | h_ple | [B, S, 1536] | bf16 |
+| post_per_layer_input_norm | h_ple | [B, S, 1536] | bf16 |
+| residual + h_ple | x | [B, S, 1536] | bf16 |
+| layer_scalar multiply | y | [B, S, 1536] | bf16 |
 
 ### Layer 4 (global full-attention layer)
 
@@ -146,8 +162,19 @@ u       = linear(h, up_proj.weight)
 h_act   = mul(gelu_pytorch_tanh(g), u)
 ffn_out = linear(h_act, down_proj.weight)
 ffn_out = rms_norm(ffn_out, post_ffn_sublayer_norm.weight, eps, "standard_w")
-y       = add(x, ffn_out)
-# Optional PLE injection (model-level): y = add(y, per_layer_residual)
+x       = add(x, ffn_out)
+
+# B0.6 PLE-at-END injection (when per_layer_input is provided):
+residual_pe = x
+h_ple   = linear(x, per_layer_input_gate.weight)          # [B, S, ple_dim]
+h_ple   = gelu_pytorch_tanh(h_ple)
+h_ple   = mul(h_ple, per_layer_input)                      # [B, S, ple_dim]
+h_ple   = linear(h_ple, per_layer_projection.weight)      # [B, S, D]
+h_ple   = rms_norm(h_ple, post_per_layer_input_norm.weight, eps, "standard_w")
+x       = add(residual_pe, h_ple)
+
+# B0.6 trailing scalar — runs even when PLE is off
+y       = x * layer_scalar
 ```
 
 Global layer (index 4) — only the attention sub-block differs:
@@ -249,15 +276,23 @@ token_mixer=AttentionSpec(
   also source from 10..14, etc. Every source layer is itself unshared. The
   shared layer still computes its own K/V tensors but `SharedLayerKVCache.write`
   is a no-op — they are discarded.
-- **Per-Layer Embeddings (E2B/E4B only — axis A19):** a separate
-  `PerLayerEmbedding` module owns the PLE table (`vocab_size × ple_dim=256`),
-  the injection RMSNorm, and one linear projection per decoder layer that maps
-  ple_dim → hidden_size. At each layer the model-assembly loop computes
-  `per_layer_residual = layer_proj_l(inj_norm(ple_table[input_ids])) / sqrt(2)`
-  and passes it to `DecoderBlock.forward(..., per_layer_residual=...)`. The
-  block adds it to the residual stream AFTER the FFN residual add. The
-  `build_gemma4_decoder_layer` factory is unaware of PLE — the PLE module
-  is owned at the model level.
+- **Per-Layer Embeddings (E2B/E4B only — axis A19):** there are TWO sides
+  to PLE. Model-level (`modeling_gemma4.py:1617-1631`): a packed PLE table
+  `embed_tokens_per_layer` (`[vocab, num_layers*ple_dim]`), a Linear
+  `per_layer_model_projection` (`[D, num_layers*ple_dim]`) for the
+  context-aware path, and `per_layer_projection_norm` (RMSNorm on ple_dim).
+  The model computes per_layer_inputs for ALL layers up front (one [B,S,L,ple_dim]
+  tensor) and slices the layer-l slot before passing to the decoder block.
+  Per-layer side (`modeling_gemma4.py:1387-1389`, 1446-1453): each decoder
+  block owns `per_layer_input_gate` (Linear hidden→ple_dim),
+  `per_layer_projection` (Linear ple_dim→hidden), and a `post_per_layer_input_norm`
+  (RMSNorm). The block applies them AT END after the FFN residual add via
+  the gate→act→multiply→proj→norm→residual chain (NOT as a simple residual
+  add, which is what the B0.5 IR speculated).
+- **`layer_scalar` trailing multiply:** every Gemma 4 decoder layer registers
+  a buffer `layer_scalar` of shape [1] (`modeling_gemma4.py:1382`,
+  initialised to ones) and multiplies the FINAL output by it
+  (`modeling_gemma4.py:1455`). Loaded from the HF state dict.
 - **`attention_k_eq_v` is size-specific:** True on 12B Unified, 26B-A4B MoE,
   and 31B; FALSE on E2B and E4B. When True AND the layer is global,
   `api.attention.Attention` skips allocating `v_proj` and aliases V := K
@@ -296,6 +331,10 @@ For decoder layer L of an HF-format Gemma 4 checkpoint:
 | `model.layers.{L}.mlp.gate_proj.weight` | `blk.feedforward.gate_proj.weight` | GeGLU gate |
 | `model.layers.{L}.mlp.up_proj.weight` | `blk.feedforward.up_proj.weight` | GeGLU up |
 | `model.layers.{L}.mlp.down_proj.weight` | `blk.feedforward.down_proj.weight` | GeGLU down |
+| `model.layers.{L}.per_layer_input_gate.weight` | `blk.per_layer_input_gate.weight` | PLE gate: `Linear(D, ple_dim)` (PLE-enabled only) |
+| `model.layers.{L}.per_layer_projection.weight` | `blk.per_layer_projection.weight` | PLE proj: `Linear(ple_dim, D)` (PLE-enabled only) |
+| `model.layers.{L}.post_per_layer_input_norm.weight` | `blk.post_per_layer_input_norm.weight` | RMSNorm STANDARD_W (PLE-enabled only) |
+| `model.layers.{L}.layer_scalar` | `blk.layer_scalar` | registered buffer, shape [1] (HF init = ones) |
 
 `Dh_eff = global_head_dim` on global layers (E2B: 512), else local `head_dim`
 (E2B: 256). The loader function `load_hf_gemma4_layer` copies all tensors
@@ -304,15 +343,15 @@ correction; HF Gemma 4 attention has `self.scaling = 1.0` and plain
 STANDARD_W QK norms with no fixed scale).
 
 Model-level tensors (NOT loaded by `load_hf_gemma4_layer` — owned by the
-model assembly):
+model assembly; verified against `modeling_gemma4.py:1602-1631`):
 
 | HF tensor name | API location |
 |---|---|
 | `model.embed_tokens.weight` | model-level Embedding (with `embedding_scale=sqrt(D)`) |
 | `model.norm.weight` | model-level final RMSNorm (STANDARD_W) |
-| `model.per_layer_embeddings.weight` | `PerLayerEmbedding.ple_table.weight` |
-| `model.per_layer_projections.{L}.weight` | `PerLayerEmbedding.layer_projs[L].weight` |
-| `model.per_layer_input_norm.weight` | `PerLayerEmbedding.inj_norm.weight` |
+| `model.embed_tokens_per_layer.weight` | PLE table — packed `[vocab, num_layers*ple_dim]` |
+| `model.per_layer_model_projection.weight` | Linear(D, num_layers*ple_dim) — context-aware path |
+| `model.per_layer_projection_norm.weight` | RMSNorm on ple_dim (STANDARD_W) |
 | `lm_head.weight` | tied to `model.embed_tokens.weight` when `tie_word_embeddings=True` |
 
 ## 8. Source citations
@@ -326,13 +365,14 @@ model assembly):
 - Public announcement: https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/
 - HF model cards: https://huggingface.co/google/gemma-4-E2B-it (E2B), https://huggingface.co/google/gemma-3-1b-it (used as shape template for synthetic test fixtures while open-downloadable Gemma 4 E2B weights are gated)
 
-## 9. B0.5 validation status
+## 9. B0.6 validation status
 
 - Shape tests at the smallified E2B variant (local + global layers) — `test_layer_shape.py`, 2 tests
 - Per-layer block-spec dispatch (local vs global vs PLE wiring) — `test_config.py`, 5 tests
-- Synthetic HF weight loader round-trip (local + global) + QK-norm absorb math
-  (local + global at known input w=0) — `test_weight_loader.py`, 4 tests
-- Real-weight numerical equivalence vs HF — NOT in B0.5 scope (Gemma 4 E2B
-  weights are gated at announcement and may not be open-downloadable in this
-  environment); deferred to a later B0.5 task that exercises a public Gemma 4
-  E2B checkpoint
+- Synthetic HF weight loader round-trip (local + global) + QK-norm
+  load-straight (no absorb) — `test_weight_loader.py`, 4 tests
+- Sub-op isolation vs HF Gemma 4 (RMSNorm STANDARD_W, GeGLU MLP, SWA mask,
+  RoPE full + proportional partial geometry, no-fixed-scale, v_norm support)
+  — `test_isolation_hf.py`, 8 tests
+- T17 real-weight layer-0/4 numerical equivalence at atol=5e-4 — passes
+- T18 real-weight KV-cache prefill+decode equivalence at atol=5e-4 — passes

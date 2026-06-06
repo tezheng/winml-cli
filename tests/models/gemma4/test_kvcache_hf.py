@@ -21,12 +21,10 @@ Exercises three KV-cache flows:
 
 GATING BEHAVIOUR
 ================
-Same three skip paths as T17:
+Two skip paths (B0.6 removed the IR-divergence skip path — atol-5e-4 is
+now the contract):
   1. transformers.models.gemma4 not importable → module-level skip.
   2. HF model weights not accessible → per-test skip with the error string.
-  3. **IR divergence skip path** — running the test end-to-end records the
-     `max_abs_diff`; if it exceeds atol the test skips with the diff so the
-     B0.6 IR-correction batch can run the same test to verify convergence.
 
 Marked ``@pytest.mark.gate``.
 """
@@ -229,11 +227,6 @@ def test_layer0_local_swa_prefill_then_decode(hf_model):
                                           head_dim=cfg.head_dim)
 
     max_abs_diff = (hf_out - api_out).abs().max().item()
-    if max_abs_diff > ATOL:
-        pytest.skip(
-            f"B0.5 IR-divergence skip: layer-0 decode max_abs_diff={max_abs_diff:.4e}. "
-            "Same IR drifts as T17. Defer to B0.6 IR-correction batch."
-        )
     assert torch.allclose(hf_out, api_out, atol=ATOL, rtol=RTOL), (
         f"max_abs_diff={max_abs_diff}"
     )
@@ -277,11 +270,6 @@ def test_layer4_global_partial_rope_prefill_then_decode(hf_model):
                                           head_dim=cfg.global_head_dim)
 
     max_abs_diff = (hf_out - api_out).abs().max().item()
-    if max_abs_diff > ATOL:
-        pytest.skip(
-            f"B0.5 IR-divergence skip: global layer-{LAYER_IDX} decode "
-            f"max_abs_diff={max_abs_diff:.4e}. Defer to B0.6."
-        )
     assert torch.allclose(hf_out, api_out, atol=ATOL, rtol=RTOL), (
         f"max_abs_diff={max_abs_diff}"
     )

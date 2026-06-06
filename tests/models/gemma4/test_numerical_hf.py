@@ -1,35 +1,24 @@
-"""B0.5 T17 — Gate test: Gemma 4 E2B layer-0 numerical equivalence vs HF.
+"""B0.6 T17 — Gate test: Gemma 4 E2B layer-0/4 numerical equivalence vs HF.
 
-Loads `google/gemma-4-e2b-it` (ungated), extracts the layer-0 weights, loads
-them into our `DecoderBlock` via `load_hf_gemma4_layer`, runs both
-implementations on a fixed input, and asserts allclose at atol=5e-4.
+Loads `google/gemma-4-e2b-it` (ungated), extracts the layer-0 / layer-4
+weights, loads them into our `DecoderBlock` via `load_hf_gemma4_layer`, runs
+both implementations on a fixed input, and asserts allclose at atol=5e-4.
 
-The test ALSO exercises layer-4 (first global) where the IR-novel parts
-(partial-RoPE 0.25, dual-θ 1e6, fixed-scale absorption pre-B0.6, optional K=V
-on 12B+) are most concentrated.
+Layer-4 exercises the IR-novel paths concentrated on global layers:
+proportional partial-RoPE 0.25, θ=1e6, and the global head_dim. Layer-0 is
+the local-SWA path with full rotation and θ=1e4.
+
+B0.6 IR-correction batch landed: pre-B0.6 the test had a third skip path
+that recorded `max_abs_diff` and skipped if it exceeded the atol contract.
+That path is removed; the atol-5e-4 allclose is now the contract.
 
 GATING BEHAVIOUR
 ================
-Three skip paths handled gracefully:
-
-1. ``transformers.models.gemma4`` not importable → skipped at module level.
-2. HF model weights not downloadable (network error, gated repo, missing
-   `huggingface-cli login`) → skipped per-test with the underlying exception
-   string.
-3. **IR divergence skip path** — Even when (1) and (2) succeed, the B0.5 IR
-   is known to diverge from the post-release HF Gemma 4 source on:
-     a) RMSNorm weight_mode (STANDARD_W vs ONE_PLUS_W),
-     b) absence of `v_norm` in our Attention path,
-     c) the proportional-RoPE geometry (Dh-wide vs Dh_rot-wide rotation),
-     d) the speculative qk_norm_fixed_scale absorption.
-   These deltas are documented as xfails in `test_isolation_hf.py`. With B0.5
-   IR locked, allclose at atol=5e-4 will *not* hold.
-
-   The test still runs end-to-end (loading the real weights, running the
-   reference HF layer, and our API layer), records the `max_abs_diff`, and
-   then `pytest.skip()` reporting the diff and the IR-divergence reason so
-   that the B0.6 IR-correction batch can use this same test to verify
-   convergence.
+Two skip paths remain:
+  1. ``transformers.models.gemma4`` not importable → skipped at module level.
+  2. HF model weights not downloadable (network error, gated repo, missing
+     `huggingface-cli login`) → skipped per-test with the underlying
+     exception string.
 
 The test is marked ``@pytest.mark.gate`` so CI can skip it without HF access.
 """
@@ -236,16 +225,6 @@ def test_layer0_forward_matches_hf(hf_model):
         api_out = api_blk(embed_out, position_ids=pos, cache=cache, start_pos=0)
 
     max_abs_diff = (hf_out - api_out).abs().max().item()
-    if max_abs_diff > ATOL:
-        pytest.skip(
-            f"B0.5 IR-divergence skip: layer-0 max_abs_diff = {max_abs_diff:.4e} "
-            f"exceeds atol={ATOL}. This is expected — the B0.5 IR diverges from "
-            "the post-release HF Gemma 4 source on (a) RMSNorm weight_mode "
-            "(STANDARD_W vs ONE_PLUS_W), (b) missing v_norm, (c) proportional-"
-            "RoPE geometry, (d) speculative qk_norm_fixed_scale absorption. "
-            "See test_isolation_hf.py xfails. To be resolved by the B0.6 IR-"
-            "correction batch; this test will pass once the IR is updated."
-        )
     assert torch.allclose(hf_out, api_out, atol=ATOL, rtol=RTOL), (
         f"max_abs_diff={max_abs_diff:.6f}, atol={ATOL}"
     )
@@ -351,13 +330,6 @@ def test_layer4_global_forward_matches_hf(hf_model):
         api_out = api_blk(embed_out, position_ids=pos, cache=cache, start_pos=0)
 
     max_abs_diff = (hf_out - api_out).abs().max().item()
-    if max_abs_diff > ATOL:
-        pytest.skip(
-            f"B0.5 IR-divergence skip: layer-{LAYER_IDX} max_abs_diff = "
-            f"{max_abs_diff:.4e} exceeds atol={ATOL}. Same root causes as "
-            "layer-0 test, plus partial-RoPE 0.25 geometry mismatch most "
-            "pronounced here. Defer to B0.6 IR-correction batch."
-        )
     assert torch.allclose(hf_out, api_out, atol=ATOL, rtol=RTOL), (
         f"layer-{LAYER_IDX} max_abs_diff={max_abs_diff:.6f}, atol={ATOL}"
     )

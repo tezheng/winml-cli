@@ -55,21 +55,31 @@ def load_hf_gemma4_layer(
       model.layers.{i}.input_layernorm.weight
       model.layers.{i}.self_attn.q_proj.weight
       model.layers.{i}.self_attn.k_proj.weight
-      model.layers.{i}.self_attn.v_proj.weight        (absent on 12B+ global w/ K=V)
+      model.layers.{i}.self_attn.v_proj.weight        (absent on 12B+ global w/ K=V or KV-shared layers)
       model.layers.{i}.self_attn.o_proj.weight
       model.layers.{i}.self_attn.q_norm.weight
-      model.layers.{i}.self_attn.k_norm.weight
+      model.layers.{i}.self_attn.k_norm.weight        (absent on KV-shared layers)
       model.layers.{i}.post_attention_layernorm.weight
       model.layers.{i}.pre_feedforward_layernorm.weight
       model.layers.{i}.post_feedforward_layernorm.weight
       model.layers.{i}.mlp.gate_proj.weight
       model.layers.{i}.mlp.up_proj.weight
       model.layers.{i}.mlp.down_proj.weight
+      model.layers.{i}.per_layer_input_gate.weight    (PLE-enabled only)
+      model.layers.{i}.per_layer_projection.weight    (PLE-enabled only)
+      model.layers.{i}.post_per_layer_input_norm.weight (PLE-enabled only)
+      model.layers.{i}.layer_scalar                    (registered buffer, shape [1])
 
-    B0.6 correction: HF Gemma 4 attention (`modeling_gemma4.py:1195`) sets
-    `self.scaling = 1.0` and the QK norms are vanilla STANDARD_W RMSNorm —
-    no fixed scale, no `1 +` term, no absorb. All QK-norm weights load
-    straight from the HF state dict.
+    The caller is responsible for stripping the `model.language_model.` prefix
+    when the checkpoint is a multimodal Gemma 4 model (E2B-it, etc.); after
+    that, `model.layers.{i}.<rest>` is the canonical layout.
+
+    B0.6 corrections vs B0.5:
+    - No absorb on QK norms (HF Gemma 4 attention scaling = 1.0,
+      modeling_gemma4.py:1195).
+    - PLE-related tensors (gate, projection, post_per_layer_input_norm) are
+      loaded when the block has those modules.
+    - `layer_scalar` buffer is loaded from the state dict.
     """
     prefix = f"model.layers.{layer_idx}."
 
@@ -94,6 +104,13 @@ def load_hf_gemma4_layer(
         mapping[prefix + "self_attn.q_norm.weight"] = blk.attention.q_norm.weight
         mapping[prefix + "self_attn.k_norm.weight"] = blk.attention.k_norm.weight
 
+    # B0.6: PLE-at-END plumbing — `per_layer_input_gate.weight`,
+    # `per_layer_projection.weight`, `post_per_layer_input_norm.weight`.
+    if blk.per_layer_input_gate is not None:
+        mapping[prefix + "per_layer_input_gate.weight"] = blk.per_layer_input_gate.weight
+        mapping[prefix + "per_layer_projection.weight"] = blk.per_layer_projection.weight
+        mapping[prefix + "post_per_layer_input_norm.weight"] = blk.post_per_layer_input_norm.weight
+
     missing = [k for k in mapping if k not in hf_state_dict]
     if missing:
         raise KeyError(f"missing tensors in state dict: {missing}")
@@ -106,3 +123,16 @@ def load_hf_gemma4_layer(
                     f"shape mismatch for {hf_name}: src {src.shape} vs slot {slot.shape}"
                 )
             slot.copy_(src.to(slot.dtype))
+
+        # B0.6: layer_scalar buffer (shape [1]) — only copy if present. HF
+        # persists this buffer to the state dict (modeling_gemma4.py:1382
+        # registers it with default persistent=True).
+        scalar_key = prefix + "layer_scalar"
+        if scalar_key in hf_state_dict:
+            src = hf_state_dict[scalar_key]
+            if src.shape != blk.layer_scalar.shape:
+                raise ValueError(
+                    f"shape mismatch for {scalar_key}: src {src.shape} vs "
+                    f"slot {blk.layer_scalar.shape}"
+                )
+            blk.layer_scalar.copy_(src.to(blk.layer_scalar.dtype))
