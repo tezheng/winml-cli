@@ -89,7 +89,12 @@ def test_llama3_scaling_matches_hf_compute_llama3_parameters():
 
 
 def test_rope_module_partial_rotary_factor():
-    """RoPE module with partial_rotary_factor=0.25 should only rotate the first quarter."""
+    """B0.6 — RoPE module with partial_rotary_factor=0.25 uses HF Gemma 4
+    proportional geometry. cos/sin tables are at FULL head_dim with zero-padded
+    inv_freq. With rope_angles = pr * head_dim // 2 = 8, the channels that pass
+    through identity are [rope_angles, head_dim/2) AND
+    [head_dim/2 + rope_angles, head_dim) — NOT a contiguous prefix split.
+    """
     spec = specs.RoPESpec(
         base_theta=1_000_000.0,
         basis=types.RoPEBasis.SPLIT_HALF,
@@ -98,9 +103,26 @@ def test_rope_module_partial_rotary_factor():
     head_dim = 64
     max_seq = 32
     module = rope.RoPE(spec, head_dim=head_dim, max_seq=max_seq, dtype=torch.float32)
-    # cos/sin tables should be sized for the rotated dim only
-    Dh_rot = int(head_dim * 0.25)
-    assert module.cos_cached.shape == (max_seq, Dh_rot)
+    # B0.6: cos/sin tables are FULL head_dim wide (zero-padded inv_freq).
+    assert module.cos_cached.shape == (max_seq, head_dim)
+    rope_angles = int(0.25 * head_dim // 2)
+    assert rope_angles == 8
+
+    # The trailing channels of inv_freq must be zero (so cos=1, sin=0 there).
+    # Position 0 is special (any inv_freq * 0 = 0, so cos=1 everywhere).
+    # Use position 1: cos[1, rope_angles:Dh/2] should be 1, sin[1, ...] = 0.
+    cos1 = module.cos_cached[1]
+    sin1 = module.sin_cached[1]
+    Dh_half = head_dim // 2
+    assert torch.allclose(cos1[rope_angles:Dh_half], torch.ones(Dh_half - rope_angles),
+                          atol=1e-6)
+    assert torch.allclose(sin1[rope_angles:Dh_half], torch.zeros(Dh_half - rope_angles),
+                          atol=1e-6)
+    # Same for the second half (mirror of the inv_freq zeros).
+    assert torch.allclose(cos1[Dh_half + rope_angles:], torch.ones(Dh_half - rope_angles),
+                          atol=1e-6)
+    assert torch.allclose(sin1[Dh_half + rope_angles:], torch.zeros(Dh_half - rope_angles),
+                          atol=1e-6)
 
     B, S, H = 1, 8, 4
     q = torch.randn(B, S, H, head_dim)
@@ -108,5 +130,12 @@ def test_rope_module_partial_rotary_factor():
     pos = torch.arange(S)
     q_rot, k_rot = module(q, k, pos)
     assert q_rot.shape == q.shape
-    # Non-rotated tail (channels Dh_rot..Dh) should be identical
-    assert torch.allclose(q_rot[..., Dh_rot:], q[..., Dh_rot:], atol=1e-6)
+    # The "identity" channel slabs: [rope_angles, Dh/2) and [Dh/2 + rope_angles, Dh).
+    # By rotate_half pairing (i ↔ i + Dh/2 with sign flip on second), channel i
+    # in [rope_angles, Dh/2) has cos[i]=1, sin[i]=0 → output[i] = x[i]. And
+    # channel i' = i + Dh/2 in [Dh/2 + rope_angles, Dh) has cos[i']=1, sin[i']=0
+    # → output[i'] = x[i'].
+    assert torch.allclose(q_rot[..., rope_angles:Dh_half],
+                          q[..., rope_angles:Dh_half], atol=1e-6)
+    assert torch.allclose(q_rot[..., Dh_half + rope_angles:],
+                          q[..., Dh_half + rope_angles:], atol=1e-6)

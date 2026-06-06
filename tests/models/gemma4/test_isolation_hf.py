@@ -146,37 +146,37 @@ def test_apply_rotary_pos_emb_full_matches_hf():
 
 
 def test_partial_rope_inv_freq_structure_matches_hf_proportional():
-    """HF's proportional RoPE puts rotating freqs in the first ``rope_proportion *
-    head_dim/2`` slots, zeros in the rest, then computes cos/sin at full Dh.
-
-    Our implementation builds cos/sin at length ``Dh_rot`` only, then slices Q
-    and rotates the first Dh_rot channels. The two should produce *equivalent*
-    Q/K outputs because zero-frequency RoPE is the identity (cos=1, sin=0).
+    """B0.6 — our `api.rope.RoPE` now builds inv_freq the HF-proportional way:
+    first `rope_angles` slots hold real frequencies computed at FULL head_dim
+    denominator, remaining slots are zero. cos/sin are computed at full
+    head_dim length.
     """
     Dh = 16
     pr = 0.25  # 4 rotating channels
     rope_angles = int(pr * Dh // 2)  # 2
-    # HF inv_freq: rope_angles freqs of base 1e6, then nope_angles zeros
     base = 1_000_000.0
+
+    # HF reference inv_freq
     inv_freq_rot = 1.0 / (base ** (torch.arange(0, 2 * rope_angles, 2).float() / Dh))
     nope = Dh // 2 - rope_angles
     inv_freq_hf = torch.cat([inv_freq_rot, torch.zeros(nope)], dim=0)
-    # Build cos/sin at full Dh:
     S = 5
     pos = torch.arange(S).float()
     freqs_hf = torch.outer(pos, inv_freq_hf)
     cos_hf = torch.cat([freqs_hf.cos(), freqs_hf.cos()], dim=-1)
     sin_hf = torch.cat([freqs_hf.sin(), freqs_hf.sin()], dim=-1)
-    # The non-rotating frequencies are 0 → cos=1, sin=0 → identity.
-    # Check structure:
+    # Structural check that the trailing slots are identity.
     assert torch.allclose(cos_hf[:, rope_angles:Dh // 2], torch.ones(S, nope))
     assert torch.allclose(sin_hf[:, rope_angles:Dh // 2], torch.zeros(S, nope))
-    # And the rotating part matches what our partial path uses (head_dim_rot=Dh*pr).
-    Dh_rot = int(Dh * pr)
-    inv_freq_api = 1.0 / (base ** (torch.arange(0, Dh_rot, 2).float() / Dh_rot))
-    # NB: these are NOT equal because HF divides by head_dim while we divide
-    # by head_dim_rot. This is one of the IR drifts — captured separately.
-    assert not torch.allclose(inv_freq_hf[:rope_angles], inv_freq_api)
+
+    # Our RoPE module must produce the same cos/sin tables.
+    from api import rope as api_rope_mod
+    spec = specs.RoPESpec(base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
+                          partial_rotary_factor=pr)
+    module = api_rope_mod.RoPE(spec, head_dim=Dh, max_seq=S, dtype=torch.float32)
+    assert module.cos_cached.shape == (S, Dh)
+    assert torch.allclose(module.cos_cached, cos_hf, atol=ATOL)
+    assert torch.allclose(module.sin_cached, sin_hf, atol=ATOL)
 
 
 # ---------- 2. IR-DIVERGENCE SUB-OPS (xfail, with documented reason) ----------
@@ -237,29 +237,26 @@ def test_gemma4_v_norm_supported():
     assert block_spec.token_mixer.v_norm_with_scale is False
 
 
-@pytest.mark.xfail(
-    reason="B0.5 IR drift: HF Gemma 4 partial-RoPE (proportional rope_type) "
-    "applies cos/sin of FULL head_dim length with zero-frequency padding in "
-    "the second quarter — rotate_half operates on the full head_dim/2 split. "
-    "Our rope_apply_partial slices the first Dh_rot channels and rotates only "
-    "those (a head_dim_rot split). Both yield 'RoPE on a prefix of head_dim' "
-    "but the GEOMETRIC structure differs: HF's rotate_half pairs channel i with "
-    "channel i + Dh/2 for ALL i, even when channel i's frequency is zero, while "
-    "ours pairs channel i with channel i + Dh_rot/2 only for i < Dh_rot/2. "
-    "The two are not numerically equivalent for partial_rotary_factor < 1.",
-    strict=True,
-)
-def test_partial_rope_full_geometry_matches_hf_xfail():
-    """A non-zero Q tensor should produce the same partial-RoPE output via either path."""
+def test_partial_rope_full_geometry_matches_hf():
+    """B0.6 fixed: The `api.rope.RoPE` module's partial-RoPE path now uses HF
+    Gemma 4 proportional geometry — inv_freq is built with real freqs at the
+    first `rope_angles` slots and zeros after, cos/sin computed at FULL
+    head_dim, and rotate_half pairs i ↔ i + Dh/2 for all i. The module's
+    forward output now matches HF's apply_rotary_pos_emb exactly.
+
+    Verified against `modeling_rope_utils.py::_compute_proportional_rope_parameters`
+    (inv_freq layout) and `modeling_gemma4.py:787` (apply_rotary_pos_emb).
+    """
     torch.manual_seed(3)
     B, S, H, Dh = 1, 4, 2, 16
     pr = 0.25  # 4 rotating channels
     base = 1_000_000.0
 
     q = torch.randn(B, S, H, Dh)
-    pos = torch.arange(S).float()
+    pos_ids = torch.arange(S)
+    pos = pos_ids.float()
 
-    # HF path
+    # HF reference
     rope_angles = int(pr * Dh // 2)
     nope = Dh // 2 - rope_angles
     inv_freq_rot = 1.0 / (base ** (torch.arange(0, 2 * rope_angles, 2).float() / Dh))
@@ -269,14 +266,12 @@ def test_partial_rope_full_geometry_matches_hf_xfail():
     sin_hf = torch.cat([freqs_hf.sin(), freqs_hf.sin()], dim=-1).unsqueeze(0).expand(B, -1, -1)
     hf_q = g.apply_rotary_pos_emb(q, cos_hf, sin_hf, unsqueeze_dim=2)
 
-    # Our path
-    Dh_rot = int(Dh * pr)
-    inv_freq_api = 1.0 / (base ** (torch.arange(0, Dh_rot, 2).float() / Dh_rot))
-    freqs_api = torch.outer(pos, inv_freq_api)
-    cos_api = torch.cat([freqs_api.cos(), freqs_api.cos()], dim=-1)
-    sin_api = torch.cat([freqs_api.sin(), freqs_api.sin()], dim=-1)
-    api_q, _ = ops.rope_apply_partial(q, q, cos_api, sin_api,
-                                       partial_rotary_factor=pr, basis="split_half")
+    # Our path: build the RoPE module with the same spec
+    from api import rope as api_rope_mod
+    spec = specs.RoPESpec(base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
+                          partial_rotary_factor=pr)
+    module = api_rope_mod.RoPE(spec, head_dim=Dh, max_seq=S, dtype=torch.float32)
+    api_q, _ = module(q, q, pos_ids)
     assert torch.allclose(hf_q, api_q, atol=ATOL, rtol=RTOL), (
         f"max_abs_diff={(hf_q - api_q).abs().max().item():.2e}"
     )
