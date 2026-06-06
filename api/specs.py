@@ -35,6 +35,9 @@ class RoPESpec:
     scale_factor: Optional[float] = None
     llama3_extra: Optional[Llama3RoPEParams] = None
 
+    # B0.5: partial-rotary (Gemma 4 global = 0.25; Phi-3 legacy = 0.5; MLA = qk_rope/qk_head)
+    partial_rotary_factor: float = 1.0
+
 
 @dataclass(frozen=True)
 class AttentionSpec:
@@ -59,6 +62,10 @@ class AttentionSpec:
     qk_norm_shape: types.QKNormShape = types.QKNormShape.NONE
 
     rope: Optional[RoPESpec] = None
+
+    # B0.5: Gemma 4 additions (all backward-compatible — defaults match v1 behavior)
+    attention_k_eq_v: bool = False             # Gemma 4 12B/26B/31B global: K and V projections aliased
+    qk_norm_fixed_scale: Optional[float] = None # Gemma 4 fixed-scale gain absorbing 1/sqrt(Dh); when set, attn_scale should be 1.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,10 @@ class KVCacheSpec:
     block_size: Optional[int] = None
     k_quant: Optional[QuantSpec] = None
     v_quant: Optional[QuantSpec] = None
+
+    # B0.5: cross-layer sharing
+    share_scheme: types.ShareScheme = types.ShareScheme.NONE
+    num_kv_shared_layers: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,25 @@ class LayerScaleSpec:
 
 
 @dataclass(frozen=True)
+class PLESpec:
+    """Per-Layer Embedding spec (Gemma 4 E2B/E4B — axis A19).
+
+    The PLE table has dimension `ple_dim` (typically 256), much smaller than the
+    main residual hidden_size. Its output is normalized and injected at every
+    decoder layer as a residual term scaled by `residual_scale` (Gemma 4 uses 1/sqrt(2)).
+
+    On Gemma 4 the PLE row for token t is computed as
+        ple_row = (token_identity_emb + context_aware_projection) * residual_scale
+    and the projection is the layer-local linear that maps from the embedding
+    to the hidden_size for that layer's residual injection. Behaviour lives in
+    api/embedding.py — this spec is pure data.
+    """
+    ple_dim: int
+    residual_scale: float
+    injection_norm: "NormSpec"
+
+
+@dataclass(frozen=True)
 class DecoderBlockSpec:
     attn_norm_position: types.NormPosition
     ffn_norm_position: types.NormPosition
@@ -173,3 +203,7 @@ class DecoderBlockSpec:
     residual_scale: Optional[float] = None
     embedding_scale: Optional[float] = None
     logits_scale: Optional[float] = None
+
+    # B0.5
+    per_layer_embedding: Optional[PLESpec] = None
+    final_logit_softcap: Optional[float] = None    # Gemma 4 = 30.0 (model-level; carried here for assembly)

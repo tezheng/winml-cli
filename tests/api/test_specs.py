@@ -122,3 +122,96 @@ def test_qk_norm_phase_has_pre_rope_fixed_scale():
 def test_mask_kind_has_swa_global_alt():
     # Gemma 3 / 4 alternate SWA local with full-attention global layers at 5:1.
     assert types.MaskKind.SWA_GLOBAL_ALT
+
+
+def test_attention_spec_has_attention_k_eq_v():
+    spec = specs.AttentionSpec(
+        n_q_heads=16, n_kv_heads=8, head_dim=256,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        attention_k_eq_v=True,
+    )
+    assert spec.attention_k_eq_v is True
+
+
+def test_attention_spec_has_qk_norm_fixed_scale():
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=1, head_dim=256,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.SWA,
+        qk_norm_fixed_scale=0.9916,  # Gemma 4 local
+    )
+    assert spec.qk_norm_fixed_scale == 0.9916
+
+
+def test_attention_spec_has_final_logit_softcap_marker():
+    # final_logit_softcap belongs on the *model* level (lm_head op), but the block-level
+    # spec carries it for the assembly path. We put it on DecoderBlockSpec.
+    pass  # tested via DecoderBlockSpec below
+
+
+def test_rope_spec_has_partial_rotary_factor():
+    spec = specs.RoPESpec(
+        base_theta=1_000_000.0,
+        basis=types.RoPEBasis.SPLIT_HALF,
+        partial_rotary_factor=0.25,  # Gemma 4 global
+    )
+    assert spec.partial_rotary_factor == 0.25
+
+
+def test_rope_spec_partial_rotary_default_is_one():
+    spec = specs.RoPESpec(base_theta=1_000_000.0, basis=types.RoPEBasis.SPLIT_HALF)
+    assert spec.partial_rotary_factor == 1.0  # full rotation by default
+
+
+def test_kvcache_spec_has_share_scheme():
+    spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.bfloat16, v_dtype=torch.bfloat16,
+        share_scheme=types.ShareScheme.SAME_BLOCK_SHARED,
+        num_kv_shared_layers=20,
+    )
+    assert spec.share_scheme == types.ShareScheme.SAME_BLOCK_SHARED
+    assert spec.num_kv_shared_layers == 20
+
+
+def test_ple_spec_exists():
+    spec = specs.PLESpec(
+        ple_dim=256,
+        residual_scale=1.0 / (2 ** 0.5),
+        injection_norm=specs.NormSpec(
+            kind=types.NormKind.RMS, eps=1e-6,
+            weight_mode=types.NormWeightMode.ONE_PLUS_W,
+        ),
+    )
+    assert spec.ple_dim == 256
+
+
+def test_decoder_block_spec_has_pre_ple_injection():
+    norm = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                          weight_mode=types.NormWeightMode.ONE_PLUS_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=1, head_dim=256,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.SWA,
+    )
+    ffn = specs.FFNSpec(intermediate_size=8192,
+                       activation=types.Activation.GELU,
+                       gate_kind=types.GateKind.GEGLU)
+    ple = specs.PLESpec(ple_dim=256, residual_scale=0.7071,
+                       injection_norm=norm)
+    block = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE_AND_POST,
+        ffn_norm_position=types.NormPosition.PRE_AND_POST,
+        token_mixer=attn, channel_mixer=ffn,
+        pre_attn_norm=norm, post_attn_norm=norm,
+        pre_ffn_norm=norm, post_ffn_norm=norm,
+        per_layer_embedding=ple,
+        final_logit_softcap=30.0,
+    )
+    assert block.per_layer_embedding is ple
+    assert block.final_logit_softcap == 30.0
