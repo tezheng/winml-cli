@@ -115,6 +115,46 @@ def rope_apply(
     return q_rot, k_rot
 
 
+def rope_apply_partial(
+    q: torch.Tensor,           # [B, S, H, Dh]
+    k: torch.Tensor,           # [B, S, Hk, Dh]
+    cos: torch.Tensor,         # [S, Dh_rot] — cos/sin computed at the rotated dim only
+    sin: torch.Tensor,         # [S, Dh_rot]
+    partial_rotary_factor: float,
+    basis: str = "split_half",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to only the first `partial_rotary_factor * Dh` channels of each head.
+
+    For Gemma 4 global layers: partial_rotary_factor=0.25, so the first 64 of 256
+    head_dim channels rotate, the remaining 192 pass through unchanged.
+
+    For MLA: q_rope is a separate sub-head dim already so the caller pre-slices;
+    this helper handles the simpler "head is a single tensor with a rotated prefix"
+    case used by Gemma 4 and Phi-3 partial-RoPE.
+    """
+    if not (0.0 < partial_rotary_factor <= 1.0):
+        raise ValueError(f"partial_rotary_factor must be in (0, 1], got {partial_rotary_factor}")
+    if partial_rotary_factor == 1.0:
+        return rope_apply(q, k, cos, sin, basis=basis)
+
+    Dh = q.shape[-1]
+    Dh_rot = int(Dh * partial_rotary_factor)
+    if Dh_rot % 2 != 0:
+        raise ValueError(f"rotated head_dim ({Dh_rot}) must be even")
+    if cos.shape[-1] != Dh_rot or sin.shape[-1] != Dh_rot:
+        raise ValueError(f"cos/sin last dim must equal Dh_rot ({Dh_rot}), got {cos.shape[-1]}")
+
+    q_rot_in, q_pass = q[..., :Dh_rot], q[..., Dh_rot:]
+    k_rot_in, k_pass = k[..., :Dh_rot], k[..., Dh_rot:]
+    q_rot, k_rot = rope_apply(q_rot_in, k_rot_in, cos, sin, basis=basis)
+    return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
+
+
+def gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
+    """Gemma's `gelu_pytorch_tanh` activation — `F.gelu(x, approximate='tanh')`."""
+    return F.gelu(x, approximate="tanh")
+
+
 def sdpa(
     q: torch.Tensor,                       # [B, Hq, S, Dh]
     k: torch.Tensor,                       # [B, Hk, S, Dh]

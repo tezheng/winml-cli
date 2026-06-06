@@ -228,3 +228,34 @@ def test_conv1d_matches_torch():
 def test_selective_scan_raises_until_m2():
     with pytest.raises(NotImplementedError, match="M2"):
         ops.selective_scan()
+
+
+def test_rope_apply_partial_rotary_factor_quarter():
+    """Gemma 4 global RoPE: only the first 25% of head_dim channels rotate."""
+    B, S, H, Dh = 1, 4, 2, 16
+    q = torch.randn(B, S, H, Dh, dtype=torch.float32)
+    k = torch.randn(B, S, H, Dh, dtype=torch.float32)
+
+    # Build cos/sin for the rotated portion only (Dh_rot = 4 channels of the head)
+    Dh_rot = int(Dh * 0.25)  # 4
+    freqs = torch.linspace(0.1, 1.0, Dh_rot // 2)
+    positions = torch.arange(S).float().unsqueeze(-1) * freqs.unsqueeze(0)
+    cos_rot = torch.cat([positions.cos(), positions.cos()], dim=-1)  # [S, Dh_rot]
+    sin_rot = torch.cat([positions.sin(), positions.sin()], dim=-1)
+
+    q_rot, k_rot = ops.rope_apply_partial(q, k, cos_rot, sin_rot,
+                                          partial_rotary_factor=0.25,
+                                          basis="split_half")
+    # Non-rotated tail (channels Dh_rot..Dh) is identical to input
+    assert torch.allclose(q_rot[..., Dh_rot:], q[..., Dh_rot:], atol=1e-7)
+    assert torch.allclose(k_rot[..., Dh_rot:], k[..., Dh_rot:], atol=1e-7)
+    # Rotated head (first Dh_rot channels) differs from input at non-zero positions
+    assert not torch.allclose(q_rot[:, 1, :, :Dh_rot], q[:, 1, :, :Dh_rot], atol=1e-3)
+
+
+def test_gelu_pytorch_tanh_matches_torch():
+    """Gemma 4 uses hidden_activation='gelu_pytorch_tanh'."""
+    x = torch.randn(2, 4, 8)
+    out = ops.gelu_pytorch_tanh(x)
+    ref = F.gelu(x, approximate="tanh")
+    assert torch.allclose(out, ref, atol=1e-6)
