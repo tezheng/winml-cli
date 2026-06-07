@@ -53,8 +53,11 @@ class Attention(nn.Module):
                 )
             if spec.attention_k_eq_v:
                 raise NotImplementedError("MLA + attention_k_eq_v unsupported")
-            if spec.qk_norm is not None:
-                raise NotImplementedError("MLA + qk_norm unsupported")
+            # NOTE: spec.qk_norm is OVERLOADED for MLA. For STANDARD attention
+            # it would mean a Qwen3-style PRE-RoPE QK-norm; for MLA it carries
+            # the rms_norm_eps used by q_a_layernorm / kv_a_layernorm. The MLA
+            # branch reads ONLY .eps (and .weight_mode) from it; if None we
+            # default to 1e-5. spec.v_norm is not used by MLA.
             if spec.v_norm is not None:
                 raise NotImplementedError("MLA + v_norm unsupported")
             self._init_mla(spec, hidden_size, max_seq, dtype)
