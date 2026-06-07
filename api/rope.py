@@ -14,6 +14,70 @@ from torch import nn
 from api import ops, specs, types
 
 
+def _yarn_inv_freq_and_scale(
+    base: float,
+    dim_rot: int,
+    extra: specs.YarnRoPEParams,
+) -> tuple[torch.Tensor, float]:
+    """YARN scaling (DeepSeek-V2/V3 family).
+
+    Mirrors transformers/modeling_rope_utils.py::_compute_yarn_parameters
+    (L327-459). Returns (inv_freq, attention_factor).
+
+    Note: when `extra.factor <= 1` the helper get_mscale returns 1.0 and we
+    short-circuit the standard NTK-like extrapolation path back to the
+    "no-scale" branch.
+    """
+    import math
+    factor = extra.factor
+    original = extra.original_max_position_embeddings
+    beta_fast = extra.beta_fast
+    beta_slow = extra.beta_slow
+    truncate = extra.truncate
+
+    def get_mscale(scale: float, mscale: float = 1.0) -> float:
+        if scale <= 1.0:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    if extra.mscale > 0 and extra.mscale_all_dim > 0:
+        attention_factor = float(
+            get_mscale(factor, extra.mscale) / get_mscale(factor, extra.mscale_all_dim)
+        )
+    else:
+        attention_factor = get_mscale(factor)
+
+    def find_correction_dim(num_rotations: float, dim: int, b: float, max_pos: int) -> float:
+        return (dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(b))
+
+    def find_correction_range(low_rot: float, high_rot: float, dim: int, b: float,
+                              max_pos: int, trunc: bool) -> tuple[float, float]:
+        low = find_correction_dim(low_rot, dim, b, max_pos)
+        high = find_correction_dim(high_rot, dim, b, max_pos)
+        if trunc:
+            low = math.floor(low)
+            high = math.ceil(high)
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(low: float, high: float, half_dim: int) -> torch.Tensor:
+        if low == high:
+            high = high + 0.001
+        linear_func = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
+        return torch.clamp(linear_func, 0.0, 1.0)
+
+    pos_freqs = base ** (torch.arange(0, dim_rot, 2, dtype=torch.float32) / dim_rot)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    low, high = find_correction_range(beta_fast, beta_slow, dim_rot, base, original, truncate)
+    ramp = linear_ramp_factor(low, high, dim_rot // 2)
+    inv_freq_extrapolation_factor = 1.0 - ramp
+    inv_freq = (
+        inv_freq_interpolation * (1.0 - inv_freq_extrapolation_factor)
+        + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    )
+    return inv_freq, attention_factor
+
+
 def _llama3_scale_inv_freq(
     inv_freq: torch.Tensor,
     extra: specs.Llama3RoPEParams,
@@ -77,10 +141,15 @@ class RoPE(nn.Module):
                 raise NotImplementedError(
                     "INTERLEAVED basis with partial_rotary_factor != 1.0 not supported"
                 )
-            if spec.scaling not in (types.RoPEScaling.NONE, types.RoPEScaling.LLAMA3):
+            # B5: YARN-scaled INTERLEAVED is needed for DeepSeek-V2-Lite
+            # production RoPE. Source: modeling_deepseek_v2.py:271-284
+            # (complex-multiply pairing on (re, im) channel pairs).
+            if spec.scaling not in (types.RoPEScaling.NONE,
+                                    types.RoPEScaling.LLAMA3,
+                                    types.RoPEScaling.YARN):
                 raise NotImplementedError(
-                    f"INTERLEAVED basis supports NONE / LLAMA3 scaling only, "
-                    f"got {spec.scaling}"
+                    f"INTERLEAVED basis supports NONE / LLAMA3 / YARN scaling "
+                    f"only, got {spec.scaling}"
                 )
         if spec.partial_rotary_kind not in ("prefix", "proportional"):
             raise ValueError(
@@ -89,6 +158,7 @@ class RoPE(nn.Module):
             )
         self.spec = spec
         self.head_dim = head_dim
+        self._yarn_attention_factor: float | None = None
         # rope_angles == number of real (non-zero) frequencies. HF formula:
         #   rope_angles = int(partial_rotary_factor * head_dim // 2)
         rope_angles = int(spec.partial_rotary_factor * head_dim // 2)
@@ -187,9 +257,30 @@ class RoPE(nn.Module):
             self.register_buffer("cos_cached_long", cos_long, persistent=False)
             self.register_buffer("sin_cached_long", sin_long, persistent=False)
             return
+        elif spec.scaling == types.RoPEScaling.YARN:
+            # B5: YARN scaling — DeepSeek-V2-Lite / V3. Replaces inv_freq with
+            # the YARN linear-ramp blend of extrapolation and interpolation,
+            # then multiplies cos/sin by attention_factor (the mscale term).
+            # Compatible with INTERLEAVED + SPLIT_HALF basis. Compatible with
+            # partial_rotary_factor < 1.0 in "prefix" kind only — the
+            # YARN dim_rot is head_dim_rot (per HF
+            # `dim = head_dim * partial_rotary_factor`).
+            # Source: modeling_rope_utils.py:_compute_yarn_parameters L327-459.
+            if spec.yarn_extra is None:
+                raise ValueError("YARN scaling requires yarn_extra")
+            if self._partial_kind == "proportional" and nope_angles > 0:
+                raise NotImplementedError(
+                    "YARN + proportional partial-rotary not supported"
+                )
+            dim_rot = max(2 * rope_angles, 2)
+            inv_freq_yarn, att_yarn = _yarn_inv_freq_and_scale(
+                spec.base_theta, dim_rot, spec.yarn_extra,
+            )
+            inv_freq = inv_freq_yarn
+            self._yarn_attention_factor = float(att_yarn)
         elif spec.scaling != types.RoPEScaling.NONE:
             raise NotImplementedError(
-                f"B2a supports NONE, LLAMA3, LONGROPE scaling only, got {spec.scaling}"
+                f"B5 supports NONE, LLAMA3, LONGROPE, YARN scaling only, got {spec.scaling}"
             )
 
         t = torch.arange(max_seq).float()
@@ -199,12 +290,23 @@ class RoPE(nn.Module):
         # - SPLIT_HALF + "proportional": [max_seq, head_dim] — full-dim, with
         #   cos=1, sin=0 in the trailing zero-inv_freq channels.
         # - INTERLEAVED: [max_seq, head_dim/2] — one entry per (real, imag) pair.
+        att_post_mul = getattr(self, "_yarn_attention_factor", None)
         if spec.basis == types.RoPEBasis.INTERLEAVED:
-            cos = freqs.cos().to(dtype)             # [max_seq, head_dim/2]
-            sin = freqs.sin().to(dtype)
+            cos = freqs.cos()                       # [max_seq, head_dim/2]
+            sin = freqs.sin()
+            if att_post_mul is not None:
+                cos = cos * att_post_mul
+                sin = sin * att_post_mul
+            cos = cos.to(dtype)
+            sin = sin.to(dtype)
         else:
-            cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(dtype)
-            sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).to(dtype)
+            cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)
+            sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
+            if att_post_mul is not None:
+                cos = cos * att_post_mul
+                sin = sin * att_post_mul
+            cos = cos.to(dtype)
+            sin = sin.to(dtype)
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
         self._longrope_boundary = None

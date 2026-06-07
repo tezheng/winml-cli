@@ -290,3 +290,97 @@ def test_interleaved_rope_identity_at_position_0():
     q_rot, k_rot = module(q, k, pos)
     assert torch.allclose(q_rot, q, atol=1e-6)
     assert torch.allclose(k_rot, k, atol=1e-6)
+
+
+def test_b5_yarn_inv_freq_matches_hf_compute_yarn_parameters():
+    """B5: YARN inv_freq must match HF's _compute_yarn_parameters exactly.
+
+    Uses DeepSeek-V2-Lite's actual production rope_scaling block as a fixture.
+    Source: deepseek-ai/DeepSeek-V2-Lite/config.json (factor=40, beta_fast=32,
+    beta_slow=1, mscale=0.707, mscale_all_dim=0.707, original=4096).
+    """
+    from transformers.modeling_rope_utils import _compute_yarn_parameters
+    from api.rope import _yarn_inv_freq_and_scale
+
+    class _FakeCfg:
+        head_dim = 64
+        hidden_size = 1024
+        num_attention_heads = 16
+        rope_parameters = {
+            "rope_type": "yarn",
+            "rope_theta": 10000.0,
+            "factor": 40.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 0.707,
+            "mscale_all_dim": 0.707,
+            "original_max_position_embeddings": 4096,
+        }
+        max_position_embeddings = 163840
+        def standardize_rope_params(self):
+            pass
+
+    hf_inv_freq, hf_att = _compute_yarn_parameters(_FakeCfg())
+    extra = specs.YarnRoPEParams(
+        factor=40.0, original_max_position_embeddings=4096,
+        beta_fast=32, beta_slow=1, mscale=0.707, mscale_all_dim=0.707,
+    )
+    ours_inv_freq, ours_att = _yarn_inv_freq_and_scale(10000.0, 64, extra)
+    assert torch.allclose(hf_inv_freq, ours_inv_freq, atol=1e-6)
+    assert abs(hf_att - ours_att) < 1e-9
+
+
+def test_b5_yarn_attention_factor_non_unity_case():
+    """B5: when mscale_all_dim is 0, attention_factor falls back to get_mscale(factor)."""
+    from api.rope import _yarn_inv_freq_and_scale
+    extra = specs.YarnRoPEParams(
+        factor=40.0, original_max_position_embeddings=4096,
+        beta_fast=32, beta_slow=1, mscale=1.0, mscale_all_dim=0.0,
+    )
+    _, att = _yarn_inv_freq_and_scale(10000.0, 64, extra)
+    # get_mscale(40, 1.0) = 0.1 * 1.0 * log(40) + 1.0
+    import math
+    expected = 0.1 * 1.0 * math.log(40.0) + 1.0
+    assert abs(att - expected) < 1e-9
+
+
+def test_b5_yarn_interleaved_matches_v2_complex_multiply():
+    """B5: INTERLEAVED basis + YARN scaling reproduces V2 RoPE math.
+
+    DeepSeek-V2 uses `view_as_complex(reshape(*, -1, 2))` + complex multiply
+    with `polar(ones, freqs)` (modeling_deepseek_v2.py:271-284). Our
+    INTERLEAVED basis is the same complex multiply on (real, imag) pairs.
+    """
+    yarn = specs.YarnRoPEParams(
+        factor=40.0, original_max_position_embeddings=4096,
+        beta_fast=32, beta_slow=1, mscale=0.707, mscale_all_dim=0.707,
+    )
+    spec = specs.RoPESpec(
+        base_theta=10000.0,
+        basis=types.RoPEBasis.INTERLEAVED,
+        scaling=types.RoPEScaling.YARN,
+        yarn_extra=yarn,
+    )
+    mod = rope.RoPE(spec, head_dim=64, max_seq=128, dtype=torch.float32)
+    assert mod.cos_cached.shape == (128, 32)
+
+    # Replicate V2 forward inline.
+    from api.rope import _yarn_inv_freq_and_scale
+    inv_freq_yarn, _ = _yarn_inv_freq_and_scale(10000.0, 64, yarn)
+    positions = torch.arange(8).float()
+    freqs = positions.view(8, 1) * inv_freq_yarn.view(1, 32)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex [8, 32]
+
+    torch.manual_seed(7)
+    B, H, S, D = 1, 4, 8, 64
+    q = torch.randn(B, H, S, D)
+    q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    fc = freqs_cis.unsqueeze(0).unsqueeze(0)        # [1, 1, S, D/2]
+    hf_out = torch.view_as_real(q_ * fc).flatten(3).type_as(q)
+
+    q_api = q.transpose(1, 2)                       # [B, S, H, D]
+    k_api = torch.zeros_like(q_api)
+    q_rot, _ = mod(q_api, k_api, positions.long())
+    q_rot_b = q_rot.transpose(1, 2)
+    diff = (q_rot_b - hf_out).abs().max().item()
+    assert diff < 1e-5, f"max_abs_diff={diff:.3e}"
