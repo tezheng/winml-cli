@@ -115,6 +115,25 @@ class AttentionSpec:
     v_norm: Optional[NormSpec] = None
     v_norm_with_scale: bool = True             # False for Gemma 4 (unit RMSNorm)
 
+    # B2b: MLA-specific dims (MiniCPM-3 / DeepSeek-V2 / V3 family). When
+    # `kind == AttentionKind.MLA`, the following five fields are REQUIRED.
+    # For non-MLA they MUST be None and `head_dim` carries the normal Dh.
+    #
+    # Source (MiniCPM-3): modeling_minicpm.py:351-357
+    #   q_lora_rank, qk_rope_head_dim, kv_lora_rank, v_head_dim = hidden_size // num_attention_heads,
+    #   qk_nope_head_dim, q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    # Source (DeepSeek-V2): modeling_deepseek_v2.py:300-305 (same five fields).
+    #
+    # Note that for MLA, the per-head Q/K assembly dim is qk_nope_head_dim +
+    # qk_rope_head_dim, while V's per-head dim is v_head_dim — usually NOT
+    # equal. The attention scale is `(qk_nope_head_dim + qk_rope_head_dim) ** -0.5`
+    # per modeling_deepseek_v2.py:335 / modeling_minicpm.py:387.
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+
 
 @dataclass(frozen=True)
 class FFNSpec:

@@ -215,3 +215,51 @@ def test_decoder_block_spec_has_pre_ple_injection():
     )
     assert block.per_layer_embedding is ple
     assert block.final_logit_softcap == 30.0
+
+
+def test_attention_spec_mla_fields_default_none():
+    """B2b: MLA fields default to None for non-MLA specs."""
+    spec = specs.AttentionSpec(
+        n_q_heads=16, n_kv_heads=8, head_dim=128,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+    )
+    assert spec.q_lora_rank is None
+    assert spec.kv_lora_rank is None
+    assert spec.qk_nope_head_dim is None
+    assert spec.qk_rope_head_dim is None
+    assert spec.v_head_dim is None
+
+
+def test_attention_spec_mla_minicpm3_shape():
+    """B2b: MLA spec for MiniCPM-3.
+
+    Source: modeling_minicpm.py:351-357 / config.json (q_lora_rank=768,
+    kv_lora_rank=256, qk_nope_head_dim=64, qk_rope_head_dim=32,
+    v_head_dim = hidden_size/n_heads = 2560/40 = 64).
+    """
+    spec = specs.AttentionSpec(
+        n_q_heads=40, n_kv_heads=40, head_dim=96,  # qk_head_dim
+        kind=types.AttentionKind.MLA,
+        qkv_layout=types.QKVLayout.MLA_LATENT,
+        mask_kind=types.MaskKind.CAUSAL,
+        q_lora_rank=768,
+        kv_lora_rank=256,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+    )
+    assert spec.kind == types.AttentionKind.MLA
+    assert spec.qkv_layout == types.QKVLayout.MLA_LATENT
+    assert spec.qk_nope_head_dim + spec.qk_rope_head_dim == spec.head_dim
+
+
+def test_mask_kind_block_sparse_enum():
+    """B2b: BlockSparse mask kind exists on the enum (Phi-3-small)."""
+    assert hasattr(types.MaskKind, "BLOCK_SPARSE")
+
+
+def test_activation_gegelu_enum():
+    """B2b: Phi-3-small uses GeGELU activation. Enum value exists."""
+    assert hasattr(types.Activation, "GEGELU")
