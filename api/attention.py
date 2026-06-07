@@ -96,9 +96,13 @@ class Attention(nn.Module):
             raise NotImplementedError(
                 f"B2a: SPLIT and FUSED QKV only, got {spec.qkv_layout}"
             )
-        if spec.mask_kind not in (types.MaskKind.CAUSAL, types.MaskKind.SWA):
+        if spec.mask_kind not in (
+            types.MaskKind.CAUSAL, types.MaskKind.SWA,
+            types.MaskKind.BLOCK_BIDIRECTIONAL,
+        ):
             raise NotImplementedError(
-                f"B0.5: CAUSAL and SWA masks only, got {spec.mask_kind}"
+                f"B8: CAUSAL, SWA, and BLOCK_BIDIRECTIONAL masks only, "
+                f"got {spec.mask_kind}"
             )
         self.spec = spec
         self.hidden_size = hidden_size
@@ -316,6 +320,7 @@ class Attention(nn.Module):
         position_ids: torch.Tensor,
         cache: _kvcache.ContiguousKVCache,
         start_pos: int,
+        vision_token_count: Optional[int] = None,
     ) -> torch.Tensor:
         spec = self.spec
         if getattr(self, "_is_dsa", False):
@@ -370,7 +375,33 @@ class Attention(nn.Module):
         scale = self.effective_scale
         T = start_pos + S
         device = q.device
-        if spec.mask_kind == types.MaskKind.SWA and spec.sliding_window is not None:
+        if spec.block_bidirectional_mask and vision_token_count is not None:
+            # B8: Visual Causal Flow mask. Reserve `V = vision_token_count`
+            # tokens at the prefix as bidirectional; everything else is
+            # standard causal. Source: original DeepSeek-OCR paper §3.2.
+            # Mask is built over (S_q, T) where T = start_pos + S; the
+            # bidirectional block sits at columns [0, V).
+            V = vision_token_count
+            if V < 0 or V > T:
+                raise ValueError(f"vision_token_count {V} out of [0, {T}]")
+            i_idx = torch.arange(S, device=device).unsqueeze(1)
+            j_idx = torch.arange(T, device=device).unsqueeze(0)
+            # vision keys (j < V) seen by every query; text keys (j >= V)
+            # only by text queries via causal rule.
+            q_pos = start_pos + i_idx
+            is_vision_q = q_pos < V
+            is_vision_k = j_idx < V
+            keep_text_text = (~is_vision_k) & (~is_vision_q) & (j_idx <= q_pos)
+            keep_vis_vis = is_vision_k & is_vision_q
+            # Text-to-vision (text query attends backward to vision keys):
+            keep_text_vis = is_vision_k & (~is_vision_q)
+            keep = keep_vis_vis | keep_text_text | keep_text_vis
+            attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
+            attn_mask = attn_mask.masked_fill(
+                ~keep, float("-inf"),
+            )
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+        elif spec.mask_kind == types.MaskKind.SWA and spec.sliding_window is not None:
             # SWA mask: (i, j) is kept iff j <= start_pos+i (causal) AND
             # (start_pos+i) - j <= W (within window).
             W = spec.sliding_window

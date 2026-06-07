@@ -202,6 +202,7 @@ class DecoderBlock(nn.Module):
         cache: Optional[object] = None,
         start_pos: int = 0,
         per_layer_input: Optional[torch.Tensor] = None,
+        vision_token_count: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward.
 
@@ -228,7 +229,8 @@ class DecoderBlock(nn.Module):
             attn_out = self.attention(attn_in, cache=cache)
         else:
             attn_out = self.attention(attn_in, position_ids=position_ids,
-                                      cache=cache, start_pos=start_pos)
+                                      cache=cache, start_pos=start_pos,
+                                      vision_token_count=vision_token_count)
         if self.post_attn_sublayer_norm is not None:
             attn_out = self.post_attn_sublayer_norm(attn_out)
         # B2a: Granite μP residual scaling — sublayer output is multiplied by

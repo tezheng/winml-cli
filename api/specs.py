@@ -119,6 +119,19 @@ class RoPESpec:
     # makes the two indistinguishable.
     partial_rotary_kind: str = "prefix"   # "prefix" | "proportional"
 
+    # B8: M-RoPE (multimodal rotary position embedding) — Qwen2.5-VL family.
+    # When `mrope_section` is set, the runtime expects `position_ids` of
+    # shape [3, B, S] (channels: temporal, height, width) and slices cos/sin
+    # along the head_dim axis using `mrope_section` (cyclically `i % 3`).
+    # The tuple lengths must sum to `head_dim // 2` (HF concatenates the
+    # split twice before applying rotate_half — see source ref).
+    # Source: `transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py:564-606`
+    # (apply_multimodal_rotary_pos_emb).
+    mrope_section: Optional[tuple[int, ...]] = None
+    # B8: 2D RoPE flag reserved for future axial-RoPE work (vision encoder
+    # path). Not exercised at the B8 LM-decoder layer — kept for v3 parity.
+    is_2d: bool = False
+
 
 @dataclass(frozen=True)
 class AttentionSpec:
@@ -180,6 +193,21 @@ class AttentionSpec:
     # kind == AttentionKind.DSA. Carries the indexer's projection
     # dimension and the per-query top-k.
     indexer: Optional["IndexerSpec"] = None
+
+    # B8: When True, the attention forward expects an optional
+    # `vision_token_count` int. The keep mask becomes:
+    #   - vision keys (j < V): bidirectional within the vision block
+    #     (every vision query and every text query may attend to them).
+    #     Vision queries (i < V) attend to ALL vision keys but NOT to
+    #     any text key (since text keys come after vision in the seq).
+    #   - text keys (j >= V): standard causal (j <= start_pos + i),
+    #     attended only by text queries (i >= V).
+    # When False (default), the standard causal-or-SWA path is used.
+    # This is the "Visual Causal Flow" mask of the original DeepSeek-OCR
+    # paper. NOTE: HF v5.10.2 deepseek_ocr2 implements STANDARD causal —
+    # this flag is reserved for the v3-spec hook and exercised in B8 by
+    # a shape-only test, not by the numerical gate.
+    block_bidirectional_mask: bool = False
 
 
 @dataclass(frozen=True)

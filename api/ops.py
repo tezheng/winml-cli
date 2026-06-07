@@ -145,6 +145,71 @@ def rope_apply(
     return q_rot, k_rot
 
 
+def rope_apply_mrope(
+    q: torch.Tensor,                         # [B, S, H, Dh]
+    k: torch.Tensor,                         # [B, S, Hk, Dh]
+    cos: torch.Tensor,                       # [3, B, S, Dh]
+    sin: torch.Tensor,                       # [3, B, S, Dh]
+    mrope_section: tuple[int, ...],          # e.g. (16, 24, 24) summing to Dh/2
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Multimodal RoPE (Qwen2.5-VL).
+
+    HF's `apply_multimodal_rotary_pos_emb` stitches 3 per-axis cos/sin tables
+    into a SINGLE cos/sin tensor by taking, for each output channel band,
+    the per-axis (T / H / W) table whose row index modulo 3 matches the
+    band's position. The split semantic is "double" — `mrope_section * 2`
+    because rotate_half pairs the two halves of head_dim.
+
+    Verified against `transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py:596-606`:
+        mrope_section = mrope_section * 2
+        cos = cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, -1))], -1)
+        sin = cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, -1))], -1)
+        q_embed = q * cos + rotate_half(q) * sin
+        k_embed = k * cos + rotate_half(k) * sin
+
+    The split-and-stitch yields cos/sin of shape [B, S, Dh] — i.e. the
+    leading "3-axis" dim is consumed and the result is broadcastable to
+    [B, H, S, Dh] for the rotate_half multiply.
+
+    Args:
+        q, k: queries/keys in [B, S, H, Dh] layout (NOT yet transposed).
+        cos, sin: per-axis tables in [3, B, S, Dh] layout from the M-RoPE
+            cache. The 3 axes are (temporal, height, width) per HF semantics.
+        mrope_section: per-axis channel counts summing to Dh // 2.
+
+    Returns:
+        (q_rot, k_rot) at the input shapes.
+    """
+    if q.dim() != 4:
+        raise ValueError(f"q must be rank-4 [B,S,H,Dh], got {q.shape}")
+    if cos.shape[0] != 3:
+        raise ValueError(
+            f"M-RoPE cos must have leading dim 3 (T/H/W), got {cos.shape}"
+        )
+    Dh = q.shape[-1]
+    if sum(mrope_section) * 2 != Dh:
+        raise ValueError(
+            f"mrope_section sum*2={sum(mrope_section) * 2} must equal head_dim={Dh}"
+        )
+    sec = list(mrope_section) * 2                              # length 6 for 3 axes
+    # cos/sin split along last dim, picking [i % 3] per chunk.
+    cos_chunks = cos.split(sec, dim=-1)                        # 6 tensors [3, B, S, sec_i]
+    sin_chunks = sin.split(sec, dim=-1)
+    cos_stitched = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos_chunks)], dim=-1,
+    )                                                          # [B, S, Dh]
+    sin_stitched = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin_chunks)], dim=-1,
+    )
+    # Broadcast cos/sin from [B, S, Dh] to [B, S, 1, Dh] so it lines up with
+    # q's [B, S, H, Dh] head axis.
+    cos_b = cos_stitched.unsqueeze(2)
+    sin_b = sin_stitched.unsqueeze(2)
+    q_rot = q * cos_b + _rotate_half(q) * sin_b
+    k_rot = k * cos_b + _rotate_half(k) * sin_b
+    return q_rot, k_rot
+
+
 def rope_apply_partial(
     q: torch.Tensor,           # [B, S, H, Dh]
     k: torch.Tensor,           # [B, S, Hk, Dh]

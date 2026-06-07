@@ -317,6 +317,58 @@ class RoPE(nn.Module):
         k: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # B8: M-RoPE branch — Qwen2.5-VL. position_ids has shape [3, B, S]
+        # (axes: temporal / height / width). cos/sin tables are computed
+        # on-the-fly from inv_freq @ position_ids and stitched per
+        # mrope_section. The intra-head dispatch is in api/ops.py.
+        if position_ids.dim() == 3:
+            if self.spec.mrope_section is None:
+                raise ValueError(
+                    "3D position_ids require RoPESpec.mrope_section to be set"
+                )
+            if position_ids.shape[0] != 3:
+                raise NotImplementedError(
+                    f"M-RoPE expects 3 axes (T/H/W), got {position_ids.shape[0]}"
+                )
+            # Recover inv_freq from cos_cached (shape [max_seq, head_dim] for
+            # SPLIT_HALF). For M-RoPE we must rebuild cos/sin against the
+            # arbitrary position_ids tensor — we cannot precompute since the
+            # 3-axis position_ids change per forward. Use the rope_angles
+            # inv_freq we built in __init__ (note: M-RoPE Qwen2.5-VL uses
+            # `partial_rotary_factor=1.0`, `scaling=NONE`, so the construction
+            # mirrors compute_default_rope_parameters).
+            # Source: modeling_qwen2_5_vl.py:485-545 (Qwen2_5_VLRotaryEmbedding).
+            if self.spec.partial_rotary_factor != 1.0:
+                raise NotImplementedError(
+                    "M-RoPE + partial_rotary_factor < 1 not supported"
+                )
+            if self.spec.scaling != types.RoPEScaling.NONE:
+                raise NotImplementedError(
+                    "M-RoPE only supports RoPEScaling.NONE"
+                )
+            # Rebuild inv_freq from base_theta (same formula as __init__'s
+            # construction for SPLIT_HALF partial=1.0).
+            head_dim_rot = 2 * self.rope_angles                 # = head_dim
+            inv_freq = 1.0 / (
+                self.spec.base_theta ** (
+                    torch.arange(0, head_dim_rot, 2, dtype=torch.float32,
+                                 device=q.device) / head_dim_rot
+                )
+            )
+            # Expand for 3-axis projection: [3, B, head_dim/2, 1].
+            B_n = position_ids.shape[1]
+            inv_freq_expanded = (
+                inv_freq[None, None, :, None].expand(3, B_n, -1, 1)
+            )
+            # position_ids: [3, B, S] -> [3, B, 1, S] for matmul.
+            pos_exp = position_ids[:, :, None, :].float()
+            # freqs: [3, B, head_dim/2, S] -> transpose to [3, B, S, head_dim/2]
+            freqs = (inv_freq_expanded @ pos_exp).transpose(2, 3)
+            # emb = cat([freqs, freqs], -1) -> [3, B, S, head_dim]
+            emb = torch.cat([freqs, freqs], dim=-1)
+            cos = emb.cos().to(q.dtype)
+            sin = emb.sin().to(q.dtype)
+            return ops.rope_apply_mrope(q, k, cos, sin, self.spec.mrope_section)
         if position_ids.dim() != 1:
             raise NotImplementedError("M1 supports 1D position_ids only")
         # B2a: LongRoPE dispatch — HF picks the SHORT or LONG inv_freq table

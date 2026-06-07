@@ -48,6 +48,20 @@ class MaskKind(Enum):
     FULL = auto()
     CUSTOM = auto()
     BLOCK_SPARSE = auto()
+    # B8: Visual Causal Flow / block-bidirectional mask. Used by
+    # the original DeepSeek-OCR architecture (and reserved as a v3
+    # spec hook): a leading "vision_token_count" prefix of keys/queries
+    # attends bidirectionally (every vision token sees every other vision
+    # token), and the trailing text region uses standard causal masking.
+    # The cross-block keep rule is asymmetric: text queries CAN attend to
+    # all preceding vision tokens, vision queries CANNOT attend to text
+    # tokens (since they come first in the sequence anyway under typical
+    # OCR-LLM prefix-fusion). NOTE: the HF v5.10.2 reference impl for
+    # `deepseek_ocr2` uses STANDARD causal masking — block-bidirectional
+    # is exercised by the B8 deepseek_ocr2 family ONLY as an alternative
+    # mask op (the canonical numerical gate uses CAUSAL).
+    # Source: original DeepSeek-OCR paper §3.2 (Visual Causal Flow).
+    BLOCK_BIDIRECTIONAL = auto()
 
 
 class QKNormPhase(Enum):
