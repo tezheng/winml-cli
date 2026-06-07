@@ -452,3 +452,46 @@ def test_attention_mla_rejects_wrong_qkv_layout():
             v_head_dim=64,
         )
         attention.Attention(spec, hidden_size=256, max_seq=8)
+
+
+def test_b5_attention_mla_direct_q_proj_v2_lite():
+    """B5: V2-Lite has q_lora_rank=null and uses a direct q_proj
+    (no q_a_proj/q_a_layernorm/q_b_proj). Source:
+    deepseek-ai/DeepSeek-V2-Lite/config.json and
+    modeling_deepseek_v2.py:310-315.
+    """
+    spec = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=4,
+        head_dim=96,                              # 64 nope + 32 rope
+        kind=types.AttentionKind.MLA,
+        qkv_layout=types.QKVLayout.MLA_LATENT,
+        mask_kind=types.MaskKind.CAUSAL,
+        q_lora_rank=None,                          # direct q_proj
+        kv_lora_rank=64,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        rope=specs.RoPESpec(base_theta=10_000.0,
+                            basis=types.RoPEBasis.INTERLEAVED),
+    )
+    attn = attention.Attention(spec, hidden_size=128, max_seq=16,
+                               dtype=torch.float32)
+    assert attn.q_proj is not None
+    assert attn.q_a_proj is None
+    assert attn.q_b_proj is None
+    assert attn.q_a_layernorm is None
+    assert attn.q_proj.weight.shape == (4 * 96, 128)
+    # Forward smoke.
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_q_heads, head_dim=spec.head_dim, max_seq=16,
+        v_head_dim=spec.v_head_dim,
+    )
+    x = torch.randn(1, 4, 128)
+    out = attn(x, position_ids=torch.arange(4), cache=cache, start_pos=0)
+    assert out.shape == (1, 4, 128)

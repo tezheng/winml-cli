@@ -41,7 +41,13 @@ class Attention(nn.Module):
                 raise ValueError(
                     f"MLA kind requires QKVLayout.MLA_LATENT, got {spec.qkv_layout}"
                 )
-            for fname in ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
+            # B5: q_lora_rank can be None for DeepSeek-V2-Lite (16B-A2.4B)
+            # which uses a DIRECT q_proj (no LoRA). The kv_lora path is
+            # always present. Source:
+            # modeling_deepseek_v2.py:310-315 (if q_lora_rank is None: ...
+            # self.q_proj = nn.Linear(hidden_size, num_heads * qk_head_dim));
+            # deepseek-ai/DeepSeek-V2-Lite/config.json: q_lora_rank=null.
+            for fname in ("kv_lora_rank", "qk_nope_head_dim",
                           "qk_rope_head_dim", "v_head_dim"):
                 if getattr(spec, fname) is None:
                     raise ValueError(f"MLA spec missing {fname}")
@@ -214,22 +220,7 @@ class Attention(nn.Module):
         H = spec.n_q_heads
         qk_h = spec.head_dim                  # qk_nope + qk_rope
         v_h = spec.v_head_dim
-        # Q LoRA path
-        self.q_a_proj = nn.Linear(hidden_size, spec.q_lora_rank,
-                                  bias=attn_bias, dtype=dtype)
-        # q_a_layernorm: RMSNorm at q_lora_rank. We instantiate via api.norm.RMSNorm
-        # with a NormSpec built from spec.qk_norm or fallback. MiniCPM uses
-        # rms_norm_eps = config.rms_norm_eps — we read from a dedicated
-        # AttentionSpec field; defaulting to 1e-5 if not set. We use eps from
-        # spec.qk_norm if provided, else require it to be encoded into the
-        # config. For simplicity we plumb through a fixed eps via the NormSpec
-        # that the model factory must construct. Since AttentionSpec does NOT
-        # currently carry an MLA-norm eps field, we read it from a NEW spec
-        # attribute fallback. We instead allow eps to come from a per-MLA
-        # NormSpec on the AttentionSpec — but to keep the public API minimal,
-        # we accept the eps via spec.qk_norm if provided AND use it for both
-        # q_a_layernorm and kv_a_layernorm. If spec.qk_norm is None, default
-        # to 1e-5 (MiniCPM-3's rms_norm_eps).
+        # Q path: LoRA (MiniCPM-3, V2-7B/full, V3) OR direct q_proj (V2-Lite).
         if spec.qk_norm is not None:
             qa_norm_spec = spec.qk_norm
         else:
@@ -237,9 +228,20 @@ class Attention(nn.Module):
                 kind=types.NormKind.RMS, eps=1e-5,
                 weight_mode=types.NormWeightMode.STANDARD_W,
             )
-        self.q_a_layernorm = norm.RMSNorm(qa_norm_spec, spec.q_lora_rank, dtype=dtype)
-        self.q_b_proj = nn.Linear(spec.q_lora_rank, H * qk_h,
-                                  bias=False, dtype=dtype)
+        if spec.q_lora_rank is None:
+            # V2-Lite direct q_proj — modeling_deepseek_v2.py:310-311.
+            self.q_a_proj = None
+            self.q_a_layernorm = None
+            self.q_b_proj = None
+            self.q_proj = nn.Linear(hidden_size, H * qk_h,
+                                    bias=False, dtype=dtype)
+        else:
+            self.q_proj = None
+            self.q_a_proj = nn.Linear(hidden_size, spec.q_lora_rank,
+                                      bias=attn_bias, dtype=dtype)
+            self.q_a_layernorm = norm.RMSNorm(qa_norm_spec, spec.q_lora_rank, dtype=dtype)
+            self.q_b_proj = nn.Linear(spec.q_lora_rank, H * qk_h,
+                                      bias=False, dtype=dtype)
         # KV LoRA path
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, spec.kv_lora_rank + spec.qk_rope_head_dim,
@@ -271,9 +273,9 @@ class Attention(nn.Module):
                 spec.rope, head_dim=spec.qk_rope_head_dim,
                 max_seq=max_seq, dtype=dtype,
             )
-        # Mark the rest of standard attention as unused
+        # Mark the rest of standard attention as unused. NOTE: q_proj may be
+        # set above (V2-Lite direct path) — do not overwrite it here.
         self.qkv_proj = None
-        self.q_proj = None
         self.k_proj = None
         self.v_proj = None
         self.q_norm = None
@@ -395,9 +397,14 @@ class Attention(nn.Module):
         qk_rope = spec.qk_rope_head_dim
         qk_h = spec.head_dim          # qk_nope + qk_rope
         v_h = spec.v_head_dim
-        # Q LoRA: x -> [B, S, q_lora_rank] -> RMSNorm -> [B, S, H*qk_h]
-        # Source: modeling_minicpm.py:444-448.
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        # Q: LoRA path (q_a_proj → q_a_layernorm → q_b_proj) when q_lora_rank
+        # is set; direct q_proj otherwise (V2-Lite).
+        # Source: modeling_minicpm.py:444-448 (LoRA) /
+        #         modeling_deepseek_v2.py:349-352 (LoRA OR direct).
+        if self.q_proj is not None:
+            q = self.q_proj(x)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
         # Reshape to [B, S, H, qk_h] then split nope/rope on last dim.
         q = q.view(B, S, H, qk_h)
         q_nope = q[..., :qk_nope]
