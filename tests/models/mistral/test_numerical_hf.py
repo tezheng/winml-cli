@@ -25,12 +25,43 @@ ATOL = 5e-4
 RTOL = 5e-4
 
 
+def _mistral_weights_complete(cache_dir: str) -> bool:
+    """Pre-check that the model is fully downloaded before attempting from_pretrained.
+
+    HF caches the model under `hub/models--mistralai--Mistral-7B-v0.3/`. If any
+    blob has the `.incomplete` suffix, the download is in progress and loading
+    will segfault on the truncated safetensors. Skip in that case.
+    """
+    import glob
+    pat = os.path.join(
+        cache_dir, "hub", "models--mistralai--Mistral-7B-v0.3", "blobs", "*.incomplete"
+    )
+    if glob.glob(pat):
+        return False
+    # Snapshot dir must exist with all safetensors files
+    snap = glob.glob(os.path.join(
+        cache_dir, "hub", "models--mistralai--Mistral-7B-v0.3", "snapshots", "*"
+    ))
+    if not snap:
+        return False
+    return any(
+        f.endswith(".safetensors") and not os.path.basename(f).startswith(".")
+        for f in os.listdir(snap[0])
+    )
+
+
 @pytest.fixture(scope="module")
 def hf_model():
     cache_dir = os.environ.get(
         "HF_HOME",
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "hf_cache"),
     )
+    if not _mistral_weights_complete(cache_dir):
+        pytest.skip(
+            "Mistral 7B v0.3 weights not fully downloaded "
+            f"(cache_dir={cache_dir}). The gate test will execute once "
+            "the ~14GB safetensors are local."
+        )
     try:
         _ = AutoConfig.from_pretrained(MODEL_ID, cache_dir=cache_dir)
         model = AutoModelForCausalLM.from_pretrained(
@@ -41,9 +72,8 @@ def hf_model():
         )
     except Exception as e:
         pytest.skip(
-            f"Mistral 7B v0.3 weights not accessible: {type(e).__name__}: "
-            f"{str(e)[:200]}. Gate test stub remains; will execute once weights "
-            "are local."
+            f"Mistral 7B v0.3 weights load failed: {type(e).__name__}: "
+            f"{str(e)[:200]}"
         )
     model.eval()
     return model
