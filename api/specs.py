@@ -28,12 +28,32 @@ class Llama3RoPEParams:
 
 
 @dataclass(frozen=True)
+class LongRoPEParams:
+    """LongRoPE (Phi-3 / Phi-4) parameters.
+
+    Two scale-factor vectors of length ``head_dim_rot/2`` and a switching point
+    at ``original_max_position_embeddings``. inv_freq is computed per-position
+    as ``1 / (ext_factor * base ** (2i/head_dim_rot))`` where ``ext_factor`` is
+    ``short_factor`` for positions ≤ ``original_max_position_embeddings`` and
+    ``long_factor`` otherwise. cos/sin are multiplied by ``attention_factor``.
+
+    Source: `transformers/modeling_rope_utils.py::_compute_longrope_parameters`
+    (lines 462-547).
+    """
+    short_factor: tuple[float, ...]
+    long_factor: tuple[float, ...]
+    original_max_position_embeddings: int
+    attention_factor: float = 1.0
+
+
+@dataclass(frozen=True)
 class RoPESpec:
     base_theta: float
     basis: types.RoPEBasis
     scaling: types.RoPEScaling = types.RoPEScaling.NONE
     scale_factor: Optional[float] = None
     llama3_extra: Optional[Llama3RoPEParams] = None
+    longrope_extra: Optional[LongRoPEParams] = None
 
     # B0.5: partial-rotary (Gemma 4 global = 0.25; Phi-3 legacy = 0.5; MLA = qk_rope/qk_head)
     partial_rotary_factor: float = 1.0

@@ -139,3 +139,89 @@ def test_rope_module_partial_rotary_factor():
                           q[..., rope_angles:Dh_half], atol=1e-6)
     assert torch.allclose(q_rot[..., Dh_half + rope_angles:],
                           q[..., Dh_half + rope_angles:], atol=1e-6)
+
+
+def test_longrope_short_factor_below_boundary():
+    """B2a: LongRoPE — for positions ≤ original_max, RoPE uses short_factor.
+    Built table must match the HF formula:
+        inv_freq[i] = 1 / (short[i] * base ** (2i/dim_rot))
+    """
+    head_dim = 8
+    base = 10_000.0
+    short_factor = (1.0, 1.0, 1.0, 1.0)         # length dim_rot/2 = 4 (no scaling)
+    long_factor = (2.0, 2.0, 2.0, 2.0)
+    spec = specs.RoPESpec(
+        base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
+        scaling=types.RoPEScaling.LONGROPE,
+        longrope_extra=specs.LongRoPEParams(
+            short_factor=short_factor, long_factor=long_factor,
+            original_max_position_embeddings=16, attention_factor=1.0,
+        ),
+    )
+    r = rope.RoPE(spec, head_dim=head_dim, max_seq=32, dtype=torch.float32)
+    # The short table is the default; with short_factor=1.0 it equals plain RoPE.
+    spec_plain = specs.RoPESpec(base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
+                                scaling=types.RoPEScaling.NONE)
+    r_plain = rope.RoPE(spec_plain, head_dim=head_dim, max_seq=32, dtype=torch.float32)
+    assert torch.allclose(r.cos_cached, r_plain.cos_cached, atol=1e-6)
+    assert torch.allclose(r.sin_cached, r_plain.sin_cached, atol=1e-6)
+
+
+def test_longrope_dispatches_long_above_boundary():
+    """B2a: LongRoPE forward must pick LONG table when max(position_ids)+1 > boundary."""
+    head_dim = 8
+    spec = specs.RoPESpec(
+        base_theta=10_000.0, basis=types.RoPEBasis.SPLIT_HALF,
+        scaling=types.RoPEScaling.LONGROPE,
+        longrope_extra=specs.LongRoPEParams(
+            short_factor=(1.0, 1.0, 1.0, 1.0),
+            long_factor=(2.0, 2.0, 2.0, 2.0),
+            original_max_position_embeddings=4,
+            attention_factor=1.0,
+        ),
+    )
+    r = rope.RoPE(spec, head_dim=head_dim, max_seq=16, dtype=torch.float32)
+    # Short and long tables differ.
+    assert not torch.allclose(r.cos_cached, r.cos_cached_long)
+    # Dispatch check: small positions → cos_cached values.
+    q = torch.randn(1, 3, 2, head_dim)
+    k = torch.randn(1, 3, 2, head_dim)
+    pos_short = torch.arange(3)                                 # max+1 = 3 ≤ 4 → short
+    q_s, k_s = r(q, k, pos_short)
+    # Manually build the expected output using cos_cached[pos] directly.
+    cos_s, sin_s = r.cos_cached[pos_short], r.sin_cached[pos_short]
+    from api import ops
+    q_exp, k_exp = ops.rope_apply(q, k, cos_s, sin_s, basis="split_half")
+    assert torch.allclose(q_s, q_exp)
+    # And large positions → cos_cached_long.
+    pos_long = torch.tensor([5, 6, 7])                          # max+1 = 8 > 4 → long
+    q_l, k_l = r(q, k, pos_long)
+    cos_l, sin_l = r.cos_cached_long[pos_long], r.sin_cached_long[pos_long]
+    q_exp_l, k_exp_l = ops.rope_apply(q, k, cos_l, sin_l, basis="split_half")
+    assert torch.allclose(q_l, q_exp_l)
+
+
+def test_longrope_attention_factor_scales_cos_sin():
+    """B2a: attention_factor multiplies BOTH cos and sin in the cached table.
+    Source: modeling_phi3.py:128-129 (cos = emb.cos() * attention_scaling)."""
+    head_dim = 8
+    spec_a = specs.RoPESpec(
+        base_theta=10_000.0, basis=types.RoPEBasis.SPLIT_HALF,
+        scaling=types.RoPEScaling.LONGROPE,
+        longrope_extra=specs.LongRoPEParams(
+            short_factor=(1.0,)*4, long_factor=(1.0,)*4,
+            original_max_position_embeddings=16, attention_factor=1.0,
+        ),
+    )
+    spec_b = specs.RoPESpec(
+        base_theta=10_000.0, basis=types.RoPEBasis.SPLIT_HALF,
+        scaling=types.RoPEScaling.LONGROPE,
+        longrope_extra=specs.LongRoPEParams(
+            short_factor=(1.0,)*4, long_factor=(1.0,)*4,
+            original_max_position_embeddings=16, attention_factor=2.5,
+        ),
+    )
+    r_a = rope.RoPE(spec_a, head_dim=head_dim, max_seq=16, dtype=torch.float32)
+    r_b = rope.RoPE(spec_b, head_dim=head_dim, max_seq=16, dtype=torch.float32)
+    assert torch.allclose(r_b.cos_cached, r_a.cos_cached * 2.5, atol=1e-6)
+    assert torch.allclose(r_b.sin_cached, r_a.sin_cached * 2.5, atol=1e-6)

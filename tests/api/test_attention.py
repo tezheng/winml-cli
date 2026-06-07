@@ -282,3 +282,66 @@ def test_attention_v_norm_changes_output():
     out_b = b(x, position_ids=pos, cache=cache_b, start_pos=0)
     # Outputs must differ (RMS-normalised V is different from raw V in general).
     assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+
+def test_attention_fused_qkv_equivalent_to_split():
+    """B2a: FUSED QKV layout must produce identical output to a SPLIT layout
+    when weights are arranged such that the fused matrix's blocks match the
+    individual q/k/v matrices. (Phi-3 stores the fused matrix concatenated
+    along the output dim in order Q | K | V.)
+    Source: modeling_phi3.py:222-241."""
+    hidden = 64
+    Hq, Hk, Dh = 4, 2, 16
+    rope_spec = specs.RoPESpec(base_theta=10_000.0,
+                               basis=types.RoPEBasis.SPLIT_HALF)
+    split = specs.AttentionSpec(
+        n_q_heads=Hq, n_kv_heads=Hk, head_dim=Dh,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=rope_spec,
+    )
+    fused = specs.AttentionSpec(
+        n_q_heads=Hq, n_kv_heads=Hk, head_dim=Dh,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.FUSED,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=rope_spec,
+    )
+    a_s = attention.Attention(split, hidden_size=hidden, max_seq=32, dtype=torch.float32)
+    a_f = attention.Attention(fused, hidden_size=hidden, max_seq=32, dtype=torch.float32)
+    # Stitch fused weight from split.
+    with torch.no_grad():
+        a_f.qkv_proj.weight.copy_(torch.cat([
+            a_s.q_proj.weight, a_s.k_proj.weight, a_s.v_proj.weight,
+        ], dim=0))
+        a_f.o_proj.weight.copy_(a_s.o_proj.weight)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS, memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_s = kvcache.ContiguousKVCache(cache_spec, 1, Hk, Dh, 32)
+    cache_f = kvcache.ContiguousKVCache(cache_spec, 1, Hk, Dh, 32)
+    x = torch.randn(1, 5, hidden)
+    pos = torch.arange(5)
+    out_s = a_s(x, position_ids=pos, cache=cache_s, start_pos=0)
+    out_f = a_f(x, position_ids=pos, cache=cache_f, start_pos=0)
+    assert torch.allclose(out_s, out_f, atol=1e-5)
+
+
+def test_attention_fused_qkv_shape_outputs_correct_blocks():
+    """Verify the qkv_proj output has the right total size for Phi-3 fused QKV:
+    (Hq + 2*Hk) * Dh — the Q block, K block, V block concatenated."""
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=2, head_dim=16,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.FUSED,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=specs.RoPESpec(base_theta=10_000.0, basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    attn = attention.Attention(spec, hidden_size=64, max_seq=32, dtype=torch.float32)
+    expected_out = (8 + 2 * 2) * 16   # 12 * 16 = 192
+    assert attn.qkv_proj.weight.shape == (expected_out, 64)
+    assert attn.q_proj is None
+    assert attn.k_proj is None
+    assert attn.v_proj is None

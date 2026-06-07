@@ -29,8 +29,10 @@ class Attention(nn.Module):
         super().__init__()
         if spec.kind != types.AttentionKind.STANDARD:
             raise NotImplementedError(f"M1: STANDARD only, got {spec.kind}")
-        if spec.qkv_layout != types.QKVLayout.SPLIT:
-            raise NotImplementedError(f"M1: SPLIT QKV only, got {spec.qkv_layout}")
+        if spec.qkv_layout not in (types.QKVLayout.SPLIT, types.QKVLayout.FUSED):
+            raise NotImplementedError(
+                f"B2a: SPLIT and FUSED QKV only, got {spec.qkv_layout}"
+            )
         if spec.mask_kind not in (types.MaskKind.CAUSAL, types.MaskKind.SWA):
             raise NotImplementedError(
                 f"B0.5: CAUSAL and SWA masks only, got {spec.mask_kind}"
@@ -40,13 +42,35 @@ class Attention(nn.Module):
 
         q_proj_out = spec.n_q_heads * spec.head_dim
         kv_proj_out = spec.n_kv_heads * spec.head_dim
-        self.q_proj = nn.Linear(hidden_size, q_proj_out, bias=spec.q_bias, dtype=dtype)
-        self.k_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.k_bias, dtype=dtype)
-        # v_proj is skipped when attention_k_eq_v=True (Gemma 4 12B+ global)
-        if spec.attention_k_eq_v:
+        # B2a: FUSED QKV (Phi-3 family) — one big projection of size
+        #   (Hq + 2*Hk) * Dh, sliced at forward time.
+        # Source: modeling_phi3.py:222 (`op_size = num_attention_heads * head_dim
+        # + 2 * (num_key_value_heads * head_dim)`) and 224 (`qkv_proj = Linear(
+        # hidden_size, op_size, bias=False)`). FUSED is incompatible with
+        # `attention_k_eq_v` and biases must be uniform (Phi-3 uses no bias).
+        if spec.qkv_layout == types.QKVLayout.FUSED:
+            if spec.attention_k_eq_v:
+                raise NotImplementedError(
+                    "FUSED QKV with attention_k_eq_v is not supported"
+                )
+            if not (spec.q_bias == spec.k_bias == spec.v_bias):
+                raise NotImplementedError(
+                    "FUSED QKV requires q/k/v_bias to all match (Phi-3: all False)"
+                )
+            fused_out = q_proj_out + 2 * kv_proj_out
+            self.qkv_proj = nn.Linear(hidden_size, fused_out, bias=spec.q_bias, dtype=dtype)
+            self.q_proj = None
+            self.k_proj = None
             self.v_proj = None
         else:
-            self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
+            self.qkv_proj = None
+            self.q_proj = nn.Linear(hidden_size, q_proj_out, bias=spec.q_bias, dtype=dtype)
+            self.k_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.k_bias, dtype=dtype)
+            # v_proj is skipped when attention_k_eq_v=True (Gemma 4 12B+ global)
+            if spec.attention_k_eq_v:
+                self.v_proj = None
+            else:
+                self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
         self.o_proj = nn.Linear(q_proj_out, hidden_size, bias=spec.o_bias, dtype=dtype)
 
         # effective_scale: when qk_norm_fixed_scale is set, the norm absorbs
@@ -131,13 +155,23 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         Hq, Hk, Dh = spec.n_q_heads, spec.n_kv_heads, spec.head_dim
 
-        q = self.q_proj(x).view(B, S, Hq, Dh)
-        k = self.k_proj(x).view(B, S, Hk, Dh)
-        # K = V branch: alias the K tensor as V (after the same projection)
-        if spec.attention_k_eq_v:
-            v = k
+        if spec.qkv_layout == types.QKVLayout.FUSED:
+            # B2a: Phi-3 fused QKV slicing — Q first, then K, then V along the
+            # output dim. Source: modeling_phi3.py:237-241.
+            qkv = self.qkv_proj(x)                              # [B, S, (Hq+2*Hk)*Dh]
+            q_end = Hq * Dh
+            k_end = q_end + Hk * Dh
+            q = qkv[..., :q_end].view(B, S, Hq, Dh)
+            k = qkv[..., q_end:k_end].view(B, S, Hk, Dh)
+            v = qkv[..., k_end:].view(B, S, Hk, Dh)
         else:
-            v = self.v_proj(x).view(B, S, Hk, Dh)
+            q = self.q_proj(x).view(B, S, Hq, Dh)
+            k = self.k_proj(x).view(B, S, Hk, Dh)
+            # K = V branch: alias the K tensor as V (after the same projection)
+            if spec.attention_k_eq_v:
+                v = k
+            else:
+                v = self.v_proj(x).view(B, S, Hk, Dh)
 
         if self.q_norm is not None:
             q = self.q_norm(q)

@@ -1,7 +1,9 @@
 """RoPE block — precomputed cos/sin tables consuming RoPESpec.
 
-M1 implements SPLIT_HALF basis with optional Llama-3 smooth scaling.
-Other RoPE variants (PI, NTK, YaRN, LongRoPE) land in later milestones.
+M1 implements SPLIT_HALF basis with optional Llama-3 smooth scaling. B2a adds
+LongRoPE (Phi-3 / Phi-4) — TWO inv_freq tables (short_factor and long_factor)
+with per-position dispatch at the boundary
+``original_max_position_embeddings``.
 """
 from __future__ import annotations
 import math
@@ -98,9 +100,60 @@ class RoPE(nn.Module):
                 inv_freq = torch.cat([rot_scaled, inv_freq[rope_angles:]], dim=0)
             else:
                 inv_freq = _llama3_scale_inv_freq(inv_freq, spec.llama3_extra)
+        elif spec.scaling == types.RoPEScaling.LONGROPE:
+            # B2a: LongRoPE — TWO inv_freq tables, dispatched per position. The
+            # HF implementation uses `1 / (ext_factor * base ** (2i / dim))`
+            # where dim = head_dim * partial_rotary_factor and ext_factor is
+            # either short_factor or long_factor (each of length dim/2).
+            # cos/sin are scaled by attention_factor.
+            # Source: modeling_rope_utils.py:_compute_longrope_parameters
+            # lines 462-547; dynamic_rope_update.longrope_frequency_update L47-80.
+            if spec.longrope_extra is None:
+                raise ValueError("LONGROPE scaling requires longrope_extra")
+            lre = spec.longrope_extra
+            if len(lre.short_factor) != rope_angles:
+                raise ValueError(
+                    f"LongRoPE short_factor length {len(lre.short_factor)} "
+                    f"!= rope_angles {rope_angles} (= dim/2)"
+                )
+            if len(lre.long_factor) != rope_angles:
+                raise ValueError(
+                    f"LongRoPE long_factor length {len(lre.long_factor)} "
+                    f"!= rope_angles {rope_angles}"
+                )
+            short = torch.tensor(lre.short_factor, dtype=torch.float32)
+            long_ = torch.tensor(lre.long_factor, dtype=torch.float32)
+            # Real frequencies use the rotated denominator dim = 2*rope_angles
+            # (per modeling_rope_utils.py:544 `inv_freq_shape = arange(0, dim, 2) / dim`).
+            dim_rot = 2 * rope_angles
+            inv_freq_shape = torch.arange(0, dim_rot, 2).float() / dim_rot
+            inv_freq_short_rot = 1.0 / (short * spec.base_theta ** inv_freq_shape)
+            inv_freq_long_rot = 1.0 / (long_ * spec.base_theta ** inv_freq_shape)
+            if nope_angles > 0:
+                zeros = torch.zeros(nope_angles)
+                inv_freq_short = torch.cat([inv_freq_short_rot, zeros], dim=0)
+                inv_freq_long = torch.cat([inv_freq_long_rot, zeros], dim=0)
+            else:
+                inv_freq_short = inv_freq_short_rot
+                inv_freq_long = inv_freq_long_rot
+            # Build TWO cos/sin tables, each [max_seq, head_dim].
+            t = torch.arange(max_seq).float()
+            freqs_short = torch.outer(t, inv_freq_short)
+            freqs_long = torch.outer(t, inv_freq_long)
+            att = lre.attention_factor
+            cos_short = (torch.cat([freqs_short.cos(), freqs_short.cos()], dim=-1) * att).to(dtype)
+            sin_short = (torch.cat([freqs_short.sin(), freqs_short.sin()], dim=-1) * att).to(dtype)
+            cos_long = (torch.cat([freqs_long.cos(), freqs_long.cos()], dim=-1) * att).to(dtype)
+            sin_long = (torch.cat([freqs_long.sin(), freqs_long.sin()], dim=-1) * att).to(dtype)
+            self._longrope_boundary = lre.original_max_position_embeddings
+            self.register_buffer("cos_cached", cos_short, persistent=False)
+            self.register_buffer("sin_cached", sin_short, persistent=False)
+            self.register_buffer("cos_cached_long", cos_long, persistent=False)
+            self.register_buffer("sin_cached_long", sin_long, persistent=False)
+            return
         elif spec.scaling != types.RoPEScaling.NONE:
             raise NotImplementedError(
-                f"M1 supports NONE and LLAMA3 scaling only, got {spec.scaling}"
+                f"B2a supports NONE, LLAMA3, LONGROPE scaling only, got {spec.scaling}"
             )
 
         t = torch.arange(max_seq).float()
@@ -110,6 +163,7 @@ class RoPE(nn.Module):
         sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).to(dtype)
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
+        self._longrope_boundary = None
 
     def forward(
         self,
@@ -119,8 +173,21 @@ class RoPE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if position_ids.dim() != 1:
             raise NotImplementedError("M1 supports 1D position_ids only")
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
+        # B2a: LongRoPE dispatch — HF picks the SHORT or LONG inv_freq table
+        # for the WHOLE forward pass based on `max(position_ids) + 1` vs
+        # `original_max_position_embeddings`. Source:
+        # modeling_rope_utils.py:longrope_frequency_update lines 47-80.
+        if self._longrope_boundary is not None:
+            seq_len_max = int(position_ids.max().item()) + 1
+            if seq_len_max > self._longrope_boundary:
+                cos = self.cos_cached_long[position_ids]
+                sin = self.sin_cached_long[position_ids]
+            else:
+                cos = self.cos_cached[position_ids]
+                sin = self.sin_cached[position_ids]
+        else:
+            cos = self.cos_cached[position_ids]
+            sin = self.sin_cached[position_ids]
         # Always use the full-rotation path. When partial_rotary_factor < 1,
         # cos/sin have ones/zeros in the trailing channels — those positions
         # multiply-through identity but still participate in rotate_half's
