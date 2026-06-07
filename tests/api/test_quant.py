@@ -5,7 +5,9 @@ Scheme coverage:
   - GGUF Q4_K_M (k-quant; super-block 256, 6-bit sub-scales/mins)
   - FP8 E4M3 W8A8 (per-tensor W + per-token A, fp32 accumulate)
   - MXFP4 (UE8M0 shared exp + E2M1 mantissas, block 32)
+  - IQ2_M / AQLM   (stub guard rails — must raise NotImplementedError)
 """
+import pytest
 import torch
 
 from api import quant, specs, types
@@ -256,3 +258,18 @@ def test_mxfp4_handles_large_dynamic_range():
     assert y.shape == (32,)
     # Recovered max-element is within E2M1 grid step of 1000.
     assert abs(y[0].item() - 1000.0) / 1000.0 < 0.20
+
+
+# ============================================================================
+# Codebook-quant stubs (IQ2_M / AQLM)
+# ============================================================================
+
+
+def test_iq2_m_dequantize_is_reserved():
+    with pytest.raises(NotImplementedError, match="IQ2_M"):
+        quant.iq2_m_dequantize(None)
+
+
+def test_aqlm_dequantize_is_reserved():
+    with pytest.raises(NotImplementedError, match="AQLM"):
+        quant.aqlm_dequantize(None)

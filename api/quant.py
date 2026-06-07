@@ -553,3 +553,41 @@ def mxfp4_dequantize(codes: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
     scale = torch.pow(2.0, e).unsqueeze(-1)  # [B, 1]
     vals = _mxfp4_decode_e2m1(codes)         # [B, 32]
     return (vals * scale).reshape(B * MXFP4_BLOCK)
+
+
+# ============================================================================
+# Codebook-quantization stubs  (axis A24 — reserved for M3)
+# ============================================================================
+#
+# The QuantSpec already carries a `codebook` field for codebook-style quants.
+# Two production-relevant formats remain UNEXERCISED after B10:
+#
+#   - IQ2_M  (llama.cpp k-quant family; uses precomputed 2-bit codebooks
+#             with per-sub-block scales).
+#             Reference: ggml/src/ggml-quants.c::dequantize_row_iq2_m
+#                        ggml-common.h::block_iq2_m
+#                        https://github.com/ggml-org/llama.cpp
+#
+#   - AQLM   (Additive Quantization for Language Models, ICML 2024;
+#             multi-codebook additive product quantization).
+#             Reference: https://github.com/Vahe1994/AQLM
+#                        modeling_aqlm.py / inference_kernels/cuda_kernel.cu
+#
+# These are deferred to a follow-up batch (M3). The skeleton below makes the
+# intent explicit and ensures any caller that asks for IQ2_M/AQLM fails fast.
+
+
+def iq2_m_dequantize(*_args, **_kwargs):
+    """IQ2_M codebook dequant — reserved for M3 (axis A24)."""
+    raise NotImplementedError(
+        "IQ2_M codebook dequant is deferred to M3. Reference: "
+        "ggml/src/ggml-quants.c::dequantize_row_iq2_m + ggml-common.h block_iq2_m."
+    )
+
+
+def aqlm_dequantize(*_args, **_kwargs):
+    """AQLM additive-codebook dequant — reserved for M3 (axis A24)."""
+    raise NotImplementedError(
+        "AQLM additive-codebook dequant is deferred to M3. Reference: "
+        "https://github.com/Vahe1994/AQLM — modeling_aqlm.py + inference_kernels/."
+    )
