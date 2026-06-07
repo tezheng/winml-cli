@@ -364,8 +364,13 @@ class Attention(nn.Module):
             attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
             attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
+        # B3 (Gemma 2): attn_logit_softcap — when set, sdpa uses a manual
+        # matmul→softcap→softmax path (see api/ops.py::sdpa). The softcap is
+        # applied AFTER the matmul*scale and BEFORE the mask add, per HF
+        # `modeling_gemma2.py:212-217`.
         attn_out = ops.sdpa(q, k_full, v_full,
-                            attn_mask=attn_mask, scale=scale)
+                            attn_mask=attn_mask, scale=scale,
+                            logit_softcap=spec.logit_softcap)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, S, Hq * Dh)
         return self.o_proj(attn_out)

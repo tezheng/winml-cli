@@ -292,6 +292,172 @@ def test_block_residual_scale_nonzero_matches_manual_compute():
     assert not torch.allclose(out_a, out_b, atol=1e-3)
 
 
+def test_block_post_norm_skips_pre_norm():
+    """B3 POST (OLMo 2): when attn_norm_position=POST, the block has no
+    pre_attn_norm module and feeds raw residual to attention. Equivalent
+    structure for FFN: no pre_ffn_norm, post-norm wraps the FFN output.
+    Source: modeling_olmo2.py:295-333.
+    """
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=4, head_dim=32,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        # OLMo 2 uses FULL_HDH QK-norm.
+        qk_norm=norm_spec,
+        qk_norm_phase=types.QKNormPhase.PRE_ROPE,
+        qk_norm_shape=types.QKNormShape.FULL_HDH,
+        rope=specs.RoPESpec(base_theta=500000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    ffn = specs.FFNSpec(intermediate_size=256,
+                        activation=types.Activation.SILU,
+                        gate_kind=types.GateKind.SWIGLU)
+    block_spec = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.POST,
+        ffn_norm_position=types.NormPosition.POST,
+        token_mixer=attn, channel_mixer=ffn,
+        post_attn_norm=norm_spec,
+        post_ffn_norm=norm_spec,
+    )
+    blk = block.DecoderBlock(block_spec, hidden_size=128, max_seq=32,
+                             dtype=torch.float32)
+    # The POST-norm block has no pre-norm modules.
+    assert blk.pre_attn_norm is None
+    assert blk.pre_ffn_norm is None
+    # Post-norm modules are allocated.
+    assert blk.post_attn_sublayer_norm is not None
+    assert blk.post_ffn_sublayer_norm is not None
+    # Forward runs.
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1, n_kv_heads=4, head_dim=32, max_seq=32,
+    )
+    B, S, D = 1, 4, 128
+    x = torch.randn(B, S, D)
+    pos = torch.arange(S)
+    out = blk(x, position_ids=pos, cache=cache, start_pos=0)
+    assert out.shape == (B, S, D)
+
+
+def test_block_post_norm_matches_manual_olmo2_compute():
+    """B3 POST: with all norm weights = 1 and a controlled attention/FFN,
+    we can verify the POST-norm sandwich pattern numerically.
+
+    Specifically: out = x + post_attn_norm(attn(x))
+                  out2 = out + post_ffn_norm(ffn(out))
+
+    The test asserts the block output matches the manual computation.
+    Source: modeling_olmo2.py:315-326 (residual = x; x, _ = attn(x);
+    x = post_attention_layernorm(x); x = residual + x — same for MLP).
+    """
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=4, head_dim=16,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        qk_norm=norm_spec,
+        qk_norm_phase=types.QKNormPhase.PRE_ROPE,
+        qk_norm_shape=types.QKNormShape.FULL_HDH,
+        rope=specs.RoPESpec(base_theta=500000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    ffn = specs.FFNSpec(intermediate_size=128,
+                        activation=types.Activation.SILU,
+                        gate_kind=types.GateKind.SWIGLU)
+    block_spec = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.POST,
+        ffn_norm_position=types.NormPosition.POST,
+        token_mixer=attn, channel_mixer=ffn,
+        post_attn_norm=norm_spec, post_ffn_norm=norm_spec,
+    )
+    D = 64
+    blk = block.DecoderBlock(block_spec, hidden_size=D, max_seq=16,
+                             dtype=torch.float32)
+    blk.eval()
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_blk = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1, n_kv_heads=4, head_dim=16, max_seq=16,
+    )
+    cache_manual = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1, n_kv_heads=4, head_dim=16, max_seq=16,
+    )
+    B, S = 1, 3
+    x = torch.randn(B, S, D)
+    pos = torch.arange(S)
+    with torch.no_grad():
+        out_blk = blk(x, position_ids=pos, cache=cache_blk, start_pos=0)
+        # Manual: feed x directly to attention (NO pre-norm).
+        attn_out = blk.attention(x, position_ids=pos, cache=cache_manual, start_pos=0)
+        h = x + blk.post_attn_sublayer_norm(attn_out)
+        ffn_out = blk.feedforward(h)
+        out_manual = h + blk.post_ffn_sublayer_norm(ffn_out)
+        # The block has a layer_scalar buffer (default 1.0).
+        out_manual = out_manual * blk.layer_scalar
+    assert torch.allclose(out_blk, out_manual, atol=1e-5), (
+        f"max_abs_diff={(out_blk - out_manual).abs().max().item():.3e}"
+    )
+
+
+def test_block_softcap_propagates_through_attention():
+    """B3 (Gemma 2 path): AttentionSpec.logit_softcap should flow into ops.sdpa.
+
+    We instantiate two blocks with identical weights, one with softcap=50 and
+    one with no softcap; the outputs must differ (softcap actually applies).
+    Source: modeling_gemma2.py:293 (`softcap=self.attn_logit_softcapping`).
+    """
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    def _mk(cap):
+        attn = specs.AttentionSpec(
+            n_q_heads=4, n_kv_heads=2, head_dim=32,
+            kind=types.AttentionKind.STANDARD,
+            qkv_layout=types.QKVLayout.SPLIT,
+            mask_kind=types.MaskKind.CAUSAL,
+            logit_softcap=cap,
+            rope=specs.RoPESpec(base_theta=10000.0,
+                                basis=types.RoPEBasis.SPLIT_HALF),
+        )
+        ffn = specs.FFNSpec(intermediate_size=128,
+                            activation=types.Activation.SILU,
+                            gate_kind=types.GateKind.SWIGLU)
+        block_spec = specs.DecoderBlockSpec(
+            attn_norm_position=types.NormPosition.PRE,
+            ffn_norm_position=types.NormPosition.PRE,
+            token_mixer=attn, channel_mixer=ffn,
+            pre_attn_norm=norm_spec, pre_ffn_norm=norm_spec,
+        )
+        return block.DecoderBlock(block_spec, hidden_size=128, max_seq=16,
+                                  dtype=torch.float32)
+    blk_a = _mk(None)
+    blk_b = _mk(0.5)        # tiny cap so the effect is large
+    blk_b.load_state_dict(blk_a.state_dict())
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_a = kvcache.ContiguousKVCache(cache_spec, 1, 2, 32, 16)
+    cache_b = kvcache.ContiguousKVCache(cache_spec, 1, 2, 32, 16)
+    x = torch.randn(1, 4, 128) * 5.0       # larger scale so softcap bites
+    pos = torch.arange(4)
+    out_a = blk_a(x, position_ids=pos, cache=cache_a, start_pos=0)
+    out_b = blk_b(x, position_ids=pos, cache=cache_b, start_pos=0)
+    assert not torch.allclose(out_a, out_b, atol=1e-3)
+
+
 def test_block_layer_scalar_scales_output():
     """B0.6: changing `layer_scalar` from 1 to 2 must double the output."""
     spec = _qwen3_like_block_spec(hidden_size=128)

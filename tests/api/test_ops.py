@@ -259,3 +259,77 @@ def test_gelu_pytorch_tanh_matches_torch():
     out = ops.gelu_pytorch_tanh(x)
     ref = F.gelu(x, approximate="tanh")
     assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_sdpa_logit_softcap_matches_gemma2_eager():
+    """B3: sdpa with `logit_softcap` matches HF Gemma 2 eager attention math.
+
+    Source: modeling_gemma2.py:212-225 — `attn = matmul(q,k.T)*scale; attn =
+    tanh(attn/cap)*cap; attn += mask; attn = softmax(...fp32).to(q.dtype);
+    out = matmul(attn, v)`.
+    """
+    B, H, S, Dh = 1, 4, 6, 32
+    cap = 50.0
+    q = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    k = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    v = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    # Build a causal mask matching what api/attention builds.
+    causal = torch.zeros(S, S, dtype=q.dtype)
+    causal = causal.masked_fill(
+        torch.arange(S).unsqueeze(0) > torch.arange(S).unsqueeze(1),
+        float("-inf"),
+    )
+    attn_mask = causal.unsqueeze(0).unsqueeze(0)
+
+    scale = Dh ** -0.5
+    # Reference: HF Gemma 2 eager_attention_forward inlined.
+    attn_w = (q @ k.transpose(-2, -1)) * scale
+    attn_w = torch.tanh(attn_w / cap) * cap
+    attn_w = attn_w + attn_mask
+    attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
+    ref = attn_w @ v
+
+    out = ops.sdpa(q, k, v, attn_mask=attn_mask, scale=scale, logit_softcap=cap)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_sdpa_logit_softcap_none_matches_plain_sdpa():
+    """B3: logit_softcap=None is a pass-through to F.scaled_dot_product_attention."""
+    B, H, S, Dh = 1, 2, 4, 16
+    q = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    k = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    v = torch.randn(B, H, S, Dh, dtype=torch.float32)
+    causal = torch.zeros(S, S, dtype=q.dtype)
+    causal = causal.masked_fill(
+        torch.arange(S).unsqueeze(0) > torch.arange(S).unsqueeze(1),
+        float("-inf"),
+    )
+    attn_mask = causal.unsqueeze(0).unsqueeze(0)
+    out = ops.sdpa(q, k, v, attn_mask=attn_mask, logit_softcap=None)
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_sdpa_logit_softcap_gqa_repeats_kv():
+    """B3: logit_softcap path still GQA-repeats K/V when n_q_heads > n_kv_heads."""
+    B, Hq, Hk, S, Dh = 1, 8, 2, 5, 16
+    q = torch.randn(B, Hq, S, Dh, dtype=torch.float32)
+    k = torch.randn(B, Hk, S, Dh, dtype=torch.float32)
+    v = torch.randn(B, Hk, S, Dh, dtype=torch.float32)
+    causal = torch.zeros(S, S, dtype=q.dtype)
+    causal = causal.masked_fill(
+        torch.arange(S).unsqueeze(0) > torch.arange(S).unsqueeze(1),
+        float("-inf"),
+    )
+    attn_mask = causal.unsqueeze(0).unsqueeze(0)
+    out = ops.sdpa(q, k, v, attn_mask=attn_mask, logit_softcap=30.0)
+    # Manual ref with KV repetition.
+    k_rep = k.repeat_interleave(Hq // Hk, dim=1)
+    v_rep = v.repeat_interleave(Hq // Hk, dim=1)
+    scale = Dh ** -0.5
+    attn_w = (q @ k_rep.transpose(-2, -1)) * scale
+    attn_w = torch.tanh(attn_w / 30.0) * 30.0
+    attn_w = attn_w + attn_mask
+    attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
+    ref = attn_w @ v_rep
+    assert torch.allclose(out, ref, atol=1e-5)

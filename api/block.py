@@ -1,7 +1,8 @@
 """DecoderBlock — assembles token mixer + channel mixer with residual structure.
 
 M1 supports PRE-norm (Qwen3 / Llama default). B0.5 adds PRE_AND_POST (sandwich
-norm — Gemma 2/3/4).
+norm — Gemma 2/3/4). B3 adds POST (OLMo 2): no pre-norm, post-norm on the
+sublayer output before the residual add.
 
 B0.6 adds the Gemma 4 PLE-at-END injection: when `spec.per_layer_embedding`
 is set, after the FFN residual add we apply:
@@ -18,6 +19,13 @@ loaded from state dict): `x = x * layer_scalar`.
 Verified against `modeling_gemma4.py:1382` (layer_scalar buffer),
 `modeling_gemma4.py:1384-1389` (PLE module init), and
 `modeling_gemma4.py:1446-1455` (forward PLE+layer_scalar block).
+
+B3 POST-norm structure (OLMo 2):
+    h = x + post_attn_norm(attn(x))
+    out = h + post_ffn_norm(ffn(h))
+No `pre_attn_norm` / `pre_ffn_norm` modules are allocated; attention is fed
+the raw residual. Source: `modeling_olmo2.py:295-333` (Olmo2DecoderLayer init
+and forward).
 """
 from __future__ import annotations
 from typing import Optional
@@ -38,16 +46,18 @@ class DecoderBlock(nn.Module):
     ):
         super().__init__()
         if spec.attn_norm_position not in (
-            types.NormPosition.PRE, types.NormPosition.PRE_AND_POST
+            types.NormPosition.PRE, types.NormPosition.PRE_AND_POST,
+            types.NormPosition.POST,
         ):
             raise NotImplementedError(
-                f"B0.5: PRE and PRE_AND_POST attn-norm only, got {spec.attn_norm_position}"
+                f"B3: PRE, PRE_AND_POST, and POST attn-norm only, got {spec.attn_norm_position}"
             )
         if spec.ffn_norm_position not in (
-            types.NormPosition.PRE, types.NormPosition.PRE_AND_POST
+            types.NormPosition.PRE, types.NormPosition.PRE_AND_POST,
+            types.NormPosition.POST,
         ):
             raise NotImplementedError(
-                f"B0.5: PRE and PRE_AND_POST ffn-norm only, got {spec.ffn_norm_position}"
+                f"B3: PRE, PRE_AND_POST, and POST ffn-norm only, got {spec.ffn_norm_position}"
             )
         if not isinstance(spec.token_mixer, specs.AttentionSpec):
             raise NotImplementedError("M1: AttentionSpec token mixer only")
@@ -67,6 +77,18 @@ class DecoderBlock(nn.Module):
                 raise ValueError("PRE_AND_POST attn norm requires pre and post norm specs")
             self.pre_attn_norm = norm.RMSNorm(spec.pre_attn_norm, hidden_size, dtype=dtype)
             self.post_attn_sublayer_norm = norm.RMSNorm(spec.post_attn_norm, hidden_size, dtype=dtype)
+        elif spec.attn_norm_position == types.NormPosition.POST:
+            # B3 POST (OLMo 2): NO pre-norm; post-norm wraps the attention output
+            # before the residual add. Source: modeling_olmo2.py:315-326.
+            if spec.post_attn_norm is None:
+                raise ValueError("POST attn-norm requires post_attn_norm")
+            if spec.pre_attn_norm is not None:
+                raise ValueError(
+                    "POST attn-norm must not also set pre_attn_norm "
+                    "(OLMo 2 has only one norm per sublayer, post-side)"
+                )
+            self.pre_attn_norm = None
+            self.post_attn_sublayer_norm = norm.RMSNorm(spec.post_attn_norm, hidden_size, dtype=dtype)
         else:  # PRE
             if spec.pre_attn_norm is None:
                 raise ValueError("PRE attn-norm requires pre_attn_norm")
@@ -81,6 +103,16 @@ class DecoderBlock(nn.Module):
             if spec.pre_ffn_norm is None or spec.post_ffn_norm is None:
                 raise ValueError("PRE_AND_POST ffn norm requires pre and post norm specs")
             self.pre_ffn_norm = norm.RMSNorm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
+            self.post_ffn_sublayer_norm = norm.RMSNorm(spec.post_ffn_norm, hidden_size, dtype=dtype)
+        elif spec.ffn_norm_position == types.NormPosition.POST:
+            # B3 POST (OLMo 2): NO pre-norm on FFN. Source: modeling_olmo2.py:329-332.
+            if spec.post_ffn_norm is None:
+                raise ValueError("POST ffn-norm requires post_ffn_norm")
+            if spec.pre_ffn_norm is not None:
+                raise ValueError(
+                    "POST ffn-norm must not also set pre_ffn_norm"
+                )
+            self.pre_ffn_norm = None
             self.post_ffn_sublayer_norm = norm.RMSNorm(spec.post_ffn_norm, hidden_size, dtype=dtype)
         else:  # PRE
             if spec.pre_ffn_norm is None:
@@ -138,7 +170,11 @@ class DecoderBlock(nn.Module):
                 tests handled at the call site).
         """
         # Attention sublayer
-        attn_in = self.pre_attn_norm(x)
+        # B3 POST (OLMo 2): no pre-norm; feed raw residual to attention.
+        if self.pre_attn_norm is not None:
+            attn_in = self.pre_attn_norm(x)
+        else:
+            attn_in = x
         attn_out = self.attention(attn_in, position_ids=position_ids,
                                   cache=cache, start_pos=start_pos)
         if self.post_attn_sublayer_norm is not None:
@@ -150,7 +186,10 @@ class DecoderBlock(nn.Module):
         x = ops.add(x, attn_out)
 
         # FFN sublayer
-        ffn_in = self.pre_ffn_norm(x)
+        if self.pre_ffn_norm is not None:
+            ffn_in = self.pre_ffn_norm(x)
+        else:
+            ffn_in = x
         ffn_out = self.feedforward(ffn_in)
         if self.post_ffn_sublayer_norm is not None:
             ffn_out = self.post_ffn_sublayer_norm(ffn_out)

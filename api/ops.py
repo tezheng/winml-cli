@@ -162,10 +162,24 @@ def sdpa(
     attn_mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    logit_softcap: Optional[float] = None,
 ) -> torch.Tensor:
     """Scaled dot-product attention with GQA support.
 
     Repeats K/V to match Q heads when n_q_heads > n_kv_heads.
+
+    When ``logit_softcap`` is set (Gemma 2: 50.0), falls back to a manual
+    matmul → scale → tanh-softcap → mask-add → softmax → matmul path because
+    ``F.scaled_dot_product_attention`` does not expose pre-softmax post-scale
+    transforms. Softcap order matches HF Gemma 2 eager attention:
+
+        attn = (q @ k.T) * scale
+        attn = tanh(attn / softcap) * softcap
+        attn = attn + mask
+        attn = softmax(attn, fp32-upcast).to(q.dtype)
+        out = attn @ v
+
+    Source: ``modeling_gemma2.py:212-225`` (eager_attention_forward).
     """
     Hq = q.shape[1]
     Hk = k.shape[1]
@@ -175,6 +189,27 @@ def sdpa(
         repeats = Hq // Hk
         k = k.repeat_interleave(repeats, dim=1)
         v = v.repeat_interleave(repeats, dim=1)
+
+    if logit_softcap is not None:
+        # Manual eager attention to honor Gemma 2 softcap semantics.
+        # The default scale (when None) is head_dim ** -0.5; mirror SDPA's behavior.
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = torch.tanh(attn / logit_softcap) * logit_softcap
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        elif is_causal:
+            # Fall back to building a causal mask. We don't expect is_causal=True
+            # in the softcap path (callers supply explicit attn_mask), but support
+            # it defensively.
+            S_q, S_k = q.shape[-2], k.shape[-2]
+            mask = torch.full((S_q, S_k), float("-inf"), dtype=q.dtype, device=q.device)
+            mask = torch.triu(mask, diagonal=1 + (S_k - S_q))
+            attn = attn + mask
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        return torch.matmul(attn, v)
+
     return F.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
     )
