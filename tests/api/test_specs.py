@@ -354,6 +354,21 @@ def test_b5_indexer_spec():
     assert spec.indexer_dim == 64
 
 
+def test_b5_attention_spec_has_indexer_field():
+    """B5: AttentionSpec.indexer is plumbed for DSA composition."""
+    indexer = specs.IndexerSpec(indexer_dim=64, top_k=2048)
+    spec = specs.AttentionSpec(
+        n_q_heads=16, n_kv_heads=16, head_dim=192,
+        kind=types.AttentionKind.DSA,
+        qkv_layout=types.QKVLayout.MLA_LATENT,
+        mask_kind=types.MaskKind.CAUSAL,
+        q_lora_rank=1536, kv_lora_rank=512,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        indexer=indexer,
+    )
+    assert spec.indexer is indexer
+
+
 def test_b5_decoder_block_spec_accepts_moe():
     """B5: DecoderBlockSpec.channel_mixer accepts a MoESpec (V2-Lite MoE layers)."""
     norm = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,

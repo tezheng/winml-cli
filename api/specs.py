@@ -176,6 +176,11 @@ class AttentionSpec:
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
 
+    # B5: DSA (DeepSeek-V3.2) Lightning Indexer. Required when
+    # kind == AttentionKind.DSA. Carries the indexer's projection
+    # dimension and the per-query top-k.
+    indexer: Optional["IndexerSpec"] = None
+
 
 @dataclass(frozen=True)
 class FFNSpec:

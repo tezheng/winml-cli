@@ -27,10 +27,34 @@ class Attention(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        if spec.kind not in (types.AttentionKind.STANDARD, types.AttentionKind.MLA):
+        if spec.kind not in (types.AttentionKind.STANDARD,
+                             types.AttentionKind.MLA,
+                             types.AttentionKind.DSA):
             raise NotImplementedError(
-                f"B2b: STANDARD and MLA only, got {spec.kind}"
+                f"B5: STANDARD, MLA, and DSA only, got {spec.kind}"
             )
+        if spec.kind == types.AttentionKind.DSA:
+            # B5: DSA shape-only — allocate the indexer module and the
+            # full MLA backbone, but raise on forward.
+            if spec.indexer is None:
+                raise ValueError("DSA kind requires AttentionSpec.indexer")
+            # Re-use the MLA init for the MLA backbone (DSA = MLA + indexer).
+            if spec.qkv_layout != types.QKVLayout.MLA_LATENT:
+                raise ValueError(
+                    f"DSA kind requires QKVLayout.MLA_LATENT, got {spec.qkv_layout}"
+                )
+            self._init_mla(spec, hidden_size, max_seq, dtype)
+            # Allocate indexer Q/K projections — shape-only.
+            self.indexer_q_proj = nn.Linear(
+                hidden_size, spec.n_q_heads * spec.indexer.indexer_dim,
+                bias=False, dtype=dtype,
+            )
+            self.indexer_k_proj = nn.Linear(
+                hidden_size, spec.indexer.indexer_dim,
+                bias=False, dtype=dtype,
+            )
+            self._is_dsa = True
+            return
         if spec.kind == types.AttentionKind.MLA:
             # B2b: MLA path — MiniCPM-3 / DeepSeek-V2/V3 family. The MLA branch
             # uses MLA_LATENT qkv_layout and ignores attention_k_eq_v / qk_norm
@@ -294,6 +318,8 @@ class Attention(nn.Module):
         start_pos: int,
     ) -> torch.Tensor:
         spec = self.spec
+        if getattr(self, "_is_dsa", False):
+            raise NotImplementedError("DSA forward implementation deferred")
         if getattr(self, "_is_mla", False):
             return self._forward_mla(x, position_ids, cache, start_pos)
         B, S, _ = x.shape
