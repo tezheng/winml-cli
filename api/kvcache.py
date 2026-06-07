@@ -26,7 +26,20 @@ class ContiguousKVCache:
         head_dim: int,
         max_seq: int,
         device: torch.device | str = "cpu",
+        v_head_dim: int | None = None,
     ):
+        """Pre-allocated K/V buffer.
+
+        Args:
+            head_dim: per-head K dim. For standard attention, this is also V's
+                head dim. For MLA (B2b — MiniCPM-3), V has a different head dim
+                given via ``v_head_dim``.
+            v_head_dim: optional override for V's per-head dim. Defaults to
+                ``head_dim``. MiniCPM-3 reference path stores
+                decompressed K at ``qk_head_dim`` (=96) and V at ``v_head_dim``
+                (=64). Source: modeling_minicpm.py:457 (kv view uses
+                qk_nope_head_dim + v_head_dim), then split at 461-463.
+        """
         if spec.layout != types.CacheLayout.CONTIGUOUS:
             raise NotImplementedError("M1 supports CONTIGUOUS layout only")
         if spec.memory_layout != types.MemoryLayout.HND:
@@ -37,10 +50,11 @@ class ContiguousKVCache:
         self.batch_size = batch_size
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.max_seq = max_seq
         self.k = torch.zeros(batch_size, n_kv_heads, max_seq, head_dim,
                              dtype=spec.k_dtype, device=device)
-        self.v = torch.zeros(batch_size, n_kv_heads, max_seq, head_dim,
+        self.v = torch.zeros(batch_size, n_kv_heads, max_seq, self.v_head_dim,
                              dtype=spec.v_dtype, device=device)
         self.seq_len = 0
 

@@ -107,3 +107,41 @@ def test_shared_layer_kv_cache_write_is_noop():
     k_out, v_out = source.read(seq_len=3)
     assert torch.allclose(k_out, k_src)  # source unchanged
     assert torch.allclose(v_out, v_src)
+
+
+def test_kvcache_asymmetric_v_head_dim():
+    """B2b: MLA stores K at qk_head_dim and V at v_head_dim — asymmetric.
+
+    MiniCPM-3 ref path: K is [B, H, S, qk_head_dim=96], V is [B, H, S, v_head_dim=64].
+    Source: modeling_minicpm.py:457 (kv view uses qk_nope_head_dim + v_head_dim),
+    481-483 (key_states assembled at q_head_dim=96), 516 (attn_output uses v_head_dim).
+    """
+    spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        spec, batch_size=1, n_kv_heads=2,
+        head_dim=96, max_seq=8, v_head_dim=64,
+    )
+    assert cache.k.shape == (1, 2, 8, 96)
+    assert cache.v.shape == (1, 2, 8, 64)
+    k = torch.randn(1, 2, 3, 96); v = torch.randn(1, 2, 3, 64)
+    cache.write(k, v, start_pos=0)
+    k_out, v_out = cache.read(seq_len=3)
+    assert torch.allclose(k_out, k)
+    assert torch.allclose(v_out, v)
+
+
+def test_kvcache_default_v_head_dim_matches_head_dim():
+    """Default v_head_dim == head_dim — backward-compat."""
+    spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(spec, batch_size=1, n_kv_heads=2,
+                                      head_dim=8, max_seq=4)
+    assert cache.v_head_dim == 8
+    assert cache.k.shape == cache.v.shape
