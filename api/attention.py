@@ -108,10 +108,17 @@ class Attention(nn.Module):
             self._v_norm_mode = None
             self._v_norm_with_scale = None
 
+        # B1: SmolLM3 NoPE per-layer — spec.rope may be None on layers where the
+        # model disables RoPE (NoPE layers). The forward path then skips
+        # rope_apply entirely; Q/K propagate to SDPA without position rotation.
+        # Source: `transformers/models/smollm3/modeling_smollm3.py:211`
+        # (`self.use_rope = config.no_rope_layers[layer_idx]`) and 233-235
+        # (the `if self.use_rope:` branch around apply_rotary_pos_emb).
         if spec.rope is None:
-            raise NotImplementedError("M1: RoPE required")
-        self.rope = _rope.RoPE(spec.rope, head_dim=spec.head_dim,
-                               max_seq=max_seq, dtype=dtype)
+            self.rope = None
+        else:
+            self.rope = _rope.RoPE(spec.rope, head_dim=spec.head_dim,
+                                   max_seq=max_seq, dtype=dtype)
 
     def forward(
         self,
@@ -136,7 +143,9 @@ class Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        q, k = self.rope(q, k, position_ids)
+        # B1: NoPE branch — SmolLM3 disables RoPE on a periodic subset of layers.
+        if self.rope is not None:
+            q, k = self.rope(q, k, position_ids)
 
         # B0.6: v_norm applied to V before transpose+cache.write (per HF
         # `modeling_gemma4.py:1265`). When `attention_k_eq_v=True` (v aliased
