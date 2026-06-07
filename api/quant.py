@@ -1,4 +1,4 @@
-"""Quantization: AWQ W4A16, GGUF Q4_K_M round-trip.
+"""Quantization: AWQ W4A16, GGUF Q4_K_M, FP8 E4M3 W8A8 round-trip.
 
 Each scheme below is grounded in the upstream reference implementation and
 exercises a distinct axis of `specs.QuantSpec`:
@@ -6,6 +6,8 @@ exercises a distinct axis of `specs.QuantSpec`:
   - AWQ W4A16          : INT4 grouped, asymmetric, AWQ_INTERLEAVE packing.
   - GGUF Q4_K_M        : INT4 super-block (256), 8 sub-blocks of 32 elements,
                          6-bit per-sub-block scale+min, fp16 super-block d/dmin.
+  - FP8 E4M3 W8A8      : per-tensor weight scale + per-token activation scale,
+                         fp32 accumulator.
 
 Source citations are inline at each function. See per-function docstring for
 tolerance expectations.
@@ -388,3 +390,77 @@ def gguf_q4_k_dequantize(
     mn_f32 = mn_q.float().reshape(B, 8, 1)
     y = d_f32 * sc_f32 * q - dmin_f32 * mn_f32
     return y.reshape(B, GGUF_QK_K)
+
+
+# ============================================================================
+# FP8 E4M3 W8A8
+# ============================================================================
+#
+# Format:
+#   - Weights: per-tensor symmetric scale, cast to torch.float8_e4m3fn.
+#   - Activations: per-token symmetric scale (one scale per row of [tokens, hidden]),
+#     also cast to torch.float8_e4m3fn.
+#   - Compute: fp32 accumulator (matmul performed after dequantizing both sides).
+#
+# torch.float8_e4m3fn carries:
+#   sign(1) + exp(4, bias=7) + mantissa(3); dynamic range ~ [-448, 448].
+#
+# This is the dominant H100/B200 inference format (vLLM / TensorRT-LLM / Triton
+# fused kernels). For our purposes we expose a tensor-level round-trip without
+# depending on a CUDA backend.
+#
+# torch.float8_e4m3fn is the IEEE-incompatible "fn" variant — no infinities,
+# NaN encoded only as 0x7F/0xFF. The max finite is 448. See
+# https://docs.pytorch.org/docs/stable/tensors.html#torch.float8_e4m3fn
+
+FP8_E4M3_MAX = 448.0
+
+
+def fp8_e4m3_quantize_per_tensor(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor symmetric FP8 E4M3 weight quantization.
+
+    Returns (w_fp8, scale_fp32).
+    The original is recovered by `scale * w_fp8.to(fp32)`.
+    """
+    amax = w.abs().max().float().clamp_min(1e-12)
+    scale = amax / FP8_E4M3_MAX
+    w_scaled = (w.float() / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    w_fp8 = w_scaled.to(torch.float8_e4m3fn)
+    return w_fp8, scale
+
+
+def fp8_e4m3_quantize_per_token(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token (per-row, last-dim) symmetric FP8 E4M3 activation quantization.
+
+    x: shape [..., hidden]. The scale is per-row over the LAST axis.
+    Returns (x_fp8, scales_fp32) where scales has shape x.shape[:-1] + (1,).
+    """
+    amax = x.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-12)
+    scale = amax / FP8_E4M3_MAX
+    x_scaled = (x.float() / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+    return x_fp8, scale
+
+
+def fp8_e4m3_dequantize(t_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize an FP8 E4M3 tensor back to fp32 using the supplied scale."""
+    return t_fp8.to(torch.float32) * scale.to(torch.float32)
+
+
+def fp8_e4m3_matmul(
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    """W8A8 matmul with FP32 accumulator.
+
+    x_fp8 : [..., K] FP8 E4M3 activations
+    x_scale: per-token scales, shape x_fp8.shape[:-1] + (1,)
+    w_fp8 : [K, N] FP8 E4M3 weights
+    w_scale: per-tensor scale (scalar)
+    """
+    x_f32 = x_fp8.to(torch.float32)
+    w_f32 = w_fp8.to(torch.float32)
+    acc = x_f32 @ w_f32                       # fp32 accumulator
+    return acc * x_scale.to(torch.float32) * w_scale.to(torch.float32)

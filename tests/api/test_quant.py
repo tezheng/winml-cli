@@ -3,6 +3,7 @@
 Scheme coverage:
   - AWQ W4A16   (INT4 grouped, asymmetric, AWQ_INTERLEAVE)
   - GGUF Q4_K_M (k-quant; super-block 256, 6-bit sub-scales/mins)
+  - FP8 E4M3 W8A8 (per-tensor W + per-token A, fp32 accumulate)
 """
 import torch
 
@@ -143,3 +144,59 @@ def test_gguf_q4k_zeroed_block_round_trip_exact():
     d, dmin, scales_packed, qs = quant.gguf_q4_k_quantize(w)
     y = quant.gguf_q4_k_dequantize(d, dmin, scales_packed, qs).reshape(256)
     assert torch.all(y.abs() < 1e-6)
+
+
+# ============================================================================
+# FP8 E4M3 W8A8
+# ============================================================================
+
+
+def test_fp8_e4m3_per_tensor_round_trip_weight():
+    torch.manual_seed(4)
+    w = torch.randn(64, 64, dtype=torch.float32)
+    w_fp8, scale = quant.fp8_e4m3_quantize_per_tensor(w)
+    assert w_fp8.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.float32
+    w_back = quant.fp8_e4m3_dequantize(w_fp8, scale)
+    rel = (w_back - w).abs() / (w.abs() + 1e-6)
+    median_rel = rel.median().item()
+    # E4M3 has ~3 mantissa bits => quant step ~ 2^-3 = 0.125 of magnitude.
+    assert median_rel < 0.10, f"per-tensor median rel-err {median_rel} too large"
+
+
+def test_fp8_e4m3_per_token_round_trip_activation():
+    torch.manual_seed(5)
+    x = torch.randn(4, 128, dtype=torch.float32)
+    x_fp8, scale = quant.fp8_e4m3_quantize_per_token(x)
+    assert x_fp8.dtype == torch.float8_e4m3fn
+    assert scale.shape == (4, 1)
+    x_back = quant.fp8_e4m3_dequantize(x_fp8, scale)
+    rel = (x_back - x).abs() / (x.abs() + 1e-6)
+    assert rel.median().item() < 0.10
+
+
+def test_fp8_e4m3_w8a8_matmul_within_tolerance():
+    torch.manual_seed(6)
+    B, K, N = 2, 128, 64
+    x = torch.randn(B, K, dtype=torch.float32)
+    w = torch.randn(K, N, dtype=torch.float32) * 0.5
+
+    x_fp8, x_scale = quant.fp8_e4m3_quantize_per_token(x)
+    w_fp8, w_scale = quant.fp8_e4m3_quantize_per_tensor(w)
+    y_quant = quant.fp8_e4m3_matmul(x_fp8, x_scale, w_fp8, w_scale)
+    y_full = x @ w
+
+    rel = (y_quant - y_full).abs() / (y_full.abs() + 1e-3)
+    median_rel = rel.median().item()
+    # Sum of K ~= 128 FP8 products: noise averages down, so median rel ~ a few %.
+    assert median_rel < 0.10, f"W8A8 matmul median rel-err {median_rel:.4f} too large"
+
+
+def test_fp8_e4m3_clamp_against_overflow():
+    # Values larger than FP8 E4M3 max (~448) must be clamped by the scale.
+    big = torch.tensor([1000.0, -1000.0, 0.5, -0.5], dtype=torch.float32)
+    w_fp8, scale = quant.fp8_e4m3_quantize_per_tensor(big)
+    w_back = quant.fp8_e4m3_dequantize(w_fp8, scale)
+    # Big values recoverable to within ~1 step of scale * FP8_E4M3_MAX
+    assert torch.isfinite(w_back).all()
+    assert (w_back[0] > 800.0) and (w_back[1] < -800.0)
