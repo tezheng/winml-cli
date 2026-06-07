@@ -128,6 +128,71 @@ a v3-spec hook (`MaskKind.BLOCK_BIDIRECTIONAL` +
 exercised by shape-only tests; the canonical numerical gate runs against
 CAUSAL per the HF source.
 
+## B9 status — Audio-LM family (2 families landed)
+
+B9 adds the LM-decoder portion of two audio-LM families:
+
+- **Moshi 7B** (`models/moshi/`) — Kyutai's full-duplex audio LM. The
+  main (Helium) decoder is a PRE-norm Llama-like block with two quirks:
+  **MHA** (n_q = n_kv = 32 — not GQA despite the 7B size) and **fused
+  SwiGLU gate/up** (`MoshiGatingMLP.fc1` is one Linear of size `ffn_dim`
+  split via `.view(B, S, 2, -1)`). RMSNorm eps=1e-8, rope_theta=10000.
+  Synthetic-weight numerical gate vs HF MoshiModel: max_abs_diff =
+  1.19e-7 / 5.96e-8 (layer 0 / layer 1).
+
+- **Voxtral 3B** (`models/voxtral/`) — Mistral.ai's audio model. The LM
+  decoder is delegated to `AutoModel.from_config(text_config)` and the
+  canonical `mistralai/Voxtral-Mini-3B-2507` uses
+  `text_config.model_type='llama'` — i.e. a Llama backbone with
+  rope_theta=1e8 and no sliding window. Synthetic-weight numerical gate
+  vs HF VoxtralForConditionalGeneration: max_abs_diff = 1.19e-7 / 5.96e-8.
+
+**Audio encoder/decoder OUT OF SCOPE.** Both families ship only the
+LM-decoder portion. The Mimi audio codec (Moshi) and the Whisper-style
+audio encoder + multi-modal projector (Voxtral) are intentionally not
+included. Dual-stream text + audio token routing (Moshi) lives at the
+embedding layer + depth-decoder head — the per-layer block is
+stream-agnostic, so both families fit the existing IR cleanly with zero
+new api/ hooks.
+
+**Source-grounded drifts caught:**
+- Moshi LM-decoder is **MHA, NOT GQA** (B9 plan said "verify GQA"). The
+  HF state-dict layout further wraps q/k/v/o under `MoshiLinear` adding
+  a `.linear.weight` suffix.
+- Voxtral LM-decoder is **Llama, NOT Mistral** (B9 plan said
+  "Mistral-style"). The two are architecturally indistinguishable at the
+  layer level, but rope_theta=1e8 (vs Mistral v0.3's 1e6) is a
+  meaningful drift for any context-length scaling work.
+
+## B10 status — Quantization "support 6" baseline (5 schemes landed, 1 stubbed)
+
+B10 exercises the QuantSpec axes that AWQ alone (landed in M1) does not
+reach. Each scheme is verified source-first against the canonical reference
+implementation and round-trip tested at the API level + (for AWQ and Q4_K_M)
+on a real Qwen3-0.6B q_proj weight.
+
+| Scheme         | Format                                       | Source                                  | Median rel-err (synthetic) | Real-weight test         |
+|----------------|----------------------------------------------|-----------------------------------------|-----------------------------|--------------------------|
+| AWQ W4A16      | grouped INT4 asym, AWQ_INTERLEAVE pack       | (M1, casper-hansen/AutoAWQ)             | 0.150                       | Qwen3 q_proj: 0.157      |
+| GGUF Q4_K_M    | super-block 256 + 6-bit sub-scales/mins      | ggml-quants.c, ggml-common.h block_q4_K | 0.091                       | Qwen3 q_proj: 0.094      |
+| FP8 E4M3 W8A8  | per-tensor W + per-token A, fp32 acc         | torch.float8_e4m3fn                     | 0.037 (W8A8 matmul)         | n/a (synthetic only)     |
+| MXFP4          | UE8M0 shared exp + E2M1 mantissas (blk 32)   | OCP MX v1.0 sections 5.4-5.5            | 0.121                       | n/a                      |
+| LiteRT W4A8    | per-channel INT4 weight + per-tensor INT8 act| developers.google.com/edge/litert spec  | weight 0.140; W4A8 0.05-0.10| n/a                      |
+| IQ2_M / AQLM   | codebook-quant (2-bit + multi-codebook)      | ggml + Vahe1994/AQLM (stubs only)       | stub: NotImplementedError   | reserved for M3          |
+
+`api/quant.py` now exposes:
+- AWQ:    `awq_quantize` / `awq_dequantize` (M1)
+- GGUF:   `gguf_q4_k_quantize` / `gguf_q4_k_dequantize` + 6-bit pack/unpack helpers
+- FP8:    `fp8_e4m3_quantize_per_tensor` / `fp8_e4m3_quantize_per_token` / `fp8_e4m3_matmul`
+- MXFP4:  `mxfp4_quantize` / `mxfp4_dequantize` + E2M1 encode/decode helpers
+- LiteRT: `litert_quantize_weight` / `litert_quantize_activation_per_tensor` /
+          `litert_w4a8_matmul` / `litert_w4_pack` / `litert_w4_unpack`
+- Stubs:  `iq2_m_dequantize` / `aqlm_dequantize` (raise NotImplementedError with
+          pointers to the canonical references)
+
+Tests: 23 unit (`tests/api/test_quant.py`) + 2 real-weight on Qwen3 q_proj
+(`tests/models/qwen3/test_quant_awq.py` and `test_quant_gguf_q4k.py`).
+
 ## Project structure
 
 See `docs/superpowers/plans/2026-06-05-llm-layers-m1-qwen3.md` for the M1 plan,
