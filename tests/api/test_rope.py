@@ -226,3 +226,67 @@ def test_longrope_attention_factor_scales_cos_sin():
     r_b = rope.RoPE(spec_b, head_dim=head_dim, max_seq=16, dtype=torch.float32)
     assert torch.allclose(r_b.cos_cached, r_a.cos_cached * 2.5, atol=1e-6)
     assert torch.allclose(r_b.sin_cached, r_a.sin_cached * 2.5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# B4: INTERLEAVED basis (Llama 4) — rotates consecutive (real, imag) pairs.
+# ---------------------------------------------------------------------------
+
+
+def test_interleaved_rope_cos_sin_shape():
+    """INTERLEAVED cos/sin tables have shape [S, Dh/2], not [S, Dh]."""
+    spec = specs.RoPESpec(base_theta=500_000.0, basis=types.RoPEBasis.INTERLEAVED)
+    head_dim = 16
+    max_seq = 8
+    module = rope.RoPE(spec, head_dim=head_dim, max_seq=max_seq, dtype=torch.float32)
+    assert module.cos_cached.shape == (max_seq, head_dim // 2)
+    assert module.sin_cached.shape == (max_seq, head_dim // 2)
+
+
+def test_interleaved_rope_matches_hf_llama4_complex_multiply():
+    """Verify the INTERLEAVED rotation matches HF Llama 4's
+    `apply_rotary_emb` (modeling_llama4.py:245-254) which uses
+    view_as_complex + complex multiply.
+    """
+    spec = specs.RoPESpec(base_theta=500_000.0, basis=types.RoPEBasis.INTERLEAVED)
+    head_dim = 8
+    max_seq = 16
+    module = rope.RoPE(spec, head_dim=head_dim, max_seq=max_seq, dtype=torch.float32)
+
+    B, S, H = 1, 4, 2
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, head_dim)
+    k = torch.randn(B, S, H, head_dim)
+    pos = torch.arange(S)
+    q_rot, k_rot = module(q, k, pos)
+
+    # Reference: rebuild HF Llama 4's complex-multiply path.
+    inv_freq = 1.0 / (500_000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_seq).float()
+    freqs = torch.outer(t, inv_freq)               # [max_seq, head_dim/2]
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex
+    # Sub-select positions [0..S).
+    freqs_cis = freqs_cis[:S]
+    # Apply per HF: view_as_complex on (real, imag) pairs.
+    q_ = torch.view_as_complex(q.reshape(B, S, H, head_dim // 2, 2))
+    k_ = torch.view_as_complex(k.reshape(B, S, H, head_dim // 2, 2))
+    # Broadcast: freqs_cis[None, S, None, head_dim/2].
+    freqs_b = freqs_cis[None, :, None, :]
+    q_ref = torch.view_as_real(q_ * freqs_b).flatten(3)
+    k_ref = torch.view_as_real(k_ * freqs_b).flatten(3)
+    assert torch.allclose(q_rot, q_ref, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(k_rot, k_ref, atol=1e-5, rtol=1e-5)
+
+
+def test_interleaved_rope_identity_at_position_0():
+    """At position 0 the rotation is identity (cos=1, sin=0)."""
+    spec = specs.RoPESpec(base_theta=10000.0, basis=types.RoPEBasis.INTERLEAVED)
+    head_dim = 16
+    module = rope.RoPE(spec, head_dim=head_dim, max_seq=8, dtype=torch.float32)
+    B, S, H = 1, 1, 2
+    q = torch.randn(B, S, H, head_dim)
+    k = torch.randn(B, S, H, head_dim)
+    pos = torch.tensor([0])
+    q_rot, k_rot = module(q, k, pos)
+    assert torch.allclose(q_rot, q, atol=1e-6)
+    assert torch.allclose(k_rot, k, atol=1e-6)

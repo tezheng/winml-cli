@@ -62,10 +62,26 @@ class RoPE(nn.Module):
     def __init__(self, spec: specs.RoPESpec, head_dim: int, max_seq: int,
                  dtype: torch.dtype = torch.float32):
         super().__init__()
-        if spec.basis != types.RoPEBasis.SPLIT_HALF:
-            raise NotImplementedError("M1 supports SPLIT_HALF basis only")
+        if spec.basis not in (types.RoPEBasis.SPLIT_HALF, types.RoPEBasis.INTERLEAVED):
+            raise NotImplementedError(
+                f"SPLIT_HALF and INTERLEAVED basis only, got {spec.basis}"
+            )
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even, got {head_dim}")
+        # B4: INTERLEAVED basis (Llama 4) is incompatible with the partial-rotary
+        # and LongRoPE codepaths in the current implementation. Source:
+        # modeling_llama4.py:200-241 — Llama 4's RoPE uses full head_dim,
+        # default scaling, and complex-multiply pairing.
+        if spec.basis == types.RoPEBasis.INTERLEAVED:
+            if spec.partial_rotary_factor != 1.0:
+                raise NotImplementedError(
+                    "INTERLEAVED basis with partial_rotary_factor != 1.0 not supported"
+                )
+            if spec.scaling not in (types.RoPEScaling.NONE, types.RoPEScaling.LLAMA3):
+                raise NotImplementedError(
+                    f"INTERLEAVED basis supports NONE / LLAMA3 scaling only, "
+                    f"got {spec.scaling}"
+                )
         if spec.partial_rotary_kind not in ("prefix", "proportional"):
             raise ValueError(
                 f"partial_rotary_kind must be 'prefix' or 'proportional', "
@@ -178,12 +194,17 @@ class RoPE(nn.Module):
 
         t = torch.arange(max_seq).float()
         freqs = torch.outer(t, inv_freq)            # [max_seq, *]
-        # cos/sin shape depends on partial_rotary_kind:
-        # - "prefix": [max_seq, head_dim_rot] — cos/sin only at rotated channels.
-        # - "proportional": [max_seq, head_dim] — full-dim, with cos=1, sin=0 in
-        #   the trailing zero-inv_freq channels.
-        cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(dtype)
-        sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).to(dtype)
+        # cos/sin shape depends on basis and partial_rotary_kind:
+        # - SPLIT_HALF + "prefix": [max_seq, head_dim_rot] — cos/sin at rotated channels.
+        # - SPLIT_HALF + "proportional": [max_seq, head_dim] — full-dim, with
+        #   cos=1, sin=0 in the trailing zero-inv_freq channels.
+        # - INTERLEAVED: [max_seq, head_dim/2] — one entry per (real, imag) pair.
+        if spec.basis == types.RoPEBasis.INTERLEAVED:
+            cos = freqs.cos().to(dtype)             # [max_seq, head_dim/2]
+            sin = freqs.sin().to(dtype)
+        else:
+            cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(dtype)
+            sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).to(dtype)
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
         self._longrope_boundary = None
@@ -211,13 +232,17 @@ class RoPE(nn.Module):
         else:
             cos = self.cos_cached[position_ids]
             sin = self.sin_cached[position_ids]
-        # Dispatch by partial_rotary_kind:
-        # - "proportional" (Gemma 4) → cos/sin span the full head_dim;
-        #   rotate_half pairs i↔i+head_dim/2 across the full head_dim, with
-        #   identity multiply on the trailing zero-inv_freq channels.
-        # - "prefix" (Phi-3 / Phi-4) → cos/sin span only head_dim_rot;
-        #   rope_apply_partial slices q[..., :rot_dim] (rotated) and
-        #   q[..., rot_dim:] (pass-through) and concatenates.
+        # Dispatch by basis + partial_rotary_kind:
+        # - INTERLEAVED (Llama 4) → cos/sin span head_dim/2; rope_apply
+        #   reshapes head into (Dh/2, 2) pairs and complex-multiplies.
+        # - SPLIT_HALF + "proportional" (Gemma 4) → cos/sin span the full
+        #   head_dim; rotate_half pairs i↔i+head_dim/2 across the full head_dim,
+        #   with identity multiply on the trailing zero-inv_freq channels.
+        # - SPLIT_HALF + "prefix" (Phi-3 / Phi-4) → cos/sin span only
+        #   head_dim_rot; rope_apply_partial slices q[..., :rot_dim] (rotated)
+        #   and q[..., rot_dim:] (pass-through) and concatenates.
+        if self.spec.basis == types.RoPEBasis.INTERLEAVED:
+            return ops.rope_apply(q, k, cos, sin, basis="interleaved")
         if self._partial_kind == "prefix" and self.spec.partial_rotary_factor < 1.0:
             return ops.rope_apply_partial(
                 q, k, cos, sin,

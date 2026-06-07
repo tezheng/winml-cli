@@ -93,19 +93,49 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def rope_apply(
     q: torch.Tensor,           # [B, S, H, Dh]
     k: torch.Tensor,           # [B, S, Hk, Dh]
-    cos: torch.Tensor,         # [S, Dh]
-    sin: torch.Tensor,         # [S, Dh]
+    cos: torch.Tensor,         # [S, Dh] for SPLIT_HALF; [S, Dh/2] for INTERLEAVED
+    sin: torch.Tensor,         # [S, Dh] for SPLIT_HALF; [S, Dh/2] for INTERLEAVED
     basis: str = "split_half",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding.
 
     For Qwen3 / Llama / most modern SLMs we use SPLIT_HALF basis (GPT-NeoX style).
-    INTERLEAVED (GPT-J) basis is supported for future models.
+
+    B4: INTERLEAVED basis (Llama 4) — pairs (q[..., 2i], q[..., 2i+1]) are
+    rotated by angle θ_i directly, mathematically equivalent to complex
+    multiplication `(real + j*imag) * (cos(θ) + j*sin(θ))`. cos/sin tables
+    have shape [S, Dh/2] (one entry per pair). Source: modeling_llama4.py
+    L239 (freqs_cis = polar(1, freqs)) and L245-254 (view_as_complex →
+    complex multiply → view_as_real → flatten).
     """
     if basis not in ("split_half", "interleaved"):
         raise ValueError(f"unknown basis: {basis!r}")
     if basis == "interleaved":
-        raise NotImplementedError("INTERLEAVED basis lands in a later milestone")
+        # cos/sin must span Dh/2 — one entry per (even, odd) pair.
+        Dh = q.shape[-1]
+        if Dh % 2 != 0:
+            raise ValueError(f"head_dim must be even, got {Dh}")
+        if cos.shape[-1] != Dh // 2:
+            raise ValueError(
+                f"INTERLEAVED cos last dim must be Dh/2 ({Dh // 2}), "
+                f"got {cos.shape[-1]}"
+            )
+        # Broadcast cos/sin from [S, Dh/2] to [1, S, 1, Dh/2].
+        cos_b = cos.unsqueeze(0).unsqueeze(2)
+        sin_b = sin.unsqueeze(0).unsqueeze(2)
+
+        def _rot(x: torch.Tensor) -> torch.Tensor:
+            # Reshape last dim from Dh to (Dh/2, 2). Channel ordering is
+            # (real, imag) per pair.
+            x_pairs = x.reshape(*x.shape[:-1], Dh // 2, 2)
+            x_re = x_pairs[..., 0]
+            x_im = x_pairs[..., 1]
+            y_re = x_re * cos_b - x_im * sin_b
+            y_im = x_re * sin_b + x_im * cos_b
+            y = torch.stack([y_re, y_im], dim=-1)
+            return y.reshape(*x.shape)
+
+        return _rot(q), _rot(k)
 
     # Broadcast cos/sin from [S, Dh] to [1, S, 1, Dh]
     cos_b = cos.unsqueeze(0).unsqueeze(2)
