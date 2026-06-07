@@ -33,7 +33,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from api import attention as _attention, feedforward, kvcache, norm, ops, specs, types
+from api import attention as _attention, feedforward, kvcache, norm, ops, specs, ssm as _ssm, types
 
 
 class DecoderBlock(nn.Module):
@@ -59,14 +59,24 @@ class DecoderBlock(nn.Module):
             raise NotImplementedError(
                 f"B3: PRE, PRE_AND_POST, and POST ffn-norm only, got {spec.ffn_norm_position}"
             )
-        if not isinstance(spec.token_mixer, specs.AttentionSpec):
-            raise NotImplementedError("M1: AttentionSpec token mixer only")
+        # B7: token_mixer can be AttentionSpec or SSDSpec.
+        # AttentionSpec -> api.attention.Attention. SSDSpec -> api.ssm.Mamba2Mixer.
+        # (SSMSpec / Mamba-1 is reserved but not landed in B7.)
+        if not isinstance(spec.token_mixer, (specs.AttentionSpec, specs.SSDSpec)):
+            raise NotImplementedError(
+                f"B7: token_mixer must be AttentionSpec or SSDSpec, "
+                f"got {type(spec.token_mixer).__name__}"
+            )
+        self._is_ssm_block = isinstance(spec.token_mixer, specs.SSDSpec)
         # B5: channel_mixer can be FFNSpec (dense) OR MoESpec (DeepSeek-V2/V3
         # MoE layers). The DecoderBlock dispatches between FeedForward and
         # MoE based on type. Source: modeling_deepseek_v2.py:404
         # (self.mlp = DeepseekV2Moe(config) if layer_idx >= first_k_dense_replace
         # else DeepseekV2MLP(config)).
-        if not isinstance(spec.channel_mixer, (specs.FFNSpec, specs.MoESpec)):
+        # B7: when `spec.skip_ffn == True`, the block has NO FFN sublayer
+        # (canonical Mamba-2 layers — modeling_mamba2.py:617-640). The
+        # channel_mixer field is still required by typing but is ignored.
+        if not spec.skip_ffn and not isinstance(spec.channel_mixer, (specs.FFNSpec, specs.MoESpec)):
             raise NotImplementedError(
                 f"B5: channel_mixer must be FFNSpec or MoESpec, "
                 f"got {type(spec.channel_mixer).__name__}"
@@ -103,11 +113,26 @@ class DecoderBlock(nn.Module):
             self.pre_attn_norm = norm.RMSNorm(spec.pre_attn_norm, hidden_size, dtype=dtype)
             self.post_attn_sublayer_norm = None
 
-        self.attention = _attention.Attention(spec.token_mixer, hidden_size,
-                                              max_seq=max_seq, dtype=dtype)
+        if self._is_ssm_block:
+            # B7: SSM token mixer (Mamba-2). `self.attention` carries the
+            # mixer for backward-compat with existing factories that index
+            # `blk.attention.*`; for SSM blocks it's a `Mamba2Mixer`.
+            self.attention = _ssm.Mamba2Mixer(
+                spec.token_mixer, hidden_size, dtype=dtype,
+            )
+        else:
+            self.attention = _attention.Attention(spec.token_mixer, hidden_size,
+                                                  max_seq=max_seq, dtype=dtype)
 
         # FFN sublayer norms
-        if spec.ffn_norm_position == types.NormPosition.PRE_AND_POST:
+        if spec.skip_ffn:
+            # B7: Canonical Mamba-2 has no FFN sublayer. Skip all FFN
+            # construction. We still set the attributes to None so the
+            # forward dispatch handles them uniformly.
+            self.pre_ffn_norm = None
+            self.post_ffn_sublayer_norm = None
+            self.feedforward = None
+        elif spec.ffn_norm_position == types.NormPosition.PRE_AND_POST:
             if spec.pre_ffn_norm is None or spec.post_ffn_norm is None:
                 raise ValueError("PRE_AND_POST ffn norm requires pre and post norm specs")
             self.pre_ffn_norm = norm.RMSNorm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
@@ -132,12 +157,15 @@ class DecoderBlock(nn.Module):
         # is kept for backward compat (all existing model factories and
         # weight loaders index it as `blk.feedforward`); for MoE this name
         # holds the MoE module — DeepSeek loaders use it identically.
-        if isinstance(spec.channel_mixer, specs.MoESpec):
-            self.feedforward = feedforward.MoE(spec.channel_mixer, hidden_size,
-                                               dtype=dtype)
-        else:
-            self.feedforward = feedforward.FeedForward(spec.channel_mixer, hidden_size,
-                                                       dtype=dtype)
+        # B7: skip_ffn=True (canonical Mamba-2 layer) means no channel mixer
+        # at all — `self.feedforward` is None, set above.
+        if not spec.skip_ffn:
+            if isinstance(spec.channel_mixer, specs.MoESpec):
+                self.feedforward = feedforward.MoE(spec.channel_mixer, hidden_size,
+                                                   dtype=dtype)
+            else:
+                self.feedforward = feedforward.FeedForward(spec.channel_mixer, hidden_size,
+                                                           dtype=dtype)
 
         # B0.6: Per-Layer Embedding AT-END injection (Gemma 4 E2B/E4B).
         # When `spec.per_layer_embedding` is set, the block owns 3 extra tensors:
@@ -170,29 +198,37 @@ class DecoderBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        position_ids: torch.Tensor,
-        cache: kvcache.ContiguousKVCache,
-        start_pos: int,
+        position_ids: Optional[torch.Tensor] = None,
+        cache: Optional[object] = None,
+        start_pos: int = 0,
         per_layer_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward.
 
         Args:
             x: [B, S, hidden_size]
+            position_ids: required for attention token mixer; ignored for SSM.
+            cache: ContiguousKVCache for attention; SSMStateCache for SSM.
+            start_pos: required for attention token mixer; ignored for SSM.
             per_layer_input: optional [B, S, ple_dim] tensor. When the block
                 was built with `spec.per_layer_embedding` set, this is the
                 PLE table lookup for the current layer; it is REQUIRED to be
                 non-None (HF accepts None, with zero-fill semantics in our
                 tests handled at the call site).
         """
-        # Attention sublayer
+        # Token-mixer sublayer (attention or SSM)
         # B3 POST (OLMo 2): no pre-norm; feed raw residual to attention.
         if self.pre_attn_norm is not None:
             attn_in = self.pre_attn_norm(x)
         else:
             attn_in = x
-        attn_out = self.attention(attn_in, position_ids=position_ids,
-                                  cache=cache, start_pos=start_pos)
+        if self._is_ssm_block:
+            # B7: SSM mixer takes (hidden_states, cache). Source:
+            # modeling_mamba2.py:638 — `mixer(hidden_states, cache_params=...)`.
+            attn_out = self.attention(attn_in, cache=cache)
+        else:
+            attn_out = self.attention(attn_in, position_ids=position_ids,
+                                      cache=cache, start_pos=start_pos)
         if self.post_attn_sublayer_norm is not None:
             attn_out = self.post_attn_sublayer_norm(attn_out)
         # B2a: Granite μP residual scaling — sublayer output is multiplied by
@@ -201,17 +237,20 @@ class DecoderBlock(nn.Module):
             attn_out = attn_out * self._residual_scale
         x = ops.add(x, attn_out)
 
-        # FFN sublayer
-        if self.pre_ffn_norm is not None:
-            ffn_in = self.pre_ffn_norm(x)
-        else:
-            ffn_in = x
-        ffn_out = self.feedforward(ffn_in)
-        if self.post_ffn_sublayer_norm is not None:
-            ffn_out = self.post_ffn_sublayer_norm(ffn_out)
-        if self._residual_scale is not None:
-            ffn_out = ffn_out * self._residual_scale  # modeling_granite.py:278
-        x = ops.add(x, ffn_out)
+        # FFN sublayer (skipped for canonical Mamba-2 layers).
+        # Source: modeling_mamba2.py:617-640 — Mamba2Block has ONE sublayer
+        # only (norm + mixer + residual). No FFN.
+        if self.feedforward is not None:
+            if self.pre_ffn_norm is not None:
+                ffn_in = self.pre_ffn_norm(x)
+            else:
+                ffn_in = x
+            ffn_out = self.feedforward(ffn_in)
+            if self.post_ffn_sublayer_norm is not None:
+                ffn_out = self.post_ffn_sublayer_norm(ffn_out)
+            if self._residual_scale is not None:
+                ffn_out = ffn_out * self._residual_scale  # modeling_granite.py:278
+            x = ops.add(x, ffn_out)
 
         # B0.6: PLE injection AT END (Gemma 4 only). Mirror modeling_gemma4.py:1446-1453.
         if self.per_layer_input_gate is not None and per_layer_input is not None:

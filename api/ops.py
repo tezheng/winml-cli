@@ -291,6 +291,209 @@ def conv1d(
     return F.conv1d(x, weight, bias=bias, stride=stride, padding=padding, groups=groups)
 
 
-def selective_scan(*args, **kwargs):
-    """Mamba selective-scan op. Lands fully in the M2 SSM batch."""
-    raise NotImplementedError("selective_scan is reserved for the M2 SSM batch")
+def _pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int) -> torch.Tensor:
+    """Pad along the seq_len axis (axis 1). Mirrors modeling_mamba2.py:40-48."""
+    if pad_size == 0:
+        return input_tensor
+    if input_tensor.dim() == 4:
+        # [B, S, H, D] -> [B, S+pad, H, D]
+        pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0)
+    elif input_tensor.dim() == 3:
+        # [B, S, H] -> [B, S+pad, H]
+        pad_shape = (0, 0, 0, pad_size, 0, 0)
+    else:
+        raise ValueError(f"unsupported rank: {input_tensor.dim()}")
+    return F.pad(input_tensor, pad_shape, mode="constant", value=0)
+
+
+def _reshape_into_chunks(input_tensor: torch.Tensor, pad_size: int,
+                         chunk_size: int) -> torch.Tensor:
+    """Pad + reshape into chunks. Mirrors modeling_mamba2.py:51-68."""
+    input_tensor = _pad_tensor_by_size(input_tensor, pad_size)
+    if input_tensor.dim() == 3:
+        # [B, S, H] -> [B, -1, chunk_size, H]
+        return input_tensor.reshape(
+            input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2]
+        )
+    # rank 4: [B, S, H, D] -> [B, -1, chunk_size, H, D]
+    return input_tensor.reshape(
+        input_tensor.shape[0], -1, chunk_size,
+        input_tensor.shape[2], input_tensor.shape[3]
+    )
+
+
+def _segment_sum(input_tensor: torch.Tensor) -> torch.Tensor:
+    """Numerically stable segment cumulative sum.
+
+    Mirrors `modeling_mamba2.py:71-88` (segment_sum).
+
+    Input shape: [..., chunk_size]. Output shape: [..., chunk_size, chunk_size].
+    Strict lower-triangular below the diagonal, -inf above (inclusive diagonal
+    kept in step 4 of the original).
+
+    Step-by-step (HF impl):
+    1. expand last dim by chunk_size repetitions
+    2. mask above sub-diagonal (diagonal=-1) → zeros above the sub-diag
+    3. cumsum along the row axis (dim=-2)
+    4. mask above diagonal (diagonal=0) → -inf to make exp() vanish
+    """
+    chunk_size = input_tensor.size(-1)
+    # 1. [..., chunk_size] -> [..., chunk_size, chunk_size]
+    expanded = input_tensor[..., None].expand(*input_tensor.size(), chunk_size)
+    # 2. lower-tri mask strictly below diagonal (so diagonal=0)
+    mask = torch.tril(
+        torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool),
+        diagonal=-1,
+    )
+    expanded = expanded.masked_fill(~mask, 0)
+    # 3. cumsum along the inner row axis
+    tensor_segsum = torch.cumsum(expanded, dim=-2)
+    # 4. inclusive lower-tri mask: keep diagonal and below, set above to -inf
+    mask = torch.tril(
+        torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool),
+        diagonal=0,
+    )
+    tensor_segsum = tensor_segsum.masked_fill(~mask, -torch.inf)
+    return tensor_segsum
+
+
+def selective_scan(
+    hidden_states: torch.Tensor,    # [B, S, num_heads, head_dim] — discretized x = x * dt
+    A: torch.Tensor,                # [B, S, num_heads]           — discretized A = A_log_neg * dt
+    B: torch.Tensor,                # [B, S, num_heads, d_state]  — B repeated to num_heads
+    C: torch.Tensor,                # [B, S, num_heads, d_state]  — C repeated to num_heads
+    chunk_size: int,
+    initial_state: Optional[torch.Tensor] = None,   # [B, num_heads, head_dim, d_state]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mamba-2 SSD (Structured State-Space Duality) chunk-parallel selective scan.
+
+    REFERENCE implementation in pure PyTorch. Prioritizes CORRECTNESS over speed.
+    Faithfully mirrors `modeling_mamba2.py::Mamba2Mixer.torch_forward` lines
+    503-577 (`begin ssd naive` ... end of else branch).
+
+    Inputs (already discretized by the caller — caller must pre-multiply x*dt
+    and A_log_neg*dt because the HF code does that on lines 517-518):
+        hidden_states: [B, S, num_heads, head_dim] — x * dt, fp32
+        A: [B, S, num_heads]                       — A_neg * dt, fp32
+        B: [B, S, num_heads, d_state]              — already tiled num_heads
+        C: [B, S, num_heads, d_state]              — already tiled num_heads
+        chunk_size: int — must match the SSDSpec.chunk_size
+        initial_state: optional [B, num_heads, head_dim, d_state] prior state
+            (for sequential prefill of a longer sequence; HF model uses zeros
+            for the very first chunk batch).
+
+    Returns:
+        y: [B, S, num_heads, head_dim] — the scan output BEFORE D-residual and
+           BEFORE the gated norm. Already truncated to the unpadded S.
+        ssm_state: [B, num_heads, head_dim, d_state] — the final recurrent state
+           after processing all chunks (suitable for cache.update_recurrent_state).
+
+    Note: the D-residual `D * hidden_states_unscaled` and the final norm
+    (`norm(y, gate)`) are applied by the CALLER, not this op (HF does them
+    in the mixer's forward, lines 514, 569, 579).
+
+    Correctness key: the four conceptual steps of SSD (HF inline comments,
+    lines 527-565):
+    1. Y_diag = intra-chunk causal SSD via L = exp(segment_sum(A)) and G = C·B^T.
+    2. states (per-chunk) = right-term decay B_decay = B * exp(A_cumsum_last - A_cumsum), summed over the chunk.
+    3. inter-chunk recurrence via decay_chunk = exp(segment_sum(pad(A_cumsum_last, (1,0)))).
+    4. Y_off = C @ states * exp(A_cumsum) — left-term decay.
+    Final y = Y_diag + Y_off, truncated to seq_len.
+    """
+    if hidden_states.dim() != 4:
+        raise ValueError(
+            f"hidden_states must be [B, S, num_heads, head_dim], got rank {hidden_states.dim()}"
+        )
+    B_n, S, num_heads, head_dim = hidden_states.shape
+    if A.shape != (B_n, S, num_heads):
+        raise ValueError(
+            f"A shape {tuple(A.shape)} must be [B, S, num_heads]=({B_n},{S},{num_heads})"
+        )
+    if B.shape[:3] != (B_n, S, num_heads) or C.shape != B.shape:
+        raise ValueError(
+            f"B/C shape {tuple(B.shape)}/{tuple(C.shape)} must be "
+            f"[B, S, num_heads, d_state]"
+        )
+    d_state = B.shape[-1]
+
+    # Pad sequence length up to a multiple of chunk_size (HF line 512).
+    pad_size = (chunk_size - S % chunk_size) % chunk_size
+
+    # 1. Rearrange into chunks (HF line 521).
+    hs, A_c, B_c, C_c = [
+        _reshape_into_chunks(t, pad_size, chunk_size)
+        for t in (hidden_states, A, B, C)
+    ]
+    # After reshape: hs [B, n_chunks, chunk, num_heads, head_dim]
+    #               A_c [B, n_chunks, chunk, num_heads]
+    #               B_c [B, n_chunks, chunk, num_heads, d_state]
+
+    # A_c -> [B, num_heads, n_chunks, chunk] (HF line 524)
+    A_c = A_c.permute(0, 3, 1, 2)
+    A_cumsum = torch.cumsum(A_c, dim=-1)
+
+    # --- Step 1: intra-chunk diagonal block ---
+    # L = exp(segment_sum(A))  -> [B, num_heads, n_chunks, chunk, chunk]
+    L = torch.exp(_segment_sum(A_c))
+
+    # G = C · B^T contracted over d_state -> [B, n_chunks, chunk_l, chunk_s, num_heads]
+    # G_intermediate: [B, n_chunks, l, s, num_heads, d_state]
+    G_intermediate = C_c[:, :, :, None, :, :] * B_c[:, :, None, :, :, :]
+    G = G_intermediate.sum(dim=-1)
+
+    # M = G * L  (apply per-head decay)
+    # L permuted to [B, n_chunks, chunk_l, chunk_s, num_heads]
+    L_perm = L.permute(0, 2, 3, 4, 1)
+    M_intermediate = G[..., None] * L_perm[..., None]
+    M = M_intermediate.sum(dim=-1)   # [B, n_chunks, l, s, num_heads]
+
+    # Y_diag = sum_s M[..., l, s, h] * hidden_states[..., s, h, d]
+    # M: [B, n_chunks, l, s, num_heads] -> add last dim
+    # hidden_states reshape: [B, n_chunks, s, num_heads, head_dim]
+    Y_diag = (M[..., None] * hs[:, :, None]).sum(dim=3)
+    # Y_diag: [B, n_chunks, chunk_l, num_heads, head_dim]
+
+    # --- Step 2: per-chunk states (right-term B_decay) ---
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+    # decay_states: [B, num_heads, n_chunks, chunk]
+    # B_c: [B, n_chunks, chunk, num_heads, d_state]
+    # B_decay should match B_c: permute decay_states to [B, n_chunks, chunk, num_heads]
+    B_decay = B_c * decay_states.permute(0, 2, 3, 1)[..., None]
+    # states = sum_s (B_decay[..., d_state, None] * hs[..., None]) along chunk axis (dim=2)
+    states = (B_decay[..., None, :] * hs[..., None]).sum(dim=2)
+    # states: [B, n_chunks, num_heads, head_dim, d_state]
+
+    # --- Step 3: inter-chunk recurrence ---
+    if initial_state is not None:
+        # initial_state: [B, num_heads, head_dim, d_state]
+        # Prepend as the "zeroth" chunk state.
+        previous_states = initial_state.unsqueeze(1)
+    else:
+        previous_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([previous_states, states], dim=1)
+    decay_chunk = torch.exp(
+        _segment_sum(F.pad(A_cumsum[:, :, :, -1], (1, 0)))
+    )
+    # decay_chunk: [B, num_heads, n_chunks+1, n_chunks+1]
+    decay_chunk = decay_chunk.transpose(1, 3)  # [B, n_chunks+1, n_chunks+1, num_heads]
+    # new_states[k] = sum_j decay_chunk[k, j] * states[j]
+    new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+    # new_states: [B, n_chunks+1, num_heads, head_dim, d_state]
+    states, ssm_state = new_states[:, :-1], new_states[:, -1]
+
+    # --- Step 4: state -> output (left-term C_decay) ---
+    state_decay_out = torch.exp(A_cumsum)  # [B, num_heads, n_chunks, chunk]
+    # C_c: [B, n_chunks, chunk, num_heads, d_state]
+    # states: [B, n_chunks, num_heads, head_dim, d_state]
+    C_times_states = C_c[..., None, :] * states[:, :, None, ...]
+    # C_times_states: [B, n_chunks, chunk, num_heads, head_dim, d_state]
+    state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
+    Y_off = C_times_states.sum(-1) * state_decay_out_permuted[..., None]
+    # Y_off: [B, n_chunks, chunk, num_heads, head_dim]
+
+    # Combine and reshape.
+    y = Y_diag + Y_off
+    y = y.reshape(B_n, -1, num_heads, head_dim)
+    if pad_size > 0:
+        y = y[:, :S, :, :]
+    return y, ssm_state

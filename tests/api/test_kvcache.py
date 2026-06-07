@@ -145,3 +145,63 @@ def test_kvcache_default_v_head_dim_matches_head_dim():
                                       head_dim=8, max_seq=4)
     assert cache.v_head_dim == 8
     assert cache.k.shape == cache.v.shape
+
+
+def test_ssm_state_cache_init_shapes():
+    """B7: SSMStateCache holds conv_state and ssm_state of correct shapes."""
+    cache = kvcache.SSMStateCache(
+        batch_size=2, conv_dim=64, conv_kernel=4,
+        n_heads=8, head_dim=16, d_state=32,
+    )
+    assert cache.conv_state.shape == (2, 64, 4)
+    assert cache.ssm_state.shape == (2, 8, 16, 32)
+    assert cache.has_previous_state is False
+    assert cache.conv_state.sum().item() == 0.0
+    assert cache.ssm_state.sum().item() == 0.0
+
+
+def test_ssm_state_cache_update_conv_state_marks_has_previous():
+    cache = kvcache.SSMStateCache(
+        batch_size=1, conv_dim=8, conv_kernel=4,
+        n_heads=2, head_dim=4, d_state=4,
+    )
+    new = torch.randn(1, 8, 4)
+    cache.update_conv_state(new)
+    assert cache.has_previous_state
+    assert torch.allclose(cache.conv_state, new)
+
+
+def test_ssm_state_cache_update_recurrent_state_marks_has_previous():
+    cache = kvcache.SSMStateCache(
+        batch_size=1, conv_dim=8, conv_kernel=4,
+        n_heads=2, head_dim=4, d_state=4,
+    )
+    new = torch.randn(1, 2, 4, 4)
+    cache.update_recurrent_state(new)
+    assert cache.has_previous_state
+    assert torch.allclose(cache.ssm_state, new)
+
+
+def test_ssm_state_cache_update_rejects_shape_mismatch():
+    cache = kvcache.SSMStateCache(
+        batch_size=1, conv_dim=8, conv_kernel=4,
+        n_heads=2, head_dim=4, d_state=4,
+    )
+    with pytest.raises(ValueError, match="conv_state shape mismatch"):
+        cache.update_conv_state(torch.randn(1, 8, 5))
+    with pytest.raises(ValueError, match="ssm_state shape mismatch"):
+        cache.update_recurrent_state(torch.randn(1, 2, 4, 5))
+
+
+def test_ssm_state_cache_reset_clears_state():
+    cache = kvcache.SSMStateCache(
+        batch_size=1, conv_dim=4, conv_kernel=2,
+        n_heads=1, head_dim=2, d_state=2,
+    )
+    cache.update_conv_state(torch.ones_like(cache.conv_state))
+    cache.update_recurrent_state(torch.ones_like(cache.ssm_state))
+    assert cache.has_previous_state
+    cache.reset()
+    assert not cache.has_previous_state
+    assert cache.conv_state.sum().item() == 0.0
+    assert cache.ssm_state.sum().item() == 0.0

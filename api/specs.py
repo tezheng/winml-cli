@@ -224,7 +224,15 @@ class KVCacheSpec:
 
 @dataclass(frozen=True)
 class ConvSpec:
-    """1D causal conv (Mamba)."""
+    """1D causal depthwise conv used by the Mamba family front-end.
+
+    For Mamba-2 the conv kernel size is `conv_kernel` (default 4 per
+    `Mamba2Config.conv_kernel`), padded to `kernel_size-1` on the left so
+    the output spans the same seq_len AFTER `[..., :seq_len]` slicing.
+    Implemented as a SINGLE depthwise Conv1d with groups equal to the
+    channel count, NOT a multi-channel conv. Source:
+    `modeling_mamba2.py:155-162` (Mamba2Mixer init).
+    """
     kernel_size: int
     bias: bool = True
     activation: Optional[types.Activation] = None
@@ -232,27 +240,69 @@ class ConvSpec:
 
 @dataclass(frozen=True)
 class SSMSpec:
-    """Mamba-1 SSM (state-space) parameters."""
-    d_state: int
-    d_conv: int
-    d_inner: int
+    """Mamba-1 SSM (state-space) parameters.
+
+    Used directly by Mamba-1 models; embedded as `SSDSpec.base` for Mamba-2.
+
+    For Mamba-2, several of these fields carry duplicate meaning at the
+    SSDSpec layer (`d_inner`, `d_state`, `d_conv`); the SSDSpec is the
+    authoritative source for those shapes in the SSD path, and the SSMSpec
+    inside is a convenient carrier for the per-head time-step / activation
+    defaults.
+
+    Source: `modeling_mamba2.py:121-220` (Mamba2Mixer init).
+    """
+    d_state: int                       # state_size in HF config (default 128 for Mamba-2)
+    d_conv: int                        # conv_kernel in HF config (default 4)
+    d_inner: int                       # intermediate_size = hidden * expand
     expand_factor: int = 2
-    dt_rank: int = -1                  # -1 means "auto" (= hidden // 16)
+    dt_rank: int = -1                  # -1 means "auto" (= hidden // 16) — UNUSED by Mamba-2 (per-head dt instead)
     dt_min: float = 0.001
     dt_max: float = 0.1
     dt_init_floor: float = 1e-4
     conv_bias: bool = True
     bias: bool = False
     use_fast_path: bool = True
+    activation: types.Activation = types.Activation.SILU
 
 
 @dataclass(frozen=True)
 class SSDSpec:
-    """Mamba-2 SSD form. Composition over SSMSpec via base; not inheritance, to keep frozen semantics clean."""
+    """Mamba-2 SSD form parameters.
+
+    Composes an `SSMSpec` (carrying the per-head defaults and activation)
+    with the Mamba-2-specific multi-head + grouped-B/C shape parameters.
+
+    Mamba-2 layout (source `modeling_mamba2.py:121-220`):
+    - `num_heads` (`n_heads` here): number of SSM heads (default 128 for 2.7B).
+    - `head_dim`: per-head dim (default 64). Invariant:
+      `n_heads * head_dim == hidden_size * expand == d_inner`.
+      Validated by `Mamba2Config.validate_architecture()`.
+    - `n_groups`: how many groups of (B, C) share the recurrence (default 8).
+      `num_heads` MUST be divisible by `n_groups`; B and C are tiled
+      `num_heads // n_groups` times across the head axis at scan time
+      (`modeling_mamba2.py:510-511`).
+    - `chunk_size`: chunk length for SSD chunk-parallel scan (default 256).
+      The naive PyTorch fallback (`torch_forward`, lines 503-577) pads the
+      sequence to a multiple of `chunk_size`.
+    - `time_step_limit`: (low, high) clamp applied AFTER softplus(dt+dt_bias)
+      (line 506). Default (0.0, inf) — i.e. no upper clamp.
+    - `layer_norm_epsilon`: shared with the GATED RMS norm before out_proj
+      (line 179).
+    - `use_bias` (carried via base.bias): bias of in_proj and out_proj.
+    - `use_conv_bias` (carried via base.conv_bias): bias of conv1d.
+    - `residual_in_fp32`: when True, the residual stream is upcast to fp32
+      before the residual add (modeling_mamba2.py:622, 635).
+    """
     base: SSMSpec
     chunk_size: int = 256
     headdim: int = 64
     ngroups: int = 1
+    n_heads: int = 1
+    time_step_limit_low: float = 0.0
+    time_step_limit_high: float = float("inf")
+    layer_norm_epsilon: float = 1e-5
+    residual_in_fp32: bool = True
 
 
 @dataclass(frozen=True)
@@ -361,7 +411,13 @@ class PLESpec:
 class DecoderBlockSpec:
     attn_norm_position: types.NormPosition
     ffn_norm_position: types.NormPosition
-    token_mixer: AttentionSpec           # only AttentionSpec for M1 (Qwen3 dense)
+    # B7: token_mixer broadened to a Union of AttentionSpec | SSDSpec.
+    # SSMSpec (Mamba-1) is reserved but not exercised by the B7 landing.
+    # The DecoderBlock dispatches on isinstance at build time.
+    # Default is AttentionSpec for all pre-B7 model factories.
+    # Source: v3 design spec §5.2.5 — `token_mixer: Union[AttentionSpec,
+    # SSMSpec, SSDSpec, ...]`.
+    token_mixer: Union["AttentionSpec", "SSMSpec", "SSDSpec"]
     channel_mixer: Union[FFNSpec, "MoESpec"]   # FFNSpec (dense) | MoESpec (MoE)
     pre_attn_norm: Optional[NormSpec] = None
     post_attn_norm: Optional[NormSpec] = None
@@ -374,3 +430,10 @@ class DecoderBlockSpec:
     # B0.5
     per_layer_embedding: Optional[PLESpec] = None
     final_logit_softcap: Optional[float] = None    # Gemma 4 = 30.0 (model-level; carried here for assembly)
+
+    # B7: when the token_mixer is an SSM/SSD spec, the FFN may be optional —
+    # Mamba-2 has NO FFN sublayer. When `channel_mixer` is None, the block
+    # skips the FFN sublayer entirely. For Mamba-2 we set this to None; the
+    # block then assembles `residual + ssm(norm(x))` and returns.
+    # Source: `modeling_mamba2.py:617-640` (Mamba2Block — only one sublayer).
+    skip_ffn: bool = False

@@ -113,6 +113,51 @@ def test_share_scheme_enum_values_exist():
     assert types.ShareScheme.CROSS_BLOCK_SHARED      # Apple AFM (deferred but enumerated)
 
 
+def test_token_mixer_kind_enum_values_exist():
+    """B7: TokenMixerKind enum carries ATTENTION + the SSM variants."""
+    assert types.TokenMixerKind.ATTENTION
+    assert types.TokenMixerKind.SSM_MAMBA1
+    assert types.TokenMixerKind.SSM_MAMBA2
+    assert types.TokenMixerKind.SSM_GRIFFIN
+    assert types.TokenMixerKind.SSM_RWKV
+
+
+def test_ssd_spec_b7_extra_fields_default():
+    """B7: SSDSpec carries n_heads, time_step_limit, layer_norm_epsilon,
+    residual_in_fp32. All Mamba-2 specific."""
+    ssm = specs.SSMSpec(d_state=128, d_conv=4, d_inner=5120)
+    assert ssm.activation == types.Activation.SILU
+    ssd = specs.SSDSpec(
+        base=ssm, headdim=64, ngroups=8, n_heads=80,
+        chunk_size=256,
+    )
+    assert ssd.n_heads == 80
+    assert ssd.time_step_limit_low == 0.0
+    assert ssd.time_step_limit_high == float("inf")
+    assert ssd.layer_norm_epsilon == 1e-5
+    assert ssd.residual_in_fp32 is True
+
+
+def test_decoder_block_spec_with_ssd_token_mixer_skips_ffn():
+    """B7: token_mixer can be SSDSpec; skip_ffn flag allows no FFN."""
+    norm = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-5,
+                          weight_mode=types.NormWeightMode.STANDARD_W)
+    ssm = specs.SSMSpec(d_state=128, d_conv=4, d_inner=128)
+    ssd = specs.SSDSpec(base=ssm, headdim=64, ngroups=1, n_heads=2)
+    ffn = specs.FFNSpec(intermediate_size=64,
+                       activation=types.Activation.SILU,
+                       gate_kind=types.GateKind.SWIGLU)
+    block = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE,
+        ffn_norm_position=types.NormPosition.PRE,
+        token_mixer=ssd, channel_mixer=ffn,
+        pre_attn_norm=norm, pre_ffn_norm=norm,
+        skip_ffn=True,
+    )
+    assert isinstance(block.token_mixer, specs.SSDSpec)
+    assert block.skip_ffn is True
+
+
 def test_qk_norm_phase_has_pre_rope_fixed_scale():
     # Gemma 4 uses PRE_ROPE QK-norm with a fixed-scale (non-learned-absorbing-1/sqrt(Dh)).
     # We model this as the existing PRE_ROPE phase plus a fixed_scale field on AttentionSpec.

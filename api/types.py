@@ -13,6 +13,27 @@ class AttentionKind(Enum):
     DSA = auto()            # DeepSeek V3.2 Sparse Attention (Lightning Indexer)
 
 
+class TokenMixerKind(Enum):
+    """B7: top-level dispatch between attention and state-space token mixers.
+
+    The DecoderBlockSpec.token_mixer is a Union[AttentionSpec, SSMSpec, SSDSpec].
+    For pure attention models (everything pre-B7), the token_mixer is always
+    AttentionSpec — `ATTENTION` is the implicit default and existing model
+    factories don't have to set this field. For SSM and hybrid families, the
+    factory chooses the appropriate kind per layer index in `to_block_spec`.
+
+    Source-grounded: v3 design spec §5.2.5 lists `SSM_MAMBA1, SSM_MAMBA2,
+    SSM_GRIFFIN, SSM_RWKV, HYBRID_PARALLEL` etc. For B7 we land
+    `ATTENTION`, `SSM_MAMBA2`, and reserve `SSM_GRIFFIN` / `SSM_RWKV` for
+    the deferred-family stubs.
+    """
+    ATTENTION = auto()      # default — AttentionSpec
+    SSM_MAMBA1 = auto()     # SSMSpec — Mamba-1 selective scan (reserved)
+    SSM_MAMBA2 = auto()     # SSDSpec — Mamba-2 SSD form (B7 lands this)
+    SSM_GRIFFIN = auto()    # RecurrentGemma — reserved (deferred stub)
+    SSM_RWKV = auto()       # RWKV-7 — reserved (deferred stub)
+
+
 class QKVLayout(Enum):
     SPLIT = auto()          # separate q/k/v projections
     FUSED = auto()          # one big QKV projection (Phi-3)

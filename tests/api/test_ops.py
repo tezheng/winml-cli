@@ -225,9 +225,117 @@ def test_conv1d_matches_torch():
     assert torch.allclose(out, ref, atol=1e-5)
 
 
-def test_selective_scan_raises_until_m2():
-    with pytest.raises(NotImplementedError, match="M2"):
-        ops.selective_scan()
+def test_selective_scan_basic_shapes():
+    """B7: selective_scan returns (y, final_state) of correct shapes."""
+    B, S, H, Dh, N = 1, 16, 4, 8, 4
+    chunk = 8
+    hs = torch.randn(B, S, H, Dh, dtype=torch.float32)
+    A = -torch.rand(B, S, H, dtype=torch.float32) * 0.1  # negative (decay)
+    Bm = torch.randn(B, S, H, N, dtype=torch.float32)
+    Cm = torch.randn(B, S, H, N, dtype=torch.float32)
+    y, state = ops.selective_scan(hs, A, Bm, Cm, chunk_size=chunk)
+    assert y.shape == (B, S, H, Dh)
+    assert state.shape == (B, H, Dh, N)
+
+
+def test_selective_scan_pads_to_chunk_size():
+    """seq_len need not be a multiple of chunk_size — internal pad+truncate."""
+    B, H, Dh, N = 1, 2, 4, 4
+    chunk = 8
+    for S in (5, 8, 11, 16, 19):
+        hs = torch.randn(B, S, H, Dh, dtype=torch.float32)
+        A = -torch.rand(B, S, H, dtype=torch.float32) * 0.1
+        Bm = torch.randn(B, S, H, N, dtype=torch.float32)
+        Cm = torch.randn(B, S, H, N, dtype=torch.float32)
+        y, state = ops.selective_scan(hs, A, Bm, Cm, chunk_size=chunk)
+        assert y.shape == (B, S, H, Dh), f"S={S}: got {tuple(y.shape)}"
+        assert state.shape == (B, H, Dh, N)
+
+
+def test_selective_scan_zero_decay_aggregates_x():
+    """When A==0 (no decay) and B==C==1 (no projection), the SSM degenerates.
+
+    With A=0: dA = exp(A*dt) = 1, so ssm_state[t] = ssm_state[t-1] + dB*x.
+    With B[t,k]=1 for all t,k and C[t,k]=1: y[t] = sum_{s<=t} x[s].
+
+    This sanity-checks the recurrence accumulation across chunk boundaries.
+    """
+    B, S, H, Dh, N = 1, 12, 1, 2, 1
+    chunk = 4
+    hs = torch.randn(B, S, H, Dh, dtype=torch.float32)
+    A = torch.zeros(B, S, H, dtype=torch.float32)
+    Bm = torch.ones(B, S, H, N, dtype=torch.float32)
+    Cm = torch.ones(B, S, H, N, dtype=torch.float32)
+    y, _ = ops.selective_scan(hs, A, Bm, Cm, chunk_size=chunk)
+    expected = torch.cumsum(hs, dim=1)  # [B, S, H, Dh]
+    assert torch.allclose(y, expected, atol=1e-5), (
+        f"cumsum mismatch, max_abs_diff={(y - expected).abs().max().item()}"
+    )
+
+
+def test_selective_scan_matches_hf_naive():
+    """B7: validate selective_scan against an inlined HF-style scalar recurrence.
+
+    For each batch/head, compute the SSM recurrence step-by-step:
+        s[t] = exp(A_t) * s[t-1] + B_t * x_t
+        y[t] = C_t · s[t]
+    where s[t] has shape [head_dim, d_state], x_t has shape [head_dim],
+    B_t and C_t are [d_state] (per-head in this test).
+    """
+    torch.manual_seed(7)
+    B, S, H, Dh, N = 1, 17, 3, 4, 5
+    chunk = 8
+    hs = torch.randn(B, S, H, Dh, dtype=torch.float64) * 0.5
+    A = -torch.rand(B, S, H, dtype=torch.float64) * 0.3
+    Bm = torch.randn(B, S, H, N, dtype=torch.float64) * 0.5
+    Cm = torch.randn(B, S, H, N, dtype=torch.float64) * 0.5
+    # Reference: explicit recurrence.
+    ref_y = torch.zeros(B, S, H, Dh, dtype=torch.float64)
+    state = torch.zeros(B, H, Dh, N, dtype=torch.float64)
+    for t in range(S):
+        dA = torch.exp(A[:, t]).view(B, H, 1, 1)              # [B, H, 1, 1]
+        dBx = (Bm[:, t].unsqueeze(-2)                          # [B, H, 1, N]
+               * hs[:, t].unsqueeze(-1))                       # [B, H, Dh, 1]
+        # dBx -> [B, H, Dh, N]
+        state = state * dA + dBx
+        # y[t] = C @ state  -> sum_n C[..., n] * state[..., n]
+        ref_y[:, t] = (Cm[:, t].unsqueeze(-2) * state).sum(dim=-1)
+    # Run the SSD op in fp64 by casting on the way in.
+    y, _ = ops.selective_scan(
+        hs.to(torch.float64), A.to(torch.float64),
+        Bm.to(torch.float64), Cm.to(torch.float64),
+        chunk_size=chunk,
+    )
+    max_diff = (y - ref_y).abs().max().item()
+    assert max_diff < 5e-4, f"selective_scan vs scalar recurrence max_diff={max_diff}"
+
+
+def test_selective_scan_respects_initial_state():
+    """initial_state arg = continue an existing recurrence."""
+    torch.manual_seed(11)
+    B, S, H, Dh, N = 1, 8, 2, 4, 3
+    chunk = 4
+    hs = torch.randn(B, S, H, Dh, dtype=torch.float64) * 0.5
+    A = -torch.rand(B, S, H, dtype=torch.float64) * 0.3
+    Bm = torch.randn(B, S, H, N, dtype=torch.float64) * 0.5
+    Cm = torch.randn(B, S, H, N, dtype=torch.float64) * 0.5
+    init = torch.randn(B, H, Dh, N, dtype=torch.float64) * 0.5
+    # Reference: explicit recurrence starting from init.
+    ref_y = torch.zeros(B, S, H, Dh, dtype=torch.float64)
+    state = init.clone()
+    for t in range(S):
+        dA = torch.exp(A[:, t]).view(B, H, 1, 1)
+        dBx = (Bm[:, t].unsqueeze(-2) * hs[:, t].unsqueeze(-1))
+        state = state * dA + dBx
+        ref_y[:, t] = (Cm[:, t].unsqueeze(-2) * state).sum(dim=-1)
+    y, final = ops.selective_scan(hs, A, Bm, Cm, chunk_size=chunk,
+                                   initial_state=init)
+    max_diff = (y - ref_y).abs().max().item()
+    assert max_diff < 5e-4, (
+        f"initial_state respected? max_diff={max_diff}"
+    )
+    state_diff = (final - state).abs().max().item()
+    assert state_diff < 5e-4, f"final state diff {state_diff}"
 
 
 def test_rope_apply_partial_rotary_factor_quarter():
