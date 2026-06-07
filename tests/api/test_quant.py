@@ -4,6 +4,7 @@ Scheme coverage:
   - AWQ W4A16   (INT4 grouped, asymmetric, AWQ_INTERLEAVE)
   - GGUF Q4_K_M (k-quant; super-block 256, 6-bit sub-scales/mins)
   - FP8 E4M3 W8A8 (per-tensor W + per-token A, fp32 accumulate)
+  - MXFP4 (UE8M0 shared exp + E2M1 mantissas, block 32)
 """
 import torch
 
@@ -200,3 +201,58 @@ def test_fp8_e4m3_clamp_against_overflow():
     # Big values recoverable to within ~1 step of scale * FP8_E4M3_MAX
     assert torch.isfinite(w_back).all()
     assert (w_back[0] > 800.0) and (w_back[1] < -800.0)
+
+
+# ============================================================================
+# MXFP4
+# ============================================================================
+
+
+def test_mxfp4_e2m1_codes_round_trip_exactly_on_grid():
+    # Every representable magnitude with both signs must round-trip exactly.
+    pos = quant._MXFP4_E2M1_MAGS  # [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    vals = torch.cat([pos, -pos])
+    codes = quant._mxfp4_encode_e2m1(vals)
+    back = quant._mxfp4_decode_e2m1(codes)
+    # +0 and -0 both map to magnitude 0; sign of decoded zero is sign-bit.
+    pos_back = back[: pos.numel()]
+    neg_back = back[pos.numel() :]
+    assert torch.allclose(pos_back.abs(), pos, atol=0)
+    assert torch.allclose(neg_back.abs(), pos, atol=0)
+
+
+def test_mxfp4_synthetic_round_trip_within_tolerance():
+    torch.manual_seed(7)
+    N = 32 * 16  # 16 blocks
+    w = torch.randn(N, dtype=torch.float32)
+    codes, exps = quant.mxfp4_quantize(w)
+    assert codes.shape == (16, 32)
+    assert exps.shape == (16,)
+    assert exps.dtype == torch.uint8
+
+    y = quant.mxfp4_dequantize(codes, exps)
+    rel = (y - w).abs() / (w.abs() + 1e-6)
+    median_rel = rel.median().item()
+    # E2M1 has only 8 magnitudes per block; expect ~10-15% median rel-err on
+    # Gaussian rows with block 32.
+    assert median_rel < 0.20, f"MXFP4 median rel-err {median_rel:.4f} too large"
+
+
+def test_mxfp4_zero_block_round_trip_exact():
+    w = torch.zeros(64, dtype=torch.float32)
+    codes, exps = quant.mxfp4_quantize(w)
+    y = quant.mxfp4_dequantize(codes, exps)
+    assert torch.all(y.abs() < 1e-6)
+
+
+def test_mxfp4_handles_large_dynamic_range():
+    # A block with one large element and many tiny ones — the shared
+    # exponent should track the large element, the tiny ones round to 0.
+    w = torch.zeros(32, dtype=torch.float32)
+    w[0] = 1000.0
+    w[1] = 0.001
+    codes, exps = quant.mxfp4_quantize(w)
+    y = quant.mxfp4_dequantize(codes, exps)
+    assert y.shape == (32,)
+    # Recovered max-element is within E2M1 grid step of 1000.
+    assert abs(y[0].item() - 1000.0) / 1000.0 < 0.20

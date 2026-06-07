@@ -1,4 +1,4 @@
-"""Quantization: AWQ W4A16, GGUF Q4_K_M, FP8 E4M3 W8A8 round-trip.
+"""Quantization: AWQ W4A16, GGUF Q4_K_M, FP8 E4M3 W8A8, MXFP4 round-trip.
 
 Each scheme below is grounded in the upstream reference implementation and
 exercises a distinct axis of `specs.QuantSpec`:
@@ -8,6 +8,7 @@ exercises a distinct axis of `specs.QuantSpec`:
                          6-bit per-sub-block scale+min, fp16 super-block d/dmin.
   - FP8 E4M3 W8A8      : per-tensor weight scale + per-token activation scale,
                          fp32 accumulator.
+  - MXFP4              : 32-element block; UE8M0 shared exponent + E2M1 mantissas.
 
 Source citations are inline at each function. See per-function docstring for
 tolerance expectations.
@@ -464,3 +465,91 @@ def fp8_e4m3_matmul(
     w_f32 = w_fp8.to(torch.float32)
     acc = x_f32 @ w_f32                       # fp32 accumulator
     return acc * x_scale.to(torch.float32) * w_scale.to(torch.float32)
+
+
+# ============================================================================
+# MXFP4  (OCP Microscaling FP4)
+# ============================================================================
+#
+# Source: OCP "Microscaling (MX) Formats" specification v1.0 (Open Compute
+# Project, 2023), §5.4 + §5.5; NVIDIA Blackwell PTX guide §14.7.
+# Block size = 32 elements. Shared scale is UE8M0 (8-bit unsigned exponent,
+# no mantissa, no sign, bias=127) — a pure power-of-two. Each element is
+# E2M1 (1 sign + 2 exp + 1 mantissa, bias=1):
+#
+#   E2M1 representable magnitudes:
+#     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0   (with sign bit)
+#     => 4-bit code: sign(1) | exp(2) | mantissa(1)
+#
+# Dequant: y = 2**(ue8m0_exp - 127) * e2m1_value
+# Quant:   choose shared exponent so that abs(max_in_block) / 2**(e-127) lies
+#          within the E2M1 max (= 6.0); round each element to the nearest
+#          E2M1 code.
+
+# E2M1 magnitudes (positive). Indexed by the 3-bit (exp, mantissa) field.
+_MXFP4_E2M1_MAGS = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+MXFP4_E2M1_MAX = 6.0
+MXFP4_BLOCK = 32
+
+
+def _mxfp4_encode_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Encode a fp32 tensor (already scaled into the E2M1 range) to 4-bit codes.
+
+    Returns int8 [...] with values in [0, 16).
+    """
+    sign = (x < 0).to(torch.int32)
+    mag = x.abs()
+    # nearest-magnitude search over the 8 positive codes.
+    mags = _MXFP4_E2M1_MAGS.view(*([1] * mag.dim()), 8)
+    diffs = (mag.unsqueeze(-1) - mags).abs()
+    code3 = diffs.argmin(dim=-1).to(torch.int32)   # 0..7
+    code = (sign << 3) | code3
+    return code.to(torch.int8)
+
+
+def _mxfp4_decode_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    """Decode 4-bit E2M1 codes to fp32 magnitudes (signed)."""
+    c = codes.to(torch.int32)
+    mag = _MXFP4_E2M1_MAGS.to(c.device)[c & 0x7]
+    sign = ((c >> 3) & 0x1).to(torch.float32) * -2.0 + 1.0   # 0 -> +1, 1 -> -1
+    return mag * sign
+
+
+def mxfp4_quantize(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 quantize a 1D row.
+
+    w: fp32/fp16 tensor of shape [N], with N % 32 == 0.
+    returns:
+      codes  : int8 [B, 32]  E2M1 codes (low 4 bits used)
+      exps   : uint8 [B]     UE8M0 shared exponent per block
+    """
+    if w.dim() != 1:
+        raise ValueError(f"expected 1D weight, got shape {tuple(w.shape)}")
+    if w.shape[0] % MXFP4_BLOCK != 0:
+        raise ValueError(f"length {w.shape[0]} not divisible by {MXFP4_BLOCK}")
+    B = w.shape[0] // MXFP4_BLOCK
+    w32 = w.float().reshape(B, MXFP4_BLOCK)
+    amax = w32.abs().amax(dim=-1).clamp_min(1e-30)
+    # Choose smallest power-of-two scale that fits amax / 2^(e-127) <= 6
+    #   2^(e-127) >= amax / 6
+    #   e >= log2(amax / 6) + 127
+    needed = torch.log2(amax / MXFP4_E2M1_MAX)
+    exps = torch.ceil(needed).to(torch.int32) + 127
+    exps = exps.clamp(0, 255).to(torch.uint8)
+    scale = torch.pow(2.0, exps.to(torch.float32) - 127.0).unsqueeze(-1)
+    w_scaled = w32 / scale
+    codes = _mxfp4_encode_e2m1(w_scaled)
+    return codes, exps
+
+
+def mxfp4_dequantize(codes: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
+    """Dequantize MXFP4 (codes, exps) back to fp32 [N]."""
+    B, blk = codes.shape
+    if blk != MXFP4_BLOCK:
+        raise ValueError(f"codes blocksize {blk} != {MXFP4_BLOCK}")
+    e = exps.to(torch.float32) - 127.0
+    scale = torch.pow(2.0, e).unsqueeze(-1)  # [B, 1]
+    vals = _mxfp4_decode_e2m1(codes)         # [B, 32]
+    return (vals * scale).reshape(B * MXFP4_BLOCK)
