@@ -263,3 +263,120 @@ def test_mask_kind_block_sparse_enum():
 def test_activation_gegelu_enum():
     """B2b: Phi-3-small uses GeGELU activation. Enum value exists."""
     assert hasattr(types.Activation, "GEGELU")
+
+
+def test_b5_attention_kind_dsa_enum():
+    """B5: DeepSeek-V3.2 Lightning Indexer attention kind."""
+    assert hasattr(types.AttentionKind, "DSA")
+
+
+def test_b5_rope_scaling_yarn_enum():
+    """B5: YARN scaling enum exists (used by DeepSeek-V2-Lite & DeepSeek-V3)."""
+    assert hasattr(types.RoPEScaling, "YARN")
+
+
+def test_b5_yarn_rope_params():
+    """B5: YarnRoPEParams matches DeepSeek-V2-Lite production config.
+
+    Source: deepseek-ai/DeepSeek-V2-Lite/config.json (rope_scaling block:
+    factor=40, beta_fast=32, beta_slow=1, mscale=0.707, mscale_all_dim=0.707,
+    original_max_position_embeddings=4096).
+    """
+    yarn = specs.YarnRoPEParams(
+        factor=40.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32.0, beta_slow=1.0,
+        mscale=0.707, mscale_all_dim=0.707,
+    )
+    spec = specs.RoPESpec(
+        base_theta=10000.0,
+        basis=types.RoPEBasis.INTERLEAVED,
+        scaling=types.RoPEScaling.YARN,
+        yarn_extra=yarn,
+    )
+    assert spec.yarn_extra is yarn
+    assert spec.scaling == types.RoPEScaling.YARN
+
+
+def test_b5_moe_spec_v2_lite_shape():
+    """B5: MoESpec matches DeepSeek-V2-Lite production config.
+
+    Source: deepseek-ai/DeepSeek-V2-Lite/config.json: n_routed_experts=64,
+    num_experts_per_tok=6, n_shared_experts=2, routed_scaling_factor=1.0,
+    norm_topk_prob=false, scoring_func=softmax, moe_intermediate_size=1408.
+    """
+    expert_ffn = specs.FFNSpec(
+        intermediate_size=1408,
+        activation=types.Activation.SILU,
+        gate_kind=types.GateKind.SWIGLU,
+    )
+    moe = specs.MoESpec(
+        n_experts=64, top_k=6,
+        n_shared_experts=2,
+        router_kind="softmax",
+        router_norm=False,
+        routed_scaling_factor=1.0,
+        expert_ffn=expert_ffn,
+    )
+    assert moe.router_kind == "softmax"
+    assert moe.expert_ffn.intermediate_size == 1408
+
+
+def test_b5_moe_spec_v3_lite_shape():
+    """B5: MoESpec for DeepSeek-V3 (sigmoid + bias + group routing).
+
+    Source: deepseek-ai/DeepSeek-V3 default config (n_routed_experts=256,
+    num_experts_per_tok=8, n_shared_experts=1, n_group=8, topk_group=4,
+    routed_scaling_factor=2.5, norm_topk_prob=true).
+    """
+    expert_ffn = specs.FFNSpec(
+        intermediate_size=2048,
+        activation=types.Activation.SILU,
+        gate_kind=types.GateKind.SWIGLU,
+    )
+    moe = specs.MoESpec(
+        n_experts=256, top_k=8,
+        n_shared_experts=1,
+        router_kind="sigmoid_plus_bias",
+        router_norm=True,
+        score_correction_bias=True,
+        group_routing=specs.GroupRoutingSpec(n_groups=8, topk_per_group=4),
+        routed_scaling_factor=2.5,
+        expert_ffn=expert_ffn,
+    )
+    assert moe.router_kind == "sigmoid_plus_bias"
+    assert moe.group_routing.n_groups == 8
+
+
+def test_b5_indexer_spec():
+    """B5: IndexerSpec exists for DSA composition (DeepSeek-V3.2)."""
+    spec = specs.IndexerSpec(indexer_dim=64, top_k=2048, warmup_tokens=1_000_000)
+    assert spec.indexer_dim == 64
+
+
+def test_b5_decoder_block_spec_accepts_moe():
+    """B5: DecoderBlockSpec.channel_mixer accepts a MoESpec (V2-Lite MoE layers)."""
+    norm = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                          weight_mode=types.NormWeightMode.STANDARD_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=16, n_kv_heads=16, head_dim=192,
+        kind=types.AttentionKind.MLA,
+        qkv_layout=types.QKVLayout.MLA_LATENT,
+        mask_kind=types.MaskKind.CAUSAL,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        kv_lora_rank=512, q_lora_rank=None,
+    )
+    expert_ffn = specs.FFNSpec(intermediate_size=1408,
+                               activation=types.Activation.SILU,
+                               gate_kind=types.GateKind.SWIGLU)
+    moe = specs.MoESpec(n_experts=64, top_k=6, n_shared_experts=2,
+                        routed_scaling_factor=1.0, expert_ffn=expert_ffn)
+    block = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE,
+        ffn_norm_position=types.NormPosition.PRE,
+        token_mixer=attn,
+        channel_mixer=moe,
+        pre_attn_norm=norm,
+        pre_ffn_norm=norm,
+    )
+    assert isinstance(block.channel_mixer, specs.MoESpec)

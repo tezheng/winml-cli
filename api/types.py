@@ -10,6 +10,7 @@ class AttentionKind(Enum):
     LINEAR_DELTANET = auto()
     LINEAR_GLA = auto()
     DIFFERENTIAL = auto()
+    DSA = auto()            # DeepSeek V3.2 Sparse Attention (Lightning Indexer)
 
 
 class QKVLayout(Enum):
@@ -80,7 +81,7 @@ class RoPEScaling(Enum):
     PI = auto()
     NTK_STATIC = auto()
     NTK_DYNAMIC = auto()
-    YARN = auto()
+    YARN = auto()           # DeepSeek-V2 / V3 — NTK + linear ramp + mscale
     LLAMA3 = auto()         # Llama 3 smooth scaling
     LONGROPE = auto()       # Phi-3 short/long
 
