@@ -142,13 +142,15 @@ class MiniCPM3Config:
         if self.rope_type == "longrope":
             assert self.longrope_short_factor is not None
             assert self.longrope_long_factor is not None
+            # MiniCPM-3's LongRoPE attention_factor formula is computed
+            # unconditionally — no clamp when scale ≤ 1 (unlike Phi-3 LongRoPE
+            # which clamps). Source: modeling_minicpm.py:218-222.
+            # For the production config (max == orig == 32768), scale=1 →
+            # attention_factor = 1.0 either way.
             scale = self.max_position_embeddings / self.original_max_position_embeddings
-            if scale <= 1.0:
-                attention_factor = 1.0
-            else:
-                attention_factor = math.sqrt(
-                    1.0 + math.log(scale) / math.log(self.original_max_position_embeddings)
-                )
+            attention_factor = math.sqrt(
+                1.0 + math.log(scale) / math.log(self.original_max_position_embeddings)
+            )
             rope_spec = specs.RoPESpec(
                 base_theta=self.rope_theta,
                 basis=types.RoPEBasis.SPLIT_HALF,
