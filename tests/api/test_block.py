@@ -480,3 +480,46 @@ def test_block_layer_scalar_scales_output():
     blk.layer_scalar.fill_(2.0)
     out_b = blk(x, position_ids=pos, cache=cache_b, start_pos=0)
     assert torch.allclose(out_b, out_a * 2.0, atol=1e-5)
+
+
+def test_b5_block_with_moe_channel_mixer_forward_runs():
+    """B5: DecoderBlock dispatches to MoE when channel_mixer is MoESpec."""
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    attn_spec = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=4, head_dim=16,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=specs.RoPESpec(base_theta=10000.0, basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    moe = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=1,
+        router_kind="softmax", routed_scaling_factor=1.0,
+        expert_ffn=specs.FFNSpec(intermediate_size=8,
+                                 activation=types.Activation.SILU,
+                                 gate_kind=types.GateKind.SWIGLU),
+    )
+    spec = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE,
+        ffn_norm_position=types.NormPosition.PRE,
+        token_mixer=attn_spec,
+        channel_mixer=moe,
+        pre_attn_norm=norm_spec,
+        pre_ffn_norm=norm_spec,
+    )
+    H = 16
+    blk = block.DecoderBlock(spec, hidden_size=H, max_seq=16, dtype=torch.float32)
+    from api import feedforward as _ff
+    assert isinstance(blk.feedforward, _ff.MoE)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1, n_kv_heads=4, head_dim=16, max_seq=16,
+    )
+    x = torch.randn(1, 3, H)
+    out = blk(x, position_ids=torch.arange(3), cache=cache, start_pos=0)
+    assert out.shape == (1, 3, H)

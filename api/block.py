@@ -61,8 +61,16 @@ class DecoderBlock(nn.Module):
             )
         if not isinstance(spec.token_mixer, specs.AttentionSpec):
             raise NotImplementedError("M1: AttentionSpec token mixer only")
-        if not isinstance(spec.channel_mixer, specs.FFNSpec):
-            raise NotImplementedError("M1: FFNSpec channel mixer only")
+        # B5: channel_mixer can be FFNSpec (dense) OR MoESpec (DeepSeek-V2/V3
+        # MoE layers). The DecoderBlock dispatches between FeedForward and
+        # MoE based on type. Source: modeling_deepseek_v2.py:404
+        # (self.mlp = DeepseekV2Moe(config) if layer_idx >= first_k_dense_replace
+        # else DeepseekV2MLP(config)).
+        if not isinstance(spec.channel_mixer, (specs.FFNSpec, specs.MoESpec)):
+            raise NotImplementedError(
+                f"B5: channel_mixer must be FFNSpec or MoESpec, "
+                f"got {type(spec.channel_mixer).__name__}"
+            )
         # B2a: residual_scale enabled — Granite μP scalar (residual_multiplier).
         # When set, each sublayer output is multiplied by residual_scale BEFORE
         # the residual add. Source: modeling_granite.py:273,278 (Granite multiplies
@@ -120,8 +128,16 @@ class DecoderBlock(nn.Module):
             self.pre_ffn_norm = norm.RMSNorm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
             self.post_ffn_sublayer_norm = None
 
-        self.feedforward = feedforward.FeedForward(spec.channel_mixer, hidden_size,
-                                                   dtype=dtype)
+        # B5: dense FFN vs MoE dispatch. The attribute name `feedforward`
+        # is kept for backward compat (all existing model factories and
+        # weight loaders index it as `blk.feedforward`); for MoE this name
+        # holds the MoE module — DeepSeek loaders use it identically.
+        if isinstance(spec.channel_mixer, specs.MoESpec):
+            self.feedforward = feedforward.MoE(spec.channel_mixer, hidden_size,
+                                               dtype=dtype)
+        else:
+            self.feedforward = feedforward.FeedForward(spec.channel_mixer, hidden_size,
+                                                       dtype=dtype)
 
         # B0.6: Per-Layer Embedding AT-END injection (Gemma 4 E2B/E4B).
         # When `spec.per_layer_embedding` is set, the block owns 3 extra tensors:
