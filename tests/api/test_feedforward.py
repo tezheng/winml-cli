@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from api import feedforward, specs, types
 
@@ -93,3 +94,219 @@ def test_fused_gate_up_shape():
     assert ffn.gate_up_proj.weight.shape == (2 * 128, 64)
     assert ffn.gate_proj is None
     assert ffn.up_proj is None
+
+
+# ---------------------------------------------------------------------------
+# B5: MoE tests
+# ---------------------------------------------------------------------------
+
+
+def _moe_expert_ffn(I: int = 16) -> specs.FFNSpec:
+    return specs.FFNSpec(
+        intermediate_size=I,
+        activation=types.Activation.SILU,
+        gate_kind=types.GateKind.SWIGLU,
+    )
+
+
+def test_b5_moe_softmax_router_shapes():
+    spec = specs.MoESpec(
+        n_experts=8, top_k=2, n_shared_experts=0,
+        router_kind="softmax", expert_ffn=_moe_expert_ffn(I=16),
+    )
+    moe = feedforward.MoE(spec, hidden_size=12, dtype=torch.float32)
+    x = torch.randn(2, 4, 12)
+    out = moe(x)
+    assert out.shape == (2, 4, 12)
+    assert moe.experts_gate_up.shape == (8, 32, 12)
+    assert moe.experts_down.shape == (8, 12, 16)
+
+
+def test_b5_moe_softmax_with_shared_experts_adds_shared_output():
+    """Shared experts run on the SAME residual stream as routed (line 122-130 V2),
+    and the final output is routed + shared. We verify by running with the
+    routed path zeroed (top-k weights = 0 by deliberately constructing
+    inputs that produce uniform routing) — actually simpler: zero the
+    experts_gate_up so routed = 0, then check out == shared(x).
+    """
+    spec = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=2,
+        router_kind="softmax", expert_ffn=_moe_expert_ffn(I=8),
+    )
+    moe = feedforward.MoE(spec, hidden_size=6, dtype=torch.float32)
+    with torch.no_grad():
+        moe.experts_gate_up.zero_()
+        moe.experts_down.zero_()
+    x = torch.randn(1, 3, 6)
+    out = moe(x)
+    expected = moe.shared_experts(x)
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_b5_moe_softmax_matches_v2_reference_inline():
+    """B5: api MoE softmax + greedy top-k matches an inline V2-style reference.
+
+    Verifies the softmax + topk + routed_scaling_factor pipeline against
+    modeling_deepseek_v2.py:100-130 implementation:
+        scores = softmax(router_logits, fp32)
+        topk_w, topk_idx = topk(scores, k)
+        topk_w *= routed_scaling_factor
+        for e in hit: route tokens, gate_up_proj, silu*up, down_proj,
+                       weight by topk_w, scatter-add.
+    """
+    torch.manual_seed(11)
+    H = 8
+    I = 16
+    E = 6
+    K = 2
+    scale = 1.7
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="softmax", routed_scaling_factor=scale,
+        expert_ffn=_moe_expert_ffn(I=I),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        nn.init.normal_(moe.experts_gate_up, std=0.05)
+        nn.init.normal_(moe.experts_down, std=0.05)
+    x = torch.randn(1, 5, H)
+    out = moe(x)
+
+    # Reference inline.
+    x_flat = x.reshape(-1, H)
+    logits = F.linear(x_flat.float(), moe.gate.weight.float())
+    scores = logits.softmax(dim=-1, dtype=torch.float32)
+    topk_w_ref, topk_idx_ref = torch.topk(scores, k=K, dim=-1, sorted=False)
+    topk_w_ref = topk_w_ref * scale
+    ref_out = torch.zeros_like(x_flat)
+    for n in range(x_flat.shape[0]):
+        for slot in range(K):
+            e = int(topk_idx_ref[n, slot].item())
+            w = float(topk_w_ref[n, slot].item())
+            gate_up = F.linear(x_flat[n:n+1], moe.experts_gate_up[e])
+            g, u = gate_up.chunk(2, dim=-1)
+            inner = F.silu(g) * u
+            inner = F.linear(inner, moe.experts_down[e])
+            ref_out[n] += w * inner.squeeze(0)
+    ref_out = ref_out.reshape(*x.shape)
+    assert torch.allclose(out, ref_out, atol=1e-5), (
+        f"max_abs_diff={(out - ref_out).abs().max().item():.3e}"
+    )
+
+
+def test_b5_moe_sigmoid_plus_bias_router_shapes():
+    spec = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias",
+        router_norm=True,
+        score_correction_bias=True,
+        routed_scaling_factor=2.5,
+        expert_ffn=_moe_expert_ffn(I=12),
+    )
+    moe = feedforward.MoE(spec, hidden_size=8, dtype=torch.float32)
+    # V3 router has a `gate` submodule with weight Parameter and a buffer.
+    assert hasattr(moe.gate, "weight")
+    assert hasattr(moe.gate, "e_score_correction_bias")
+    x = torch.randn(1, 3, 8)
+    out = moe(x)
+    assert out.shape == (1, 3, 8)
+
+
+def test_b5_moe_sigmoid_router_uses_bias_only_for_choice_not_weight():
+    """B5: V3 router gathers weights from BIAS-FREE sigmoid, but uses
+    bias for top-k INDEX selection. Source: modeling_deepseek_v3.py:230-232.
+
+    We construct a router where biasing a single expert's score correction
+    flips its inclusion in top-k. The gathered weight must remain the
+    bias-free sigmoid value at that index.
+    """
+    torch.manual_seed(3)
+    H, E, K = 4, 6, 2
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias", router_norm=False,
+        score_correction_bias=True, routed_scaling_factor=1.0,
+        expert_ffn=_moe_expert_ffn(I=4),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.3)
+        # Bias only expert 0 by a huge amount → it WILL be picked.
+        moe.gate.e_score_correction_bias[:] = 0.0
+        moe.gate.e_score_correction_bias[0] = 100.0
+        moe.experts_gate_up.zero_()    # zero outputs so we can isolate weights.
+        moe.experts_down.zero_()
+
+    x_flat = torch.randn(3, H)
+    idx, w = moe._route_sigmoid_plus_bias(x_flat)
+    # Expert 0 must appear in topk for every token.
+    assert (idx == 0).any(dim=-1).all()
+    # The weight for expert 0 must equal sigmoid(logit_0), NOT sigmoid + bias.
+    logits = F.linear(x_flat.float(), moe.gate.weight.float())
+    expected_w0 = logits[:, 0].sigmoid()
+    # Find the slot where expert 0 was selected per token.
+    matches = (idx == 0).int().argmax(dim=-1)
+    actual_w0 = torch.gather(w, 1, matches.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(actual_w0, expected_w0, atol=1e-6)
+
+
+def test_b5_moe_softmax_group_routing_v2_max_then_topk():
+    """B5: V2 group-limited greedy routing: group score = MAX (not sum),
+    then top-k_per_group, then mask non-selected groups with 0, then top-k.
+    Source: modeling_deepseek_v2.py:107-117.
+    """
+    torch.manual_seed(5)
+    n_groups, top_g, K = 4, 2, 3
+    E = 8
+    H = 4
+    gr = specs.GroupRoutingSpec(n_groups=n_groups, topk_per_group=top_g)
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="softmax", group_routing=gr,
+        routed_scaling_factor=1.0, expert_ffn=_moe_expert_ffn(I=4),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+
+    x_flat = torch.randn(7, H)
+    idx, w = moe._route_softmax(x_flat)
+    # Verify each chosen expert lives in one of the top-g groups.
+    logits = F.linear(x_flat.float(), moe.gate.weight.float())
+    scores = logits.softmax(dim=-1, dtype=torch.float32)
+    E_per_g = E // n_groups
+    group_scores = scores.view(-1, n_groups, E_per_g).max(dim=-1).values
+    top_groups = torch.topk(group_scores, k=top_g, dim=-1).indices  # [N, top_g]
+    # For each token, every chosen expert must map to a top-group.
+    for n in range(x_flat.shape[0]):
+        chosen_groups = (idx[n] // E_per_g).tolist()
+        allowed = set(top_groups[n].tolist())
+        for g in chosen_groups:
+            assert g in allowed
+
+
+def test_b5_moe_no_router_norm_v2_default():
+    """B5: V2's default norm_topk_prob=False — top-k weights NOT renormed
+    to sum-1. We verify by setting routed_scaling_factor=1 and confirming
+    the gathered weights equal the raw softmax probs (which generally do
+    NOT sum to 1 across top-k).
+    """
+    torch.manual_seed(0)
+    H, E, K = 4, 6, 2
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="softmax", router_norm=False,
+        routed_scaling_factor=1.0, expert_ffn=_moe_expert_ffn(I=4),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=1.0)
+    x_flat = torch.randn(4, H)
+    idx, w = moe._route_softmax(x_flat)
+    logits = F.linear(x_flat.float(), moe.gate.weight.float())
+    scores = logits.softmax(dim=-1, dtype=torch.float32)
+    ref_w = torch.gather(scores, 1, idx)
+    assert torch.allclose(w, ref_w, atol=1e-6)
+    # Sanity: w does not sum to 1 across slots.
+    assert not torch.allclose(w.sum(-1), torch.ones(4), atol=1e-2)
