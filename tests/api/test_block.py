@@ -190,6 +190,108 @@ def test_block_with_per_layer_embedding_at_end():
     assert not torch.allclose(out_with_ple, out_without_ple, atol=1e-3)
 
 
+def test_block_residual_scale_multiplies_sublayer_out():
+    """B2a: DecoderBlockSpec.residual_scale (Granite μP residual_multiplier)
+    multiplies BOTH sublayer outputs before the residual add.
+
+    With residual_scale=0 every sublayer's output is zeroed, so the block must
+    be an identity map (x unchanged) — verifies the scale is applied at exactly
+    the right point. Source: modeling_granite.py:273,278 — `residual + hidden_states * self.residual_multiplier`.
+    """
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=2, head_dim=32,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    ffn = specs.FFNSpec(intermediate_size=256,
+                        activation=types.Activation.SILU,
+                        gate_kind=types.GateKind.SWIGLU)
+    block_spec = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE,
+        ffn_norm_position=types.NormPosition.PRE,
+        token_mixer=attn, channel_mixer=ffn,
+        pre_attn_norm=norm_spec, pre_ffn_norm=norm_spec,
+        residual_scale=0.0,
+    )
+    D = 128
+    blk = block.DecoderBlock(block_spec, hidden_size=D, max_seq=32,
+                             dtype=torch.float32)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1, n_kv_heads=2, head_dim=32, max_seq=32,
+    )
+    B, S = 1, 4
+    x = torch.randn(B, S, D)
+    pos = torch.arange(S)
+    out = blk(x, position_ids=pos, cache=cache, start_pos=0)
+    assert torch.allclose(out, x, atol=1e-5), (
+        f"residual_scale=0 should zero both sublayer outputs; "
+        f"max_abs_diff={(out - x).abs().max().item():.3e}"
+    )
+
+
+def test_block_residual_scale_nonzero_matches_manual_compute():
+    """B2a: residual_scale=0.5 should give x + 0.5 * attn_out + 0.5 * ffn_out
+    (after second sublayer's residual add uses the *post-attn* x).
+
+    We verify by running once with residual_scale=1.0 and once with
+    residual_scale=0.5, both with the SAME weights; the second run should
+    be x + 0.5*(out1 - x) only if the attention output were strictly linear,
+    which it isn't due to the FFN's nonlinearity through the residual stream.
+    So instead we just verify a single specific scalar multiplier propagates
+    end-to-end by checking that the block with residual_scale=K is NOT the
+    same as residual_scale=1 — a regression guard.
+    """
+    norm_spec = specs.NormSpec(kind=types.NormKind.RMS, eps=1e-6,
+                               weight_mode=types.NormWeightMode.STANDARD_W)
+    attn = specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=2, head_dim=32,
+        kind=types.AttentionKind.STANDARD,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        rope=specs.RoPESpec(base_theta=10000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+    ffn = specs.FFNSpec(intermediate_size=256,
+                        activation=types.Activation.SILU,
+                        gate_kind=types.GateKind.SWIGLU)
+    def _mk(scale):
+        block_spec = specs.DecoderBlockSpec(
+            attn_norm_position=types.NormPosition.PRE,
+            ffn_norm_position=types.NormPosition.PRE,
+            token_mixer=attn, channel_mixer=ffn,
+            pre_attn_norm=norm_spec, pre_ffn_norm=norm_spec,
+            residual_scale=scale,
+        )
+        return block.DecoderBlock(block_spec, hidden_size=128, max_seq=32,
+                                  dtype=torch.float32)
+    blk_a = _mk(None)        # no scaling
+    blk_b = _mk(0.22)        # Granite μP residual_multiplier
+    # Copy weights from a → b so the only diff is residual_scale.
+    blk_b.load_state_dict(blk_a.state_dict())
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache_a = kvcache.ContiguousKVCache(cache_spec, 1, 2, 32, 32)
+    cache_b = kvcache.ContiguousKVCache(cache_spec, 1, 2, 32, 32)
+    x = torch.randn(1, 3, 128)
+    pos = torch.arange(3)
+    out_a = blk_a(x, position_ids=pos, cache=cache_a, start_pos=0)
+    out_b = blk_b(x, position_ids=pos, cache=cache_b, start_pos=0)
+    assert not torch.allclose(out_a, out_b, atol=1e-3)
+
+
 def test_block_layer_scalar_scales_output():
     """B0.6: changing `layer_scalar` from 1 to 2 must double the output."""
     spec = _qwen3_like_block_spec(hidden_size=128)

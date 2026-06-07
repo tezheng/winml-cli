@@ -53,10 +53,13 @@ class DecoderBlock(nn.Module):
             raise NotImplementedError("M1: AttentionSpec token mixer only")
         if not isinstance(spec.channel_mixer, specs.FFNSpec):
             raise NotImplementedError("M1: FFNSpec channel mixer only")
-        if spec.residual_scale is not None:
-            raise NotImplementedError("M1: no residual scaling")
+        # B2a: residual_scale enabled — Granite μP scalar (residual_multiplier).
+        # When set, each sublayer output is multiplied by residual_scale BEFORE
+        # the residual add. Source: modeling_granite.py:273,278 (Granite multiplies
+        # `hidden_states * self.residual_multiplier` before `residual + ...`).
         self.spec = spec
         self.hidden_size = hidden_size
+        self._residual_scale = spec.residual_scale
 
         # Attention sublayer norms
         if spec.attn_norm_position == types.NormPosition.PRE_AND_POST:
@@ -140,6 +143,10 @@ class DecoderBlock(nn.Module):
                                   cache=cache, start_pos=start_pos)
         if self.post_attn_sublayer_norm is not None:
             attn_out = self.post_attn_sublayer_norm(attn_out)
+        # B2a: Granite μP residual scaling — sublayer output is multiplied by
+        # `residual_multiplier` BEFORE the residual add (modeling_granite.py:273).
+        if self._residual_scale is not None:
+            attn_out = attn_out * self._residual_scale
         x = ops.add(x, attn_out)
 
         # FFN sublayer
@@ -147,6 +154,8 @@ class DecoderBlock(nn.Module):
         ffn_out = self.feedforward(ffn_in)
         if self.post_ffn_sublayer_norm is not None:
             ffn_out = self.post_ffn_sublayer_norm(ffn_out)
+        if self._residual_scale is not None:
+            ffn_out = ffn_out * self._residual_scale  # modeling_granite.py:278
         x = ops.add(x, ffn_out)
 
         # B0.6: PLE injection AT END (Gemma 4 only). Mirror modeling_gemma4.py:1446-1453.
