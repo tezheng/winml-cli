@@ -5,6 +5,7 @@ Scheme coverage:
   - GGUF Q4_K_M (k-quant; super-block 256, 6-bit sub-scales/mins)
   - FP8 E4M3 W8A8 (per-tensor W + per-token A, fp32 accumulate)
   - MXFP4 (UE8M0 shared exp + E2M1 mantissas, block 32)
+  - LiteRT W4A8 (per-output-channel INT4 weight + per-tensor INT8 activation)
   - IQ2_M / AQLM   (stub guard rails — must raise NotImplementedError)
 """
 import pytest
@@ -258,6 +259,72 @@ def test_mxfp4_handles_large_dynamic_range():
     assert y.shape == (32,)
     # Recovered max-element is within E2M1 grid step of 1000.
     assert abs(y[0].item() - 1000.0) / 1000.0 < 0.20
+
+
+# ============================================================================
+# LiteRT W4A8
+# ============================================================================
+
+
+def test_litert_w4_pack_unpack_round_trip():
+    torch.manual_seed(8)
+    # signed INT4 values in [-7, 7]
+    q = torch.randint(-7, 8, (5, 16), dtype=torch.int8)
+    packed = quant.litert_w4_pack(q)
+    assert packed.shape == (5, 8)
+    assert packed.dtype == torch.uint8
+    q_back = quant.litert_w4_unpack(packed, in_features=16)
+    assert torch.equal(q_back, q)
+
+
+def test_litert_weight_round_trip_within_tolerance():
+    torch.manual_seed(9)
+    out, in_ = 64, 128
+    w = torch.randn(out, in_, dtype=torch.float32)
+    packed, scales = quant.litert_quantize_weight(w)
+    assert packed.shape == (out, in_ // 2)
+    assert scales.shape == (out,)
+    w_back = quant.litert_dequantize_weight(packed, scales, in_features=in_)
+    rel = (w_back - w).abs() / (w.abs() + 1e-6)
+    median_rel = rel.median().item()
+    # INT4 symmetric quant => quant step ~ 1/7 of per-channel amax,
+    # median rel-err on Gaussian rows is ~10-15%.
+    assert median_rel < 0.20, f"per-channel INT4 median rel-err {median_rel:.4f} too large"
+
+
+def test_litert_activation_round_trip_within_tolerance():
+    torch.manual_seed(10)
+    x = torch.randn(4, 128, dtype=torch.float32)
+    q_x, scale = quant.litert_quantize_activation_per_tensor(x)
+    assert q_x.dtype == torch.int8
+    x_back = q_x.to(torch.float32) * scale
+    rel = (x_back - x).abs() / (x.abs() + 1e-6)
+    # INT8 symmetric quant => quant step ~ amax/127, median rel ~ 1-2%.
+    assert rel.median().item() < 0.05
+
+
+def test_litert_w4a8_matmul_within_tolerance():
+    torch.manual_seed(11)
+    out, in_ = 64, 128
+    w = torch.randn(out, in_, dtype=torch.float32) * 0.5
+    x = torch.randn(3, in_, dtype=torch.float32)
+
+    packed_w, scales_w = quant.litert_quantize_weight(w)
+    q_x, scale_x = quant.litert_quantize_activation_per_tensor(x)
+    y_quant = quant.litert_w4a8_matmul(q_x, scale_x, packed_w, scales_w, in_features=in_)
+    y_full = x @ w.t()  # LiteRT FC = x @ w.t() since weight is [out, in]
+
+    rel = (y_quant - y_full).abs() / (y_full.abs() + 1e-3)
+    median_rel = rel.median().item()
+    # K=128 averages noise; expect ~5-10% median rel-err.
+    assert median_rel < 0.15, f"W4A8 matmul median rel-err {median_rel:.4f} too large"
+
+
+def test_litert_zero_weight_block_round_trip_exact():
+    w = torch.zeros(4, 16, dtype=torch.float32)
+    packed, scales = quant.litert_quantize_weight(w)
+    w_back = quant.litert_dequantize_weight(packed, scales, in_features=16)
+    assert torch.all(w_back.abs() < 1e-6)
 
 
 # ============================================================================

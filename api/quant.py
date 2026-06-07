@@ -1,4 +1,5 @@
-"""Quantization: AWQ W4A16, GGUF Q4_K_M, FP8 E4M3 W8A8, MXFP4 round-trip.
+"""Quantization: AWQ W4A16, GGUF Q4_K_M, FP8 E4M3 W8A8, MXFP4,
+LiteRT mobile-INT4 W4A8 round-trip.
 
 Each scheme below is grounded in the upstream reference implementation and
 exercises a distinct axis of `specs.QuantSpec`:
@@ -9,6 +10,10 @@ exercises a distinct axis of `specs.QuantSpec`:
   - FP8 E4M3 W8A8      : per-tensor weight scale + per-token activation scale,
                          fp32 accumulator.
   - MXFP4              : 32-element block; UE8M0 shared exponent + E2M1 mantissas.
+  - LiteRT W4A8        : per-output-channel symmetric INT4 weights (range
+                         [-7, 7]) + per-tensor symmetric INT8 activations.
+                         This is the Gemma 4 mobile QAT shape on AI Edge /
+                         LiteRT (axes A20-A24).
 
 Source citations are inline at each function. See per-function docstring for
 tolerance expectations.
@@ -553,6 +558,127 @@ def mxfp4_dequantize(codes: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
     scale = torch.pow(2.0, e).unsqueeze(-1)  # [B, 1]
     vals = _mxfp4_decode_e2m1(codes)         # [B, 32]
     return (vals * scale).reshape(B * MXFP4_BLOCK)
+
+
+# ============================================================================
+# LiteRT W4A8  (per-output-channel symmetric INT4 weight + per-tensor INT8 act)
+# ============================================================================
+#
+# Source:
+#   LiteRT 8-bit quantization specification (Google AI Edge):
+#     https://developers.google.com/edge/litert/performance/quantization_spec
+#   "Per-axis ... weights are represented by int8 two's complement values
+#    in the range [-127, 127] with zero-point equal to 0."
+#   Dequant formula:   real = (q - zero_point) * scale
+#
+#   The INT4 extension: per-axis weights in two's complement INT4 ([-7, 7]
+#   for safe symmetric coverage; the spec follows the INT8 convention and
+#   reserves the all-negative endpoint). Activations stay INT8.
+#   This is the layout used by Gemma 4 mobile QAT releases on AI Edge.
+#
+# Layout for W of shape [out_features, in_features]:
+#   q_w           : int8 [out, in]     (only low nibble used; range [-7, 7])
+#   scales_w      : float32 [out]      per-output-channel
+#   q_x           : int8 [..., in]     per-tensor scaled activations
+#   scale_x       : float32 scalar     per-tensor activation scale
+#
+# Compute:    y = (q_x.float() @ q_w.t().float()) * scale_x * scales_w
+# Pack:       two INT4 values per byte (low nibble = even idx, high nibble = odd).
+
+LITERT_INT4_MAX = 7    # symmetric range [-7, 7]
+LITERT_INT8_MAX = 127
+
+
+def litert_w4_pack(q_int4: torch.Tensor) -> torch.Tensor:
+    """Pack signed INT4 weights to uint8 with two values per byte.
+
+    q_int4: int8 [out, in], values in [-7, 7]. `in` must be even.
+    returns: uint8 [out, in // 2]; low nibble = q_int4[:, 2k], high nibble = q_int4[:, 2k+1].
+    """
+    out, in_ = q_int4.shape
+    if in_ % 2 != 0:
+        raise ValueError(f"in_features ({in_}) must be even for INT4 byte packing")
+    if q_int4.dtype != torch.int8:
+        raise ValueError(f"expected int8, got {q_int4.dtype}")
+    lo = (q_int4[:, 0::2].to(torch.int32) & 0xF)
+    hi = (q_int4[:, 1::2].to(torch.int32) & 0xF)
+    return (lo | (hi << 4)).to(torch.uint8)
+
+
+def litert_w4_unpack(packed: torch.Tensor, in_features: int) -> torch.Tensor:
+    """Inverse of `litert_w4_pack`. Returns int8 [out, in_features] in [-7, 7]."""
+    out, half = packed.shape
+    if half * 2 != in_features:
+        raise ValueError(f"packed half ({half}) * 2 != in_features ({in_features})")
+    p = packed.to(torch.int32)
+    lo_nib = p & 0xF
+    hi_nib = (p >> 4) & 0xF
+    # Sign-extend the 4-bit nibble to int8 [-8, 7]; we then clamp to [-7, 7]
+    # to match the LiteRT symmetric range.
+    lo = torch.where(lo_nib >= 8, lo_nib - 16, lo_nib)
+    hi = torch.where(hi_nib >= 8, hi_nib - 16, hi_nib)
+    result = torch.zeros((out, in_features), dtype=torch.int8)
+    result[:, 0::2] = lo.to(torch.int8)
+    result[:, 1::2] = hi.to(torch.int8)
+    return result
+
+
+def litert_quantize_weight(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel symmetric INT4 weight quantization.
+
+    w: fp32/fp16 [out, in].
+    returns:
+      packed  : uint8 [out, in // 2]   two signed INT4 per byte
+      scales  : fp32  [out]            per-output-channel scale
+    Dequant: float_w[o, i] = (q[o, i].to(fp32)) * scales[o]
+    """
+    if w.dim() != 2:
+        raise ValueError(f"expected 2D weight, got shape {tuple(w.shape)}")
+    w32 = w.float()
+    amax = w32.abs().amax(dim=-1).clamp_min(1e-12)        # [out]
+    scales = amax / LITERT_INT4_MAX
+    q = (w32 / scales.unsqueeze(-1)).round().clamp(-LITERT_INT4_MAX, LITERT_INT4_MAX)
+    q_int = q.to(torch.int8)
+    packed = litert_w4_pack(q_int)
+    return packed, scales
+
+
+def litert_dequantize_weight(
+    packed: torch.Tensor, scales: torch.Tensor, in_features: int
+) -> torch.Tensor:
+    """Inverse of `litert_quantize_weight`."""
+    q = litert_w4_unpack(packed, in_features)
+    return q.to(torch.float32) * scales.unsqueeze(-1)
+
+
+def litert_quantize_activation_per_tensor(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor symmetric INT8 activation quantization (LiteRT convention).
+
+    x: fp32 [..., in].
+    returns (q_x, scale) with q_x int8 [..., in] and scale float32 scalar.
+    """
+    amax = x.abs().max().float().clamp_min(1e-12)
+    scale = amax / LITERT_INT8_MAX
+    q = (x.float() / scale).round().clamp(-LITERT_INT8_MAX, LITERT_INT8_MAX).to(torch.int8)
+    return q, scale
+
+
+def litert_w4a8_matmul(
+    q_x: torch.Tensor,
+    scale_x: torch.Tensor,
+    packed_w: torch.Tensor,
+    scales_w: torch.Tensor,
+    in_features: int,
+) -> torch.Tensor:
+    """W4A8 matmul with fp32 accumulator.
+
+    y[..., o] = sum_i x[..., i] * w[o, i]
+              = sum_i (q_x[..., i] * scale_x) * (q_w[o, i] * scales_w[o])
+              = scale_x * scales_w[o] * sum_i q_x[..., i] * q_w[o, i]
+    """
+    q_w = litert_w4_unpack(packed_w, in_features)            # int8 [out, in]
+    acc = q_x.to(torch.float32) @ q_w.to(torch.float32).t()  # [..., out]
+    return acc * scale_x.to(torch.float32) * scales_w.to(torch.float32).unsqueeze(0)
 
 
 # ============================================================================
