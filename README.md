@@ -101,6 +101,33 @@ The full API floor lands across M2+ rollout batches (MoE, SSM, MLA, more quant
 schemes). M1 establishes the foundational shape; B0.5 extends with Gemma 4
 primitives.
 
+## B8 status — OCR-LLM family (3 families landed)
+
+B8 adds the LM-decoder portion of three OCR / Vision-LLM families:
+
+- **GOT-OCR 2.0** (`models/got_ocr2/`) — Qwen2-0.5B backbone with concat-prefix
+  vision fusion. Numerical gate vs `stepfun-ai/GOT-OCR-2.0-hf`:
+  max_abs_diff = 3.81e-6 (~131x tighter than atol=5e-4).
+
+- **Qwen2.5-VL 3B** (`models/qwen2_5_vl/`) — Qwen2.5 backbone with **M-RoPE**
+  (multimodal rotary position embedding). New api hooks:
+  `RoPESpec.mrope_section`, `ops.rope_apply_mrope`. Numerical gate vs
+  `Qwen/Qwen2.5-VL-3B-Instruct`: max_abs_diff = 1.67e-6 (~299x tighter).
+
+- **DeepSeek-OCR-2** (`models/deepseek_ocr2/`) — DeepseekV3-style MoE
+  (12 layers; layer 0 dense, 1-11 sparse MoE). Numerical gates:
+  - Synthetic-weight gates (dense + MoE): max_abs_diff = 1.19e-7 / 1.19e-7
+  - HF-checkpoint gates (dense + MoE):    max_abs_diff = 4.77e-7 / 1.42e-7
+
+**Source-grounded drift caught for DeepSeek-OCR-2:** the HF transformers
+v5.10.2 `deepseek_ocr2` reference uses **STANDARD MHA + softmax MoE +
+standard causal mask** — NO MLA and NO block-bidirectional "Visual Causal
+Flow" mask described in the original paper §3.2. The VCF mask is landed as
+a v3-spec hook (`MaskKind.BLOCK_BIDIRECTIONAL` +
+`AttentionSpec.block_bidirectional_mask` + `Attention.forward(vision_token_count=...)`)
+exercised by shape-only tests; the canonical numerical gate runs against
+CAUSAL per the HF source.
+
 ## Project structure
 
 See `docs/superpowers/plans/2026-06-05-llm-layers-m1-qwen3.md` for the M1 plan,
