@@ -27,8 +27,38 @@ class Attention(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        if spec.kind != types.AttentionKind.STANDARD:
-            raise NotImplementedError(f"M1: STANDARD only, got {spec.kind}")
+        if spec.kind not in (types.AttentionKind.STANDARD, types.AttentionKind.MLA):
+            raise NotImplementedError(
+                f"B2b: STANDARD and MLA only, got {spec.kind}"
+            )
+        if spec.kind == types.AttentionKind.MLA:
+            # B2b: MLA path — MiniCPM-3 / DeepSeek-V2/V3 family. The MLA branch
+            # uses MLA_LATENT qkv_layout and ignores attention_k_eq_v / qk_norm
+            # / v_norm (those are STANDARD-only features). Source:
+            # modeling_minicpm.py:331-385 (MiniCPMAttention init), 427-526
+            # (forward).
+            if spec.qkv_layout != types.QKVLayout.MLA_LATENT:
+                raise ValueError(
+                    f"MLA kind requires QKVLayout.MLA_LATENT, got {spec.qkv_layout}"
+                )
+            for fname in ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
+                          "qk_rope_head_dim", "v_head_dim"):
+                if getattr(spec, fname) is None:
+                    raise ValueError(f"MLA spec missing {fname}")
+            if spec.qk_nope_head_dim + spec.qk_rope_head_dim != spec.head_dim:
+                raise ValueError(
+                    f"MLA: spec.head_dim ({spec.head_dim}) must equal "
+                    f"qk_nope_head_dim ({spec.qk_nope_head_dim}) + "
+                    f"qk_rope_head_dim ({spec.qk_rope_head_dim})"
+                )
+            if spec.attention_k_eq_v:
+                raise NotImplementedError("MLA + attention_k_eq_v unsupported")
+            if spec.qk_norm is not None:
+                raise NotImplementedError("MLA + qk_norm unsupported")
+            if spec.v_norm is not None:
+                raise NotImplementedError("MLA + v_norm unsupported")
+            self._init_mla(spec, hidden_size, max_seq, dtype)
+            return
         if spec.qkv_layout not in (types.QKVLayout.SPLIT, types.QKVLayout.FUSED):
             raise NotImplementedError(
                 f"B2a: SPLIT and FUSED QKV only, got {spec.qkv_layout}"
@@ -144,6 +174,113 @@ class Attention(nn.Module):
             self.rope = _rope.RoPE(spec.rope, head_dim=spec.head_dim,
                                    max_seq=max_seq, dtype=dtype)
 
+    def _init_mla(
+        self,
+        spec: specs.AttentionSpec,
+        hidden_size: int,
+        max_seq: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """MLA init — MiniCPM-3 / DeepSeek-V2 family.
+
+        Layers (source: modeling_minicpm.py:360-384):
+        - q_a_proj: Linear(hidden, q_lora_rank, bias=attention_bias)
+        - q_a_layernorm: RMSNorm(q_lora_rank)
+        - q_b_proj: Linear(q_lora_rank, n_heads * qk_head_dim, bias=False)
+        - kv_a_proj_with_mqa: Linear(hidden, kv_lora_rank + qk_rope_head_dim,
+            bias=attention_bias)
+        - kv_a_layernorm: RMSNorm(kv_lora_rank)
+        - kv_b_proj: Linear(kv_lora_rank, n_heads * (qk_nope_head_dim + v_head_dim),
+            bias=False)
+        - o_proj: Linear(n_heads * v_head_dim, hidden, bias=attention_bias)
+        - rotary_emb: built at qk_rope_head_dim (NOT a partial within a larger
+            head). Source: modeling_minicpm.py:392-395 (dim=qk_rope_head_dim).
+
+        Softmax scale: qk_head_dim ** -0.5 — source: modeling_minicpm.py:387.
+
+        attention_bias is encoded via spec.q_bias (we use q_bias as the
+        single attention_bias flag for MLA; k/v_bias are ignored for MLA
+        per the HF code which has only one `config.attention_bias`).
+        """
+        self.spec = spec
+        self.hidden_size = hidden_size
+        # Use spec.q_bias as the single MLA attention_bias flag (both
+        # q_a_proj and kv_a_proj_with_mqa and o_proj take it; q_b_proj and
+        # kv_b_proj NEVER have bias per modeling_minicpm.py:364-378).
+        attn_bias = spec.q_bias
+        H = spec.n_q_heads
+        qk_h = spec.head_dim                  # qk_nope + qk_rope
+        v_h = spec.v_head_dim
+        # Q LoRA path
+        self.q_a_proj = nn.Linear(hidden_size, spec.q_lora_rank,
+                                  bias=attn_bias, dtype=dtype)
+        # q_a_layernorm: RMSNorm at q_lora_rank. We instantiate via api.norm.RMSNorm
+        # with a NormSpec built from spec.qk_norm or fallback. MiniCPM uses
+        # rms_norm_eps = config.rms_norm_eps — we read from a dedicated
+        # AttentionSpec field; defaulting to 1e-5 if not set. We use eps from
+        # spec.qk_norm if provided, else require it to be encoded into the
+        # config. For simplicity we plumb through a fixed eps via the NormSpec
+        # that the model factory must construct. Since AttentionSpec does NOT
+        # currently carry an MLA-norm eps field, we read it from a NEW spec
+        # attribute fallback. We instead allow eps to come from a per-MLA
+        # NormSpec on the AttentionSpec — but to keep the public API minimal,
+        # we accept the eps via spec.qk_norm if provided AND use it for both
+        # q_a_layernorm and kv_a_layernorm. If spec.qk_norm is None, default
+        # to 1e-5 (MiniCPM-3's rms_norm_eps).
+        if spec.qk_norm is not None:
+            qa_norm_spec = spec.qk_norm
+        else:
+            qa_norm_spec = specs.NormSpec(
+                kind=types.NormKind.RMS, eps=1e-5,
+                weight_mode=types.NormWeightMode.STANDARD_W,
+            )
+        self.q_a_layernorm = norm.RMSNorm(qa_norm_spec, spec.q_lora_rank, dtype=dtype)
+        self.q_b_proj = nn.Linear(spec.q_lora_rank, H * qk_h,
+                                  bias=False, dtype=dtype)
+        # KV LoRA path
+        self.kv_a_proj_with_mqa = nn.Linear(
+            hidden_size, spec.kv_lora_rank + spec.qk_rope_head_dim,
+            bias=attn_bias, dtype=dtype,
+        )
+        self.kv_a_layernorm = norm.RMSNorm(qa_norm_spec, spec.kv_lora_rank, dtype=dtype)
+        self.kv_b_proj = nn.Linear(
+            spec.kv_lora_rank, H * (spec.qk_nope_head_dim + v_h),
+            bias=False, dtype=dtype,
+        )
+        # Output
+        self.o_proj = nn.Linear(H * v_h, hidden_size,
+                                bias=attn_bias, dtype=dtype)
+        # Effective scale: 1 / sqrt(qk_head_dim).
+        # Source: modeling_minicpm.py:387 — softmax_scale = q_head_dim ** -0.5.
+        self.effective_scale = spec.head_dim ** -0.5
+        # RoPE — built at qk_rope_head_dim, NOT a partial within a larger head.
+        # MiniCPM uses MiniCPMRotaryEmbedding(dim=qk_rope_head_dim) — so cos/sin
+        # span the rope sub-head dim directly, and rotate_half pairs i ↔ i+rope/2
+        # across that subspace. We therefore build an api.rope.RoPE with
+        # head_dim=qk_rope_head_dim and partial_rotary_factor=1.0 (full rotation
+        # over the rope slice). The slicing q[..., qk_nope:] is the caller's
+        # job. Source: modeling_minicpm.py:391-420 (rotary_emb dim arg
+        # is qk_rope_head_dim).
+        if spec.rope is None:
+            self.rope = None
+        else:
+            self.rope = _rope.RoPE(
+                spec.rope, head_dim=spec.qk_rope_head_dim,
+                max_seq=max_seq, dtype=dtype,
+            )
+        # Mark the rest of standard attention as unused
+        self.qkv_proj = None
+        self.q_proj = None
+        self.k_proj = None
+        self.v_proj = None
+        self.q_norm = None
+        self.k_norm = None
+        self._v_norm_eps = None
+        self._v_norm_mode = None
+        self._v_norm_with_scale = None
+        # Tag so forward dispatches.
+        self._is_mla = True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -152,6 +289,8 @@ class Attention(nn.Module):
         start_pos: int,
     ) -> torch.Tensor:
         spec = self.spec
+        if getattr(self, "_is_mla", False):
+            return self._forward_mla(x, position_ids, cache, start_pos)
         B, S, _ = x.shape
         Hq, Hk, Dh = spec.n_q_heads, spec.n_kv_heads, spec.head_dim
 
@@ -226,4 +365,79 @@ class Attention(nn.Module):
                             attn_mask=attn_mask, scale=scale)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, S, Hq * Dh)
+        return self.o_proj(attn_out)
+
+    def _forward_mla(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache: _kvcache.ContiguousKVCache,
+        start_pos: int,
+    ) -> torch.Tensor:
+        """MLA forward — MiniCPM-3 reference path.
+
+        Mirrors modeling_minicpm.py:427-526. Stores DECOMPRESSED K (at
+        qk_head_dim) and V (at v_head_dim) in the KV cache; production
+        deployments absorbing kv_b_proj into o_proj are deferred.
+        """
+        spec = self.spec
+        B, S, _ = x.shape
+        H = spec.n_q_heads
+        qk_nope = spec.qk_nope_head_dim
+        qk_rope = spec.qk_rope_head_dim
+        qk_h = spec.head_dim          # qk_nope + qk_rope
+        v_h = spec.v_head_dim
+        # Q LoRA: x -> [B, S, q_lora_rank] -> RMSNorm -> [B, S, H*qk_h]
+        # Source: modeling_minicpm.py:444-448.
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        # Reshape to [B, S, H, qk_h] then split nope/rope on last dim.
+        q = q.view(B, S, H, qk_h)
+        q_nope = q[..., :qk_nope]
+        q_pe = q[..., qk_nope:]                  # [B, S, H, qk_rope]
+        # KV LoRA path: x -> [B, S, kv_lora_rank + qk_rope].
+        # split: [..., :kv_lora_rank] -> norm -> kv_b_proj -> [B, S, H*(qk_nope+v_h)]
+        # Source: modeling_minicpm.py:450-463.
+        compressed = self.kv_a_proj_with_mqa(x)
+        c_kv, k_pe_raw = torch.split(
+            compressed, [spec.kv_lora_rank, qk_rope], dim=-1,
+        )
+        # k_pe_raw is [B, S, qk_rope] — a SINGLE rope sub-head shared across all H.
+        kv = self.kv_b_proj(self.kv_a_layernorm(c_kv))
+        kv = kv.view(B, S, H, qk_nope + v_h)
+        k_nope, v = torch.split(kv, [qk_nope, v_h], dim=-1)
+        # RoPE: rotate q_pe and k_pe_raw. q_pe has shape [B, S, H, qk_rope].
+        # k_pe_raw has shape [B, S, qk_rope]; we treat it as [B, S, 1, qk_rope]
+        # for the rope op (single-head), then broadcast to all H after rotation.
+        if self.rope is not None:
+            k_pe = k_pe_raw.view(B, S, 1, qk_rope)
+            q_pe_rot, k_pe_rot = self.rope(q_pe, k_pe, position_ids)
+        else:
+            q_pe_rot = q_pe
+            k_pe_rot = k_pe_raw.view(B, S, 1, qk_rope)
+        # Assemble q and k at qk_h. q stays per-head, k_pe broadcast to H heads.
+        # Source: modeling_minicpm.py:477-483.
+        q_full = torch.cat([q_nope, q_pe_rot], dim=-1)            # [B, S, H, qk_h]
+        k_pe_b = k_pe_rot.expand(B, S, H, qk_rope)
+        k_full = torch.cat([k_nope, k_pe_b], dim=-1)              # [B, S, H, qk_h]
+        # Transpose to [B, H, S, *] for SDPA + cache.
+        q_full = q_full.transpose(1, 2)                            # [B, H, S, qk_h]
+        k_full = k_full.transpose(1, 2)
+        v = v.transpose(1, 2)                                      # [B, H, S, v_h]
+        # Write decompressed K (at qk_h) and V (at v_h) into the cache.
+        cache.write(k_full, v, start_pos=start_pos)
+        k_cached, v_cached = cache.read(seq_len=start_pos + S)
+        # Causal mask. MLA uses standard causal mask (modeling_minicpm.py:485-505).
+        T = start_pos + S
+        device = q_full.device
+        i_idx = torch.arange(S, device=device).unsqueeze(1)        # [S, 1]
+        j_idx = torch.arange(T, device=device).unsqueeze(0)        # [1, T]
+        allowed = j_idx <= (start_pos + i_idx)                     # [S, T]
+        attn_mask = torch.zeros(S, T, dtype=q_full.dtype, device=device)
+        attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
+        # SDPA: q and k at qk_h, v at v_h. n_heads matches between q/k/v so no GQA.
+        attn_out = ops.sdpa(q_full, k_cached, v_cached,
+                            attn_mask=attn_mask, scale=self.effective_scale)
+        # attn_out: [B, H, S, v_h] → [B, S, H*v_h] → o_proj.
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, H * v_h)
         return self.o_proj(attn_out)

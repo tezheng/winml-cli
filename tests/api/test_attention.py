@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -345,3 +346,109 @@ def test_attention_fused_qkv_shape_outputs_correct_blocks():
     assert attn.q_proj is None
     assert attn.k_proj is None
     assert attn.v_proj is None
+
+
+def _minicpm3_like_mla_spec():
+    """MLA spec shaped like MiniCPM-3 (smaller dims for fast tests)."""
+    return specs.AttentionSpec(
+        n_q_heads=4, n_kv_heads=4,
+        head_dim=96,                # qk_nope + qk_rope = 64+32
+        kind=types.AttentionKind.MLA,
+        qkv_layout=types.QKVLayout.MLA_LATENT,
+        mask_kind=types.MaskKind.CAUSAL,
+        q_lora_rank=128,
+        kv_lora_rank=64,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        rope=specs.RoPESpec(base_theta=10_000.0,
+                            basis=types.RoPEBasis.SPLIT_HALF),
+    )
+
+
+def test_attention_mla_forward_shape():
+    """B2b: MLA forward returns [B, S, hidden]; cache stores K at qk_h, V at v_h."""
+    hidden_size = 256
+    spec = _minicpm3_like_mla_spec()
+    attn = attention.Attention(spec, hidden_size=hidden_size, max_seq=32,
+                               dtype=torch.float32)
+    B, S = 1, 5
+    x = torch.randn(B, S, hidden_size)
+    pos = torch.arange(S)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=B,
+        n_kv_heads=spec.n_q_heads,
+        head_dim=spec.head_dim,            # 96 for K
+        max_seq=32,
+        v_head_dim=spec.v_head_dim,        # 64 for V
+    )
+    out = attn(x, position_ids=pos, cache=cache, start_pos=0)
+    assert out.shape == (B, S, hidden_size)
+    assert cache.k.shape == (B, spec.n_q_heads, 32, spec.head_dim)
+    assert cache.v.shape == (B, spec.n_q_heads, 32, spec.v_head_dim)
+    assert cache.seq_len == S
+
+
+def test_attention_mla_decode_step_appends():
+    """MLA decode: prefill S then step 1 and verify cache grows."""
+    hidden_size = 128
+    spec = _minicpm3_like_mla_spec()
+    attn = attention.Attention(spec, hidden_size=hidden_size, max_seq=16,
+                               dtype=torch.float32)
+    B = 1
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=B,
+        n_kv_heads=spec.n_q_heads,
+        head_dim=spec.head_dim, max_seq=16,
+        v_head_dim=spec.v_head_dim,
+    )
+    x1 = torch.randn(B, 4, hidden_size)
+    _ = attn(x1, position_ids=torch.arange(4), cache=cache, start_pos=0)
+    assert cache.seq_len == 4
+    x2 = torch.randn(B, 1, hidden_size)
+    _ = attn(x2, position_ids=torch.tensor([4]), cache=cache, start_pos=4)
+    assert cache.seq_len == 5
+
+
+def test_attention_mla_rejects_partial_specs():
+    """MLA requires all 5 MLA fields; missing one raises."""
+    with pytest.raises(ValueError, match="missing"):
+        spec = specs.AttentionSpec(
+            n_q_heads=4, n_kv_heads=4, head_dim=96,
+            kind=types.AttentionKind.MLA,
+            qkv_layout=types.QKVLayout.MLA_LATENT,
+            mask_kind=types.MaskKind.CAUSAL,
+            q_lora_rank=128,
+            # kv_lora_rank missing
+            qk_nope_head_dim=64,
+            qk_rope_head_dim=32,
+            v_head_dim=64,
+        )
+        attention.Attention(spec, hidden_size=256, max_seq=8)
+
+
+def test_attention_mla_rejects_wrong_qkv_layout():
+    """MLA requires MLA_LATENT qkv_layout."""
+    with pytest.raises(ValueError, match="MLA_LATENT"):
+        spec = specs.AttentionSpec(
+            n_q_heads=4, n_kv_heads=4, head_dim=96,
+            kind=types.AttentionKind.MLA,
+            qkv_layout=types.QKVLayout.SPLIT,           # wrong
+            mask_kind=types.MaskKind.CAUSAL,
+            q_lora_rank=128,
+            kv_lora_rank=64,
+            qk_nope_head_dim=64,
+            qk_rope_head_dim=32,
+            v_head_dim=64,
+        )
+        attention.Attention(spec, hidden_size=256, max_seq=8)
