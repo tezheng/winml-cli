@@ -58,6 +58,25 @@ class RoPESpec:
     # B0.5: partial-rotary (Gemma 4 global = 0.25; Phi-3 legacy = 0.5; MLA = qk_rope/qk_head)
     partial_rotary_factor: float = 1.0
 
+    # B2a: two distinct partial-rotary semantics in the wild:
+    #
+    # - "prefix" (Phi-3 / Phi-4 / most models): cos/sin tables are built at
+    #   `head_dim * partial_rotary_factor` channels. apply_rotary_pos_emb
+    #   splits q into [..., :rot_dim] (rotated) and [..., rot_dim:] (pass-through),
+    #   rotates the first prefix via rotate_half pairing INSIDE the prefix
+    #   (i ↔ i + rot_dim/2), then concats. Source: modeling_phi3.py:199-204.
+    #
+    # - "proportional" (Gemma 4 global): cos/sin tables are built at FULL
+    #   head_dim. inv_freq has real frequencies in the first
+    #   `int(pr * head_dim / 2)` slots and zeros in the rest. rotate_half
+    #   pairs across the FULL head_dim (i ↔ i + head_dim/2). Zero-inv_freq
+    #   channels have cos=1, sin=0 so they pass through but STILL participate
+    #   in the rotate_half pairing. Source: modeling_gemma4.py:787-806.
+    #
+    # Default is "prefix" — backward-compat means partial_rotary_factor=1.0
+    # makes the two indistinguishable.
+    partial_rotary_kind: str = "prefix"   # "prefix" | "proportional"
+
 
 @dataclass(frozen=True)
 class AttentionSpec:

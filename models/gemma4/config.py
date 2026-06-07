@@ -165,6 +165,10 @@ class Gemma4Config:
                 base_theta=rope_theta_eff,
                 basis=types.RoPEBasis.SPLIT_HALF,
                 partial_rotary_factor=partial_eff,
+                # Gemma 4 uses the "proportional" semantic — inv_freq is padded
+                # with zeros to the full head_dim/2, and rotate_half pairs
+                # across the full head_dim (modeling_gemma4.py:787-806).
+                partial_rotary_kind="proportional",
             ),
         )
         ffn = specs.FFNSpec(

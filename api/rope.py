@@ -66,29 +66,47 @@ class RoPE(nn.Module):
             raise NotImplementedError("M1 supports SPLIT_HALF basis only")
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even, got {head_dim}")
+        if spec.partial_rotary_kind not in ("prefix", "proportional"):
+            raise ValueError(
+                f"partial_rotary_kind must be 'prefix' or 'proportional', "
+                f"got {spec.partial_rotary_kind}"
+            )
         self.spec = spec
         self.head_dim = head_dim
         # rope_angles == number of real (non-zero) frequencies. HF formula:
         #   rope_angles = int(partial_rotary_factor * head_dim // 2)
         rope_angles = int(spec.partial_rotary_factor * head_dim // 2)
         self.rope_angles = rope_angles
-        # For backward-compat we also expose head_dim_rot = 2 * rope_angles
-        # (the size that a "rotate-only-prefix" implementation would use).
         self.head_dim_rot = 2 * rope_angles
         self.max_seq = max_seq
+        self._partial_kind = spec.partial_rotary_kind
 
-        # Real frequencies at the first `rope_angles` slots — denominator is
-        # full head_dim per HF proportional formula.
+        # Inv-freq denominator depends on the partial-rotary semantic:
+        # - "prefix" (Phi-3): inv_freq_shape = arange(0, dim_rot, 2) / dim_rot
+        #   — denominator is dim_rot (the rotated subset only).
+        # - "proportional" (Gemma 4): inv_freq_shape = arange(0, dim_rot, 2)
+        #   / head_dim — denominator is FULL head_dim, with zero padding in
+        #   the trailing channels.
+        # Source: modeling_phi3.py:113-114 vs modeling_gemma4.py (proportional
+        # path uses head_dim denominator).
+        if self._partial_kind == "prefix":
+            denom = max(self.head_dim_rot, 2)
+        else:  # proportional
+            denom = head_dim
         inv_freq_rotated = 1.0 / (
-            spec.base_theta ** (torch.arange(0, 2 * rope_angles, 2).float() / head_dim)
+            spec.base_theta ** (torch.arange(0, 2 * rope_angles, 2).float() / denom)
         )
         nope_angles = head_dim // 2 - rope_angles
-        if nope_angles > 0:
+        if self._partial_kind == "proportional" and nope_angles > 0:
+            # Gemma 4: pad inv_freq with zeros to head_dim/2 so cos/sin live
+            # at full head_dim.
             inv_freq = torch.cat(
                 [inv_freq_rotated, torch.zeros(nope_angles)],
                 dim=0,
             )
         else:
+            # Phi-3 prefix: inv_freq stays at rope_angles entries; cos/sin live
+            # at head_dim_rot (= 2*rope_angles), and apply uses rope_apply_partial.
             inv_freq = inv_freq_rotated
 
         if spec.scaling == types.RoPEScaling.LLAMA3:
@@ -123,20 +141,22 @@ class RoPE(nn.Module):
                 )
             short = torch.tensor(lre.short_factor, dtype=torch.float32)
             long_ = torch.tensor(lre.long_factor, dtype=torch.float32)
-            # Real frequencies use the rotated denominator dim = 2*rope_angles
-            # (per modeling_rope_utils.py:544 `inv_freq_shape = arange(0, dim, 2) / dim`).
-            dim_rot = 2 * rope_angles
-            inv_freq_shape = torch.arange(0, dim_rot, 2).float() / dim_rot
+            # LongRoPE always uses dim_rot denominator (per modeling_rope_utils
+            # _compute_longrope_parameters line 544 — `inv_freq_shape =
+            # arange(0, dim, 2) / dim` where `dim = head_dim * partial_rotary_factor
+            # = head_dim_rot`).
+            dim_rot = max(2 * rope_angles, 2)
+            inv_freq_shape = torch.arange(0, 2 * rope_angles, 2).float() / dim_rot
             inv_freq_short_rot = 1.0 / (short * spec.base_theta ** inv_freq_shape)
             inv_freq_long_rot = 1.0 / (long_ * spec.base_theta ** inv_freq_shape)
-            if nope_angles > 0:
+            if self._partial_kind == "proportional" and nope_angles > 0:
                 zeros = torch.zeros(nope_angles)
                 inv_freq_short = torch.cat([inv_freq_short_rot, zeros], dim=0)
                 inv_freq_long = torch.cat([inv_freq_long_rot, zeros], dim=0)
             else:
+                # "prefix" mode: keep tables at head_dim_rot only.
                 inv_freq_short = inv_freq_short_rot
                 inv_freq_long = inv_freq_long_rot
-            # Build TWO cos/sin tables, each [max_seq, head_dim].
             t = torch.arange(max_seq).float()
             freqs_short = torch.outer(t, inv_freq_short)
             freqs_long = torch.outer(t, inv_freq_long)
@@ -157,8 +177,11 @@ class RoPE(nn.Module):
             )
 
         t = torch.arange(max_seq).float()
-        freqs = torch.outer(t, inv_freq)            # [max_seq, head_dim/2]
-        # cos/sin at FULL head_dim. Channels with zero inv_freq → cos=1, sin=0.
+        freqs = torch.outer(t, inv_freq)            # [max_seq, *]
+        # cos/sin shape depends on partial_rotary_kind:
+        # - "prefix": [max_seq, head_dim_rot] — cos/sin only at rotated channels.
+        # - "proportional": [max_seq, head_dim] — full-dim, with cos=1, sin=0 in
+        #   the trailing zero-inv_freq channels.
         cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(dtype)
         sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).to(dtype)
         self.register_buffer("cos_cached", cos, persistent=False)
@@ -188,8 +211,17 @@ class RoPE(nn.Module):
         else:
             cos = self.cos_cached[position_ids]
             sin = self.sin_cached[position_ids]
-        # Always use the full-rotation path. When partial_rotary_factor < 1,
-        # cos/sin have ones/zeros in the trailing channels — those positions
-        # multiply-through identity but still participate in rotate_half's
-        # i↔i+Dh/2 pairing per HF proportional RoPE.
+        # Dispatch by partial_rotary_kind:
+        # - "proportional" (Gemma 4) → cos/sin span the full head_dim;
+        #   rotate_half pairs i↔i+head_dim/2 across the full head_dim, with
+        #   identity multiply on the trailing zero-inv_freq channels.
+        # - "prefix" (Phi-3 / Phi-4) → cos/sin span only head_dim_rot;
+        #   rope_apply_partial slices q[..., :rot_dim] (rotated) and
+        #   q[..., rot_dim:] (pass-through) and concatenates.
+        if self._partial_kind == "prefix" and self.spec.partial_rotary_factor < 1.0:
+            return ops.rope_apply_partial(
+                q, k, cos, sin,
+                partial_rotary_factor=self.spec.partial_rotary_factor,
+                basis="split_half",
+            )
         return ops.rope_apply(q, k, cos, sin, basis="split_half")

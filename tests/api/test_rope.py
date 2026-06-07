@@ -99,6 +99,7 @@ def test_rope_module_partial_rotary_factor():
         base_theta=1_000_000.0,
         basis=types.RoPEBasis.SPLIT_HALF,
         partial_rotary_factor=0.25,
+        partial_rotary_kind="proportional",   # Gemma 4 semantic — full head_dim
     )
     head_dim = 64
     max_seq = 32

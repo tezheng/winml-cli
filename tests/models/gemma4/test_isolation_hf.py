@@ -172,7 +172,7 @@ def test_partial_rope_inv_freq_structure_matches_hf_proportional():
     # Our RoPE module must produce the same cos/sin tables.
     from api import rope as api_rope_mod
     spec = specs.RoPESpec(base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
-                          partial_rotary_factor=pr)
+                          partial_rotary_factor=pr, partial_rotary_kind="proportional")
     module = api_rope_mod.RoPE(spec, head_dim=Dh, max_seq=S, dtype=torch.float32)
     assert module.cos_cached.shape == (S, Dh)
     assert torch.allclose(module.cos_cached, cos_hf, atol=ATOL)
@@ -269,7 +269,7 @@ def test_partial_rope_full_geometry_matches_hf():
     # Our path: build the RoPE module with the same spec
     from api import rope as api_rope_mod
     spec = specs.RoPESpec(base_theta=base, basis=types.RoPEBasis.SPLIT_HALF,
-                          partial_rotary_factor=pr)
+                          partial_rotary_factor=pr, partial_rotary_kind="proportional")
     module = api_rope_mod.RoPE(spec, head_dim=Dh, max_seq=S, dtype=torch.float32)
     api_q, _ = module(q, q, pos_ids)
     assert torch.allclose(hf_q, api_q, atol=ATOL, rtol=RTOL), (
