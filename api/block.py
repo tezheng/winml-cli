@@ -147,6 +147,17 @@ class DecoderBlock(nn.Module):
                 )
             self.pre_ffn_norm = None
             self.post_ffn_sublayer_norm = norm.RMSNorm(spec.post_ffn_norm, hidden_size, dtype=dtype)
+        elif spec.block_layout == types.BlockLayout.PARALLEL:
+            # v5-phase2 V2: PARALLEL block uses the shared pre_attn_norm
+            # as the input to BOTH attn and FFN — pre_ffn_norm MUST be
+            # None. Source: modeling_falcon.py:613-614.
+            if spec.pre_ffn_norm is not None:
+                raise ValueError(
+                    "PARALLEL block_layout must have pre_ffn_norm=None "
+                    "(the shared pre_attn_norm is reused for the FFN input)"
+                )
+            self.pre_ffn_norm = None
+            self.post_ffn_sublayer_norm = None
         else:  # PRE
             if spec.pre_ffn_norm is None:
                 raise ValueError("PRE ffn-norm requires pre_ffn_norm")
