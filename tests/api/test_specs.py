@@ -44,7 +44,7 @@ def test_kvcache_spec_contiguous():
         k_dtype=torch.bfloat16, v_dtype=torch.bfloat16,
         ownership=types.CacheOwnership.EXPLICIT_PASS,
     )
-    assert spec.block_size is None  # not used for CONTIGUOUS
+    assert spec.layout == types.CacheLayout.CONTIGUOUS
 
 
 def test_quant_spec_awq():
@@ -105,12 +105,6 @@ def test_decoder_block_spec_composition():
         pre_attn_norm=norm, pre_ffn_norm=norm,
     )
     assert block.residual_scale is None
-
-
-def test_share_scheme_enum_values_exist():
-    assert types.ShareScheme.NONE
-    assert types.ShareScheme.SAME_BLOCK_SHARED       # Gemma 4 E2B / E4B
-    assert types.ShareScheme.CROSS_BLOCK_SHARED      # Apple AFM (deferred but enumerated)
 
 
 def test_token_mixer_kind_enum_values_exist():
@@ -209,18 +203,6 @@ def test_rope_spec_has_partial_rotary_factor():
 def test_rope_spec_partial_rotary_default_is_one():
     spec = specs.RoPESpec(base_theta=1_000_000.0, basis=types.RoPEBasis.SPLIT_HALF)
     assert spec.partial_rotary_factor == 1.0  # full rotation by default
-
-
-def test_kvcache_spec_has_share_scheme():
-    spec = specs.KVCacheSpec(
-        layout=types.CacheLayout.CONTIGUOUS,
-        memory_layout=types.MemoryLayout.HND,
-        k_dtype=torch.bfloat16, v_dtype=torch.bfloat16,
-        share_scheme=types.ShareScheme.SAME_BLOCK_SHARED,
-        num_kv_shared_layers=20,
-    )
-    assert spec.share_scheme == types.ShareScheme.SAME_BLOCK_SHARED
-    assert spec.num_kv_shared_layers == 20
 
 
 def test_ple_spec_exists():

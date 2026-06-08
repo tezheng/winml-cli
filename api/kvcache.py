@@ -44,8 +44,6 @@ class ContiguousKVCache:
             raise NotImplementedError("M1 supports CONTIGUOUS layout only")
         if spec.memory_layout != types.MemoryLayout.HND:
             raise NotImplementedError("M1 supports HND memory layout only")
-        if spec.k_quant is not None or spec.v_quant is not None:
-            raise NotImplementedError("M1 supports unquantized KV cache only")
         self.spec = spec
         self.batch_size = batch_size
         self.n_kv_heads = n_kv_heads

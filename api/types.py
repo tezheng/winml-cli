@@ -166,9 +166,3 @@ class QuantRole(Enum):
     ATTN_INTERNAL = auto()
 
 
-class ShareScheme(Enum):
-    """Cross-layer KV cache sharing pattern (axis A18 from research/01 v3 §6)."""
-    NONE = auto()                 # default — every layer keeps its own K/V
-    SAME_BLOCK_SHARED = auto()    # Gemma 4 E2B/E4B — last N layers reuse an earlier same-type layer's K/V
-    CROSS_BLOCK_SHARED = auto()   # Apple AFM — 2-block split, Block-2 reuses Block-1
-    # YOCO_PRODUCER_CONSUMER reserved for future research-grade additions

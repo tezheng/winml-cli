@@ -241,13 +241,6 @@ class KVCacheSpec:
     k_dtype: torch.dtype
     v_dtype: torch.dtype
     ownership: types.CacheOwnership = types.CacheOwnership.EXPLICIT_PASS
-    block_size: Optional[int] = None
-    k_quant: Optional[QuantSpec] = None
-    v_quant: Optional[QuantSpec] = None
-
-    # B0.5: cross-layer sharing
-    share_scheme: types.ShareScheme = types.ShareScheme.NONE
-    num_kv_shared_layers: int = 0
 
 
 @dataclass(frozen=True)
