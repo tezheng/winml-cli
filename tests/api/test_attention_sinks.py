@@ -165,6 +165,29 @@ def test_attention_module_forward_with_sinks():
     assert diff > 1e-4, f"sinks had no effect: max_abs_diff={diff:.6e}"
 
 
+def test_sdpa_sinks_with_swa_mask():
+    """Sliding-window + sinks: both masks should apply simultaneously
+    (GPT-OSS sliding layers have sinks AND sliding_window=128)."""
+    B, H, S, T, Dh = 1, 4, 6, 6, 8
+    torch.manual_seed(3)
+    q = torch.randn(B, H, S, Dh)
+    k = torch.randn(B, H, T, Dh)
+    v = torch.randn(B, H, T, Dh)
+    sinks = torch.randn(H) * 0.1
+    # SWA mask: window=2 (only attend to positions [i-2, i]).
+    W = 2
+    i_idx = torch.arange(S).view(S, 1)
+    j_idx = torch.arange(T).view(1, T)
+    keep = (j_idx <= i_idx) & (i_idx - j_idx <= W)
+    mask = torch.where(
+        keep, torch.zeros((), dtype=q.dtype),
+        torch.full((), float("-inf"), dtype=q.dtype),
+    )[None, None, :, :]
+    out = ops.sdpa(q, k, v, attn_mask=mask, sinks=sinks)
+    assert out.shape == (B, H, S, Dh)
+    assert torch.isfinite(out).all()
+
+
 def test_attention_rejects_n_sink_tokens_gt_1():
     spec = specs.AttentionSpec(
         n_q_heads=4, n_kv_heads=4, head_dim=8,

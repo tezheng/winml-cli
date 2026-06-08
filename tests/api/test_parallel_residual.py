@@ -158,6 +158,25 @@ def test_parallel_matches_hand_rolled_reference():
     )
 
 
+def test_sequential_layout_remains_default():
+    """Existing factories that don't set block_layout must keep
+    SEQUENTIAL behavior (M1 + B-series rollout invariant)."""
+    norm_spec = _norm_spec()
+    spec = specs.DecoderBlockSpec(
+        attn_norm_position=types.NormPosition.PRE,
+        ffn_norm_position=types.NormPosition.PRE,
+        token_mixer=_baseline_attn_spec(),
+        channel_mixer=_ffn_spec(),
+        pre_attn_norm=norm_spec,
+        pre_ffn_norm=norm_spec,
+        # block_layout not set — must default to SEQUENTIAL
+    )
+    assert spec.block_layout == types.BlockLayout.SEQUENTIAL
+    blk = block.DecoderBlock(spec=spec, hidden_size=64, max_seq=32)
+    assert blk.pre_attn_norm is not None
+    assert blk.pre_ffn_norm is not None        # SEQUENTIAL has both
+
+
 def test_parallel_block_requires_no_pre_ffn_norm():
     """Setting pre_ffn_norm on a PARALLEL block must raise at init."""
     norm_spec = _norm_spec()
