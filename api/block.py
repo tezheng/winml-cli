@@ -203,6 +203,7 @@ class DecoderBlock(nn.Module):
         start_pos: int = 0,
         per_layer_input: Optional[torch.Tensor] = None,
         vision_token_count: Optional[int] = None,
+        kv_shared: Optional[tuple] = None,
     ) -> torch.Tensor:
         """Forward.
 
@@ -217,6 +218,14 @@ class DecoderBlock(nn.Module):
                 non-None (HF accepts None, with zero-fill semantics in our
                 tests handled at the call site).
         """
+        # v5-phase2 V2: PARALLEL residual flow (Falcon-7B style).
+        # Shared norm input, both sublayers sum into the same residual:
+        #   shared = pre_attn_norm(x)
+        #   x = x + attn(shared) + ffn(shared)
+        # Sequential flow (default): x = x + attn(norm1(x));
+        # x = x + ffn(norm2(x)). Source: modeling_falcon.py:594-634.
+        is_parallel = self.spec.block_layout == types.BlockLayout.PARALLEL
+
         # Token-mixer sublayer (attention or SSM)
         # B3 POST (OLMo 2): no pre-norm; feed raw residual to attention.
         if self.pre_attn_norm is not None:
@@ -230,29 +239,52 @@ class DecoderBlock(nn.Module):
         else:
             attn_out = self.attention(attn_in, position_ids=position_ids,
                                       cache=cache, start_pos=start_pos,
-                                      vision_token_count=vision_token_count)
+                                      vision_token_count=vision_token_count,
+                                      kv_shared=kv_shared)
         if self.post_attn_sublayer_norm is not None:
             attn_out = self.post_attn_sublayer_norm(attn_out)
         # B2a: Granite μP residual scaling — sublayer output is multiplied by
         # `residual_multiplier` BEFORE the residual add (modeling_granite.py:273).
         if self._residual_scale is not None:
             attn_out = attn_out * self._residual_scale
-        x = ops.add(x, attn_out)
 
-        # FFN sublayer (skipped for canonical Mamba-2 layers).
-        # Source: modeling_mamba2.py:617-640 — Mamba2Block has ONE sublayer
-        # only (norm + mixer + residual). No FFN.
-        if self.feedforward is not None:
+        if is_parallel:
+            # PARALLEL: do NOT add to x yet — feed the SAME `attn_in`
+            # (= pre_attn_norm(x)) into the FFN, then sum both sublayer
+            # outputs into one residual add. Source: modeling_falcon.py:
+            # 613-614 (`mlp_layernorm_out = attention_layernorm_out`),
+            # 631-634 (`mlp_output += attention_output; output =
+            # mlp_output + residual`).
+            if self.feedforward is None:
+                raise ValueError("PARALLEL block_layout requires feedforward")
             if self.pre_ffn_norm is not None:
-                ffn_in = self.pre_ffn_norm(x)
-            else:
-                ffn_in = x
-            ffn_out = self.feedforward(ffn_in)
+                raise ValueError(
+                    "PARALLEL block_layout uses one shared pre-norm; "
+                    "pre_ffn_norm must be None"
+                )
+            ffn_out = self.feedforward(attn_in)
             if self.post_ffn_sublayer_norm is not None:
                 ffn_out = self.post_ffn_sublayer_norm(ffn_out)
             if self._residual_scale is not None:
-                ffn_out = ffn_out * self._residual_scale  # modeling_granite.py:278
-            x = ops.add(x, ffn_out)
+                ffn_out = ffn_out * self._residual_scale
+            x = ops.add(ops.add(x, attn_out), ffn_out)
+        else:
+            x = ops.add(x, attn_out)
+
+            # FFN sublayer (skipped for canonical Mamba-2 layers).
+            # Source: modeling_mamba2.py:617-640 — Mamba2Block has ONE sublayer
+            # only (norm + mixer + residual). No FFN.
+            if self.feedforward is not None:
+                if self.pre_ffn_norm is not None:
+                    ffn_in = self.pre_ffn_norm(x)
+                else:
+                    ffn_in = x
+                ffn_out = self.feedforward(ffn_in)
+                if self.post_ffn_sublayer_norm is not None:
+                    ffn_out = self.post_ffn_sublayer_norm(ffn_out)
+                if self._residual_scale is not None:
+                    ffn_out = ffn_out * self._residual_scale  # modeling_granite.py:278
+                x = ops.add(x, ffn_out)
 
         # B0.6: PLE injection AT END (Gemma 4 only). Mirror modeling_gemma4.py:1446-1453.
         if self.per_layer_input_gate is not None and per_layer_input is not None:

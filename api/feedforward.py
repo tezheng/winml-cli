@@ -36,13 +36,20 @@ class FeedForward(nn.Module):
     def __init__(self, spec: specs.FFNSpec, hidden_size: int,
                  dtype: torch.dtype = torch.float32):
         super().__init__()
+        # v5-phase2 V3: SWIGLU now accepts RELU2 (BitNet b1.58 uses
+        # `gate_kind=SWIGLU + activation=RELU2`). Source:
+        # `transformers/models/bitnet/modeling_bitnet.py:70-77`
+        # (BitNetMLP with gate_proj/up_proj/down_proj + act_fn applied
+        # to the gate path).
         if spec.gate_kind not in (types.GateKind.SWIGLU, types.GateKind.GEGLU):
             raise NotImplementedError(
                 f"B0.5: SWIGLU and GEGLU only, got {spec.gate_kind}"
             )
-        if spec.gate_kind == types.GateKind.SWIGLU and spec.activation != types.Activation.SILU:
+        if spec.gate_kind == types.GateKind.SWIGLU and spec.activation not in (
+            types.Activation.SILU, types.Activation.RELU2,
+        ):
             raise NotImplementedError(
-                f"B0.5: SWIGLU requires SILU activation, got {spec.activation}"
+                f"v5-phase2: SWIGLU requires SILU or RELU2, got {spec.activation}"
             )
         if spec.gate_kind == types.GateKind.GEGLU and spec.activation != types.Activation.GELU:
             raise NotImplementedError(
@@ -69,6 +76,16 @@ class FeedForward(nn.Module):
             self.up_proj = nn.Linear(hidden_size, I, bias=spec.up_bias, dtype=dtype)
         self.down_proj = nn.Linear(I, hidden_size, bias=spec.down_bias, dtype=dtype)
 
+        # v5-phase2 V3: BitNet FFN sub-norm — RMSNorm on the gated
+        # activation BEFORE down_proj. Source: modeling_bitnet.py:74, 77.
+        if spec.ffn_sub_norm is not None:
+            if spec.ffn_sub_norm.kind != types.NormKind.RMS:
+                raise ValueError("ffn_sub_norm: RMS kind only")
+            from api import norm as _norm  # local to avoid cycle
+            self.ffn_sub_norm = _norm.RMSNorm(spec.ffn_sub_norm, I, dtype=dtype)
+        else:
+            self.ffn_sub_norm = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.spec.fused_gate_up:
             # Phi-3 order: chunk(2, dim=-1) → (gate, up) — verify modeling_phi3.py:61.
@@ -78,10 +95,20 @@ class FeedForward(nn.Module):
             gate = self.gate_proj(x)
             up = self.up_proj(x)
         if self.spec.gate_kind == types.GateKind.SWIGLU:
-            act = ops.silu(gate)
+            # v5-phase2 V3: activation may be SILU (Llama/Qwen) or RELU2
+            # (BitNet b1.58, Nemotron 3 squared-ReLU).
+            if self.spec.activation == types.Activation.RELU2:
+                act = ops.relu2(gate)
+            else:
+                act = ops.silu(gate)
         else:  # GEGLU — use gelu_pytorch_tanh per Gemma's signature
             act = ops.gelu_pytorch_tanh(gate)
-        return self.down_proj(ops.mul(act, up))
+        inner = ops.mul(act, up)
+        # v5-phase2 V3: BitNet ffn_sub_norm — RMSNorm on the gated
+        # product BEFORE down_proj. Source: modeling_bitnet.py:77.
+        if self.ffn_sub_norm is not None:
+            inner = self.ffn_sub_norm(inner)
+        return self.down_proj(inner)
 
 
 class MoE(nn.Module):

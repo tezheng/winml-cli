@@ -98,11 +98,19 @@ class Attention(nn.Module):
             )
         if spec.mask_kind not in (
             types.MaskKind.CAUSAL, types.MaskKind.SWA,
-            types.MaskKind.BLOCK_BIDIRECTIONAL,
+            types.MaskKind.BLOCK_BIDIRECTIONAL, types.MaskKind.SINK,
         ):
             raise NotImplementedError(
-                f"B8: CAUSAL, SWA, and BLOCK_BIDIRECTIONAL masks only, "
-                f"got {spec.mask_kind}"
+                f"v5-phase2: CAUSAL, SWA, BLOCK_BIDIRECTIONAL, and SINK "
+                f"masks only, got {spec.mask_kind}"
+            )
+        # v5-phase2 V1: ALiBi and RoPE are mutually exclusive (a model
+        # uses one OR the other for positional encoding). MPT uses ALiBi
+        # only; Falcon-7B uses RoPE only. Source: MPT config has no
+        # rope_theta, FalconConfig.rotary = not self.alibi.
+        if spec.alibi is not None and spec.rope is not None:
+            raise ValueError(
+                "AttentionSpec: alibi and rope are mutually exclusive"
             )
         self.spec = spec
         self.hidden_size = hidden_size
@@ -115,6 +123,16 @@ class Attention(nn.Module):
         # + 2 * (num_key_value_heads * head_dim)`) and 224 (`qkv_proj = Linear(
         # hidden_size, op_size, bias=False)`). FUSED is incompatible with
         # `attention_k_eq_v` and biases must be uniform (Phi-3 uses no bias).
+        # v5-phase2 V4: CLA (Cross-Layer Attention). When
+        # `kv_source_layer_offset is not None`, this layer borrows K/V
+        # from the layer at index (L + offset) — i.e. its k_proj/v_proj
+        # weights are intentionally NOT built. The caller must pass
+        # `kv_shared` to forward.
+        self._cla_offset = spec.kv_source_layer_offset
+        if self._cla_offset is not None and spec.qkv_layout == types.QKVLayout.FUSED:
+            raise NotImplementedError(
+                "v5-phase2: CLA + FUSED QKV unsupported (CLA uses split q_proj)"
+            )
         if spec.qkv_layout == types.QKVLayout.FUSED:
             if spec.attention_k_eq_v:
                 raise NotImplementedError(
@@ -132,13 +150,64 @@ class Attention(nn.Module):
         else:
             self.qkv_proj = None
             self.q_proj = nn.Linear(hidden_size, q_proj_out, bias=spec.q_bias, dtype=dtype)
-            self.k_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.k_bias, dtype=dtype)
-            # v_proj is skipped when attention_k_eq_v=True (Gemma 4 12B+ global)
-            if spec.attention_k_eq_v:
+            if self._cla_offset is not None:
+                # CLA borrower: K/V come from the source layer.
+                self.k_proj = None
                 self.v_proj = None
             else:
-                self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
+                self.k_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.k_bias, dtype=dtype)
+                # v_proj is skipped when attention_k_eq_v=True (Gemma 4 12B+ global)
+                if spec.attention_k_eq_v:
+                    self.v_proj = None
+                else:
+                    self.v_proj = nn.Linear(hidden_size, kv_proj_out, bias=spec.v_bias, dtype=dtype)
         self.o_proj = nn.Linear(q_proj_out, hidden_size, bias=spec.o_bias, dtype=dtype)
+
+        # v5-phase2 V3: BitNet attention sub-norm — RMSNorm on attn
+        # output BEFORE o_proj. Weight shape [hidden_size].
+        if spec.attn_sub_norm is not None:
+            if spec.attn_sub_norm.kind != types.NormKind.RMS:
+                raise ValueError("attn_sub_norm: RMS kind only")
+            self.attn_sub_norm = norm.RMSNorm(spec.attn_sub_norm, hidden_size, dtype=dtype)
+        else:
+            self.attn_sub_norm = None
+
+        # v5-phase2 V1: ALiBi slopes buffer. Per MPT, this is built at
+        # module init from n_heads and alibi_bias_max. We use a buffer
+        # so it travels with the module on `.to(device)` and is excluded
+        # from state_dict (not persistent — derived purely from config).
+        if spec.alibi is not None:
+            if spec.alibi.n_heads != spec.n_q_heads:
+                raise ValueError(
+                    f"AliBiSpec.n_heads ({spec.alibi.n_heads}) must equal "
+                    f"AttentionSpec.n_q_heads ({spec.n_q_heads})"
+                )
+            if spec.alibi.slopes is not None:
+                slopes = torch.tensor(spec.alibi.slopes, dtype=dtype)
+            else:
+                slopes = ops.build_alibi_slopes(
+                    spec.alibi.n_heads,
+                    alibi_bias_max=spec.alibi.alibi_bias_max,
+                    dtype=dtype,
+                )
+            self.register_buffer("alibi_slopes", slopes, persistent=False)
+        else:
+            self.alibi_slopes = None
+
+        # v5-phase2 V5: trained sinks parameter. One learnable scalar per
+        # head, allocated when `spec.n_sink_tokens` is set. HF GPT-OSS
+        # uses n_sink_tokens=1 effectively (a single `sinks` parameter
+        # of shape [n_heads]). Source:
+        # `transformers/models/gpt_oss/modeling_gpt_oss.py:309`.
+        if spec.n_sink_tokens is not None:
+            if spec.n_sink_tokens != 1:
+                raise NotImplementedError(
+                    f"v5-phase2: only n_sink_tokens=1 lands (HF GPT-OSS form), "
+                    f"got {spec.n_sink_tokens}"
+                )
+            self.sinks = nn.Parameter(torch.empty(spec.n_q_heads, dtype=dtype))
+        else:
+            self.sinks = None
 
         # effective_scale: when qk_norm_fixed_scale is set, the norm absorbs
         # 1/sqrt(Dh) and the effective scale is 1.0 (Gemma 4). Otherwise honor
@@ -321,6 +390,7 @@ class Attention(nn.Module):
         cache: _kvcache.ContiguousKVCache,
         start_pos: int,
         vision_token_count: Optional[int] = None,
+        kv_shared: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         spec = self.spec
         if getattr(self, "_is_dsa", False):
@@ -341,6 +411,43 @@ class Attention(nn.Module):
             v = qkv[..., k_end:].view(B, S, Hk, Dh)
         else:
             q = self.q_proj(x).view(B, S, Hq, Dh)
+            if self._cla_offset is not None:
+                # v5-phase2 V4: CLA — K/V come from a preceding layer,
+                # passed by the caller in `kv_shared` as the already-
+                # transposed [B, Hk, S, Dh] tensors that this layer would
+                # otherwise have written into its own cache.
+                if kv_shared is None:
+                    raise ValueError(
+                        "CLA layer (kv_source_layer_offset set) requires "
+                        "kv_shared=(k,v) at forward"
+                    )
+                # k, v are already [B, Hk, S, Dh] — skip the projection +
+                # transpose path below by short-circuiting here.
+                k_cla, v_cla = kv_shared
+                # We still need q in the standard [B, Hq, S, Dh] layout.
+                q = q.transpose(1, 2)
+                # Apply RoPE to Q only — K was already RoPE'd by the
+                # source layer when it computed its own K. For ALiBi the
+                # rope=None path is taken below.
+                if self.rope is not None:
+                    # rope.forward expects (q_4d, k_4d) — give it a dummy k.
+                    # But we need q rotated by position_ids. Build a fake k
+                    # of matching shape (Hk=Hq for q-only rotation works
+                    # since rope acts on the last two dims).
+                    # Simpler: re-implement just q rotation here using the
+                    # rope module's exposed cos/sin if present. Punt: in
+                    # practice CLA models share K/V with RoPE already
+                    # baked-in, so q must also be rotated. We rotate via
+                    # a fake k=q approach.
+                    q_4d = q.transpose(1, 2)  # back to [B, S, Hq, Dh]
+                    q_rot, _ = self.rope(q_4d, q_4d, position_ids)
+                    q = q_rot.transpose(1, 2)  # [B, Hq, S, Dh]
+                attn_out = self._sdpa_path(q, k_cla, v_cla, start_pos, S,
+                                           vision_token_count)
+                # Sub-norm + o_proj
+                if self.attn_sub_norm is not None:
+                    attn_out = self.attn_sub_norm(attn_out)
+                return self.o_proj(attn_out)
             k = self.k_proj(x).view(B, S, Hk, Dh)
             # K = V branch: alias the K tensor as V (after the same projection)
             if spec.attention_k_eq_v:
@@ -372,6 +479,35 @@ class Attention(nn.Module):
         cache.write(k, v, start_pos=start_pos)
         k_full, v_full = cache.read(seq_len=start_pos + S)
 
+        # v5-phase2: route through unified SDPA helper. It handles mask
+        # construction (CAUSAL / SWA / BLOCK_BIDIRECTIONAL / SINK), ALiBi
+        # bias build, and trained-sink logits.
+        attn_out = self._sdpa_path(q, k_full, v_full, start_pos, S,
+                                   vision_token_count)
+        # v5-phase2 V3: BitNet attn_sub_norm — RMSNorm on the merged
+        # (B, S, Hq*Dh) representation BEFORE o_proj. Source:
+        # modeling_bitnet.py:215-217.
+        if self.attn_sub_norm is not None:
+            attn_out = self.attn_sub_norm(attn_out)
+        return self.o_proj(attn_out)
+
+    def _sdpa_path(
+        self,
+        q: torch.Tensor,       # [B, Hq, S_q, Dh]
+        k_full: torch.Tensor,  # [B, Hk, T, Dh]
+        v_full: torch.Tensor,  # [B, Hk, T, Dh]
+        start_pos: int,
+        S: int,
+        vision_token_count: Optional[int],
+    ) -> torch.Tensor:
+        """Mask construction + SDPA + reshape, shared between the standard
+        and CLA paths.
+
+        Returns [B, S, Hq * Dh] (post-transpose, pre-o_proj).
+        """
+        spec = self.spec
+        B = q.shape[0]
+        Hq, Dh = spec.n_q_heads, spec.head_dim
         scale = self.effective_scale
         T = start_pos + S
         device = q.device
@@ -423,16 +559,37 @@ class Attention(nn.Module):
             attn_mask = torch.zeros(S, T, dtype=q.dtype, device=device)
             attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)            # [1, 1, S, T]
+        # v5-phase2 V1: ALiBi position bias — build [1, Hq, S, T] additive
+        # bias and pass through sdpa(attn_bias=...). Source:
+        # modeling_mpt.py:121 (`attention_scores + position_bias`).
+        attn_bias = None
+        if self.alibi_slopes is not None:
+            # Build the (S, T) offset matrix where offset[i, j] = (j -
+            # (start_pos + i)) and broadcast across heads via slopes.
+            device2 = q.device
+            q_abs = torch.arange(start_pos, start_pos + S,
+                                 device=device2, dtype=torch.long).view(S, 1)
+            k_abs = torch.arange(T, device=device2, dtype=torch.long).view(1, T)
+            offset = (k_abs - q_abs).to(q.dtype)              # [S, T]
+            slopes_h = self.alibi_slopes.to(q.dtype).view(1, Hq, 1, 1)
+            attn_bias = slopes_h * offset.view(1, 1, S, T)    # [1, Hq, S, T]
+
+        # v5-phase2 V5: trained sinks — pass the per-head learnable
+        # scalar to sdpa, which appends the sink logit column and drops
+        # it after softmax. Source: modeling_gpt_oss.py:267-275.
+        sinks = self.sinks if self.sinks is not None else None
+
         # B3 (Gemma 2): attn_logit_softcap — when set, sdpa uses a manual
         # matmul→softcap→softmax path (see api/ops.py::sdpa). The softcap is
         # applied AFTER the matmul*scale and BEFORE the mask add, per HF
         # `modeling_gemma2.py:212-217`.
         attn_out = ops.sdpa(q, k_full, v_full,
                             attn_mask=attn_mask, scale=scale,
-                            logit_softcap=spec.logit_softcap)
+                            logit_softcap=spec.logit_softcap,
+                            attn_bias=attn_bias, sinks=sinks)
 
         attn_out = attn_out.transpose(1, 2).reshape(B, S, Hq * Dh)
-        return self.o_proj(attn_out)
+        return attn_out
 
     def _forward_mla(
         self,

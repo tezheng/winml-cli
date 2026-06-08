@@ -250,6 +250,83 @@ def gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    """Squared ReLU activation — `(F.relu(x)) ** 2`.
+
+    Used by BitNet b1.58 (config.hidden_act='relu2') and Nemotron 3.
+    Source: `transformers/activations.py::ReLU2Activation` —
+    `relu(x).pow(2)`.
+    """
+    return F.relu(x).pow(2)
+
+
+def build_alibi_slopes(n_heads: int, alibi_bias_max: float = 8.0,
+                       device=None, dtype=torch.float32) -> torch.Tensor:
+    """Build MPT canonical ALiBi slopes.
+
+    Mirrors `transformers/models/mpt/modeling_mpt.py:42-62`
+    (`build_mpt_alibi_tensor`) — slope construction only, NOT the
+    full bias tensor. Returns shape [n_heads], fp32 by default.
+
+    For n_heads that is a power of 2:
+        base[h] = (h+1) * (alibi_bias_max / n_heads)   for h=0..n-1
+        slope[h] = 1.0 / (2 ** base[h])
+                 = 2 ** (-(h+1) * alibi_bias_max / n_heads)
+
+    For non-power-of-2 n_heads, MPT computes the next power-of-2
+    slopes then interleaves odd-then-even and truncates to n_heads.
+    """
+    import math
+    if n_heads <= 0:
+        raise ValueError(f"n_heads must be positive, got {n_heads}")
+    n_heads_p2 = 2 ** math.ceil(math.log2(n_heads)) if n_heads > 1 else 1
+    base = torch.arange(1, n_heads_p2 + 1, dtype=torch.int64, device=device).float()
+    base = base * (alibi_bias_max / n_heads_p2)
+    slopes = 1.0 / torch.pow(2.0, base)            # [n_heads_p2]
+    if n_heads_p2 != n_heads:
+        # MPT interleave + truncate: take odd-indexed half then even-indexed
+        # half from the larger power-of-2 set. Source: modeling_mpt.py:58-59.
+        slopes = torch.cat([slopes[1::2], slopes[::2]], dim=0)[:n_heads]
+    return slopes.to(dtype)
+
+
+def apply_alibi(
+    scores: torch.Tensor,           # [B, H, S_q, T]
+    slopes: torch.Tensor,           # [H], pre-computed via build_alibi_slopes
+    start_pos: int = 0,
+) -> torch.Tensor:
+    """Add ALiBi position bias to attention scores (pre-softmax).
+
+    The bias for query at absolute position i and key at position j is
+        bias[h, i, j] = slope[h] * (j - i)
+
+    Note j <= i in causal contexts, so (j - i) <= 0 and the bias is
+    negative-or-zero. The causal mask is applied SEPARATELY by the
+    caller (so this op is identical for non-causal use, e.g. encoder).
+
+    Mirrors `transformers/models/mpt/modeling_mpt.py:42-62` slope build
+    + 121 (`attention_scores = attention_scores + position_bias`). The
+    MPT impl uses `alibi[..., 0:1, :T] * slope` to broadcast — here we
+    compute the full (S_q, T) bias to support `start_pos > 0` (cached
+    decoding).
+    """
+    B, H, S_q, T = scores.shape
+    if slopes.shape != (H,):
+        raise ValueError(
+            f"apply_alibi: slopes shape {tuple(slopes.shape)} must be ({H},)"
+        )
+    device = scores.device
+    # Absolute positions: query i has position start_pos + i; key j has
+    # position j. Offset (j - i_abs) is <= 0 under causal masking.
+    q_pos = torch.arange(start_pos, start_pos + S_q,
+                         device=device, dtype=torch.long).view(S_q, 1)
+    k_pos = torch.arange(T, device=device, dtype=torch.long).view(1, T)
+    offset = (k_pos - q_pos).to(scores.dtype)               # [S_q, T]
+    # slopes: [H] -> [1, H, 1, 1]; offset: [S_q, T] -> [1, 1, S_q, T]
+    bias = slopes.view(1, H, 1, 1).to(scores.dtype) * offset.view(1, 1, S_q, T)
+    return scores + bias
+
+
 def sdpa(
     q: torch.Tensor,                       # [B, Hq, S, Dh]
     k: torch.Tensor,                       # [B, Hk, S, Dh]
@@ -258,6 +335,8 @@ def sdpa(
     is_causal: bool = False,
     scale: Optional[float] = None,
     logit_softcap: Optional[float] = None,
+    attn_bias: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Scaled dot-product attention with GQA support.
 
@@ -284,6 +363,45 @@ def sdpa(
         repeats = Hq // Hk
         k = k.repeat_interleave(repeats, dim=1)
         v = v.repeat_interleave(repeats, dim=1)
+
+    # v5-phase2: ALiBi (`attn_bias`) and trained sinks (`sinks`) both
+    # require a manual matmul path because F.scaled_dot_product_attention
+    # has no pre-softmax additive bias hook beyond `attn_mask`. Both
+    # paths route through the manual branch below (the logit_softcap
+    # branch is the existing manual path).
+    if attn_bias is not None or sinks is not None:
+        if scale is None:
+            scale = q.shape[-1] ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if attn_bias is not None:
+            attn = attn + attn_bias
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        elif is_causal:
+            S_q, S_k = q.shape[-2], k.shape[-2]
+            mask = torch.full((S_q, S_k), float("-inf"), dtype=q.dtype, device=q.device)
+            mask = torch.triu(mask, diagonal=1 + (S_k - S_q))
+            attn = attn + mask
+        if sinks is not None:
+            # GPT-OSS trained sinks: append the per-head learned scalar
+            # as one extra logit column, softmax over (T+1) slots, then
+            # drop the sink column. Source:
+            # `transformers/models/gpt_oss/modeling_gpt_oss.py:267-275`.
+            if sinks.dim() != 1 or sinks.shape[0] != Hq:
+                raise ValueError(
+                    f"sinks shape {tuple(sinks.shape)} must be ({Hq},)"
+                )
+            B, H, S_q, T = attn.shape
+            sink_broadcast = sinks.view(1, H, 1, 1).expand(B, H, S_q, 1).to(attn.dtype)
+            combined = torch.cat([attn, sink_broadcast], dim=-1)
+            # Numerically stable softmax (HF subtracts max as part of the
+            # sink impl — keep that to mirror modeling_gpt_oss.py:273).
+            combined = combined - combined.max(dim=-1, keepdim=True).values
+            probs = F.softmax(combined, dim=-1, dtype=combined.dtype)
+            probs = probs[..., :-1]
+            return torch.matmul(probs, v)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        return torch.matmul(attn, v)
 
     if logit_softcap is not None:
         # Manual eager attention to honor Gemma 2 softcap semantics.

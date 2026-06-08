@@ -88,6 +88,37 @@ class LongRoPEParams:
 
 
 @dataclass(frozen=True)
+class AliBiSpec:
+    """ALiBi (Attention with Linear Biases) position encoding.
+
+    The bias added to the (Q @ K.T) scores BEFORE softmax is
+
+        bias[h, i, j] = -m_h * (i - j)              for j <= i (causal)
+
+    where `m_h` are head-specific slopes forming a geometric sequence:
+
+        for h = 1..n where n is a power of 2:
+            m_h = 1 / 2 ** (h * alibi_bias_max / n)
+
+    For non-power-of-2 `n_heads`, the MPT impl uses the larger
+    power-of-2 slope set then reorders/keeps `n_heads` of them — verified
+    against `transformers/models/mpt/modeling_mpt.py:42-62`
+    (`build_mpt_alibi_tensor`).
+
+    `slopes` is optional; if None the runtime computes the canonical
+    MPT slopes at module-init time. When provided, it must be a tuple of
+    length `n_heads`.
+
+    Source: `transformers/models/mpt/modeling_mpt.py:42-62` (MPT slopes)
+    and `transformers/models/falcon/modeling_falcon.py:168-193`
+    (alternate Falcon/Bloom slopes — NOT used; Falcon-7B uses RoPE).
+    """
+    n_heads: int
+    alibi_bias_max: float = 8.0
+    slopes: Optional[tuple[float, ...]] = None
+
+
+@dataclass(frozen=True)
 class RoPESpec:
     base_theta: float
     basis: types.RoPEBasis
@@ -190,6 +221,56 @@ class AttentionSpec:
     # dimension and the per-query top-k.
     indexer: Optional["IndexerSpec"] = None
 
+    # v5-phase2 V1: ALiBi position encoding (MPT / Baichuan / Bloom).
+    # When set, ALiBi adds head-specific linear position biases to the
+    # attention scores BEFORE softmax — no RoPE, no learned positions.
+    # ALiBi is MUTUALLY EXCLUSIVE with `rope`: setting both is a config
+    # error and raises in Attention.__init__. Source:
+    # `transformers/models/mpt/modeling_mpt.py:42-62, 121` (build slopes
+    # + add bias before softmax).
+    alibi: Optional["AliBiSpec"] = None
+
+    # v5-phase2 V3: BitNet b1.58 sub-norm. RMSNorm applied to the
+    # attention output AFTER the per-head sdpa concat-reshape but BEFORE
+    # o_proj. Source:
+    # `transformers/models/bitnet/modeling_bitnet.py:177, 216` (
+    # `self.attn_sub_norm = BitNetRMSNorm(config.hidden_size)`,
+    # `attn_output = self.attn_sub_norm(attn_output)`).
+    attn_sub_norm: Optional[NormSpec] = None
+
+    # v5-phase2 V4: CLA (Cross-Layer Attention) per-layer KV pointer.
+    # When set to a negative int (e.g. -1), the layer at index L uses
+    # the K/V projections of layer L+offset (i.e. shares K/V with a
+    # preceding layer). Even-indexed layers compute K/V; odd-indexed
+    # layers borrow from their predecessor.
+    #
+    # Architectural expression at the model assembly level: factories
+    # set `kv_source_layer_offset=None` on owning layers (and build
+    # k_proj/v_proj) and `kv_source_layer_offset=-1` on borrowing
+    # layers (where k_proj/v_proj are intentionally NOT built — the
+    # caller passes K/V from the predecessor at forward time).
+    #
+    # Source: Hunyuan-Large `config.json` `use_cla=True`,
+    # `cla_share_factor=2`. The HF v5.10.2 `hunyuan_v1_dense` /
+    # `hunyuan_v1_moe` modeling files do NOT carry this spec hook —
+    # CLA is exercised only by the Hunyuan-Large public release.
+    kv_source_layer_offset: Optional[int] = None
+
+    # v5-phase2 V5: trained attention sinks (GPT-OSS family). When set,
+    # the attention forward appends `n_sink_tokens` learnable per-head
+    # logits to the (B, Hq, S, T) scores BEFORE softmax, then drops
+    # them post-softmax — so each head spends some softmax mass on a
+    # "trained sink" slot. Source:
+    # `transformers/models/gpt_oss/modeling_gpt_oss.py:309, 267-275`
+    # (`self.sinks = nn.Parameter(torch.empty(num_attention_heads))` /
+    # `combined_logits = cat([attn_weights, sinks], -1); probs = softmax(
+    # combined_logits); scores = probs[..., :-1]`).
+    #
+    # The HF impl uses a SINGLE learnable slot per head (so
+    # n_sink_tokens=1 is the canonical value); the IR exposes the count
+    # for forward-compat with multi-sink-slot variants.
+    n_sink_tokens: Optional[int] = None
+
     # B8: When True, the attention forward expects an optional
     # `vision_token_count` int. The keep mask becomes:
     #   - vision keys (j < V): bidirectional within the vision block
@@ -215,6 +296,14 @@ class FFNSpec:
     gate_bias: bool = False
     up_bias: bool = False
     down_bias: bool = False
+
+    # v5-phase2 V3: BitNet b1.58 sub-norm. RMSNorm applied to the gated
+    # activation `act(gate(x)) * up(x)` BEFORE the down_proj.
+    # Source: `transformers/models/bitnet/modeling_bitnet.py:74, 77`
+    # (`self.ffn_sub_norm = BitNetRMSNorm(config.intermediate_size)` /
+    # `self.down_proj(self.ffn_sub_norm(self.act_fn(self.gate_proj(x))
+    # * self.up_proj(x)))`).
+    ffn_sub_norm: Optional[NormSpec] = None
 
 
 @dataclass(frozen=True)
@@ -441,3 +530,11 @@ class DecoderBlockSpec:
     # block then assembles `residual + ssm(norm(x))` and returns.
     # Source: `modeling_mamba2.py:617-640` (Mamba2Block — only one sublayer).
     skip_ffn: bool = False
+
+    # v5-phase2 V2: SEQUENTIAL (default) vs PARALLEL residual flow.
+    # PARALLEL is Falcon-7B / Cohere-style — one shared norm input fed to
+    # both attention and FFN, both sublayer outputs summed into a single
+    # residual add. In PARALLEL mode `pre_ffn_norm` MUST be None and
+    # `ffn_norm_position` MUST be PRE. Source: see types.BlockLayout
+    # docstring.
+    block_layout: types.BlockLayout = types.BlockLayout.SEQUENTIAL

@@ -82,6 +82,24 @@ class NormPosition(Enum):
     PRE_AND_POST = auto()   # Gemma 2 / 3
 
 
+class BlockLayout(Enum):
+    """v5-phase2 V2: residual flow inside a DecoderBlock.
+
+    - SEQUENTIAL (default): the historical Llama / Qwen flow:
+          y = x + attn(norm1(x))
+          y = y + ffn(norm2(y))
+    - PARALLEL: Falcon-7B / Cohere flow with one shared norm input:
+          shared = norm(x)
+          y = x + attn(shared) + ffn(shared)
+      In PARALLEL mode the same `pre_attn_norm` is fed to BOTH the
+      attention sublayer AND the FFN; `pre_ffn_norm` must be None.
+      Source: `transformers/models/falcon/modeling_falcon.py:598, 613,
+      631-634` (`parallel_attn=True`, `mlp_output += attention_output`).
+    """
+    SEQUENTIAL = auto()
+    PARALLEL = auto()
+
+
 class Activation(Enum):
     SILU = auto()
     GELU = auto()
