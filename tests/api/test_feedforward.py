@@ -200,7 +200,6 @@ def test_b5_moe_sigmoid_plus_bias_router_shapes():
         n_experts=4, top_k=2, n_shared_experts=0,
         router_kind="sigmoid_plus_bias",
         router_norm=True,
-        score_correction_bias=True,
         routed_scaling_factor=2.5,
         expert_ffn=_moe_expert_ffn(I=12),
     )
@@ -226,7 +225,7 @@ def test_b5_moe_sigmoid_router_uses_bias_only_for_choice_not_weight():
     spec = specs.MoESpec(
         n_experts=E, top_k=K, n_shared_experts=0,
         router_kind="sigmoid_plus_bias", router_norm=False,
-        score_correction_bias=True, routed_scaling_factor=1.0,
+        routed_scaling_factor=1.0,
         expert_ffn=_moe_expert_ffn(I=4),
     )
     moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)

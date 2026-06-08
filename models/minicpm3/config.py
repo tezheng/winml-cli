@@ -217,11 +217,4 @@ class MiniCPM3Config:
             # μP residual scaling — applied inside DecoderBlock.forward.
             # Source: modeling_minicpm.py:941, 948.
             residual_scale=residual_scale,
-            # μP model-level scalars (consumed by embedding layer and lm_head
-            # respectively; the block does not apply them).
-            embedding_scale=self.scale_emb,
-            # logits_scale convention in this repo: lm_head MULTIPLIES by it.
-            # MiniCPM divides by hidden/dim_model_base, so the equivalent
-            # multiplier is dim_model_base / hidden_size.
-            logits_scale=self.dim_model_base / self.hidden_size,
         )

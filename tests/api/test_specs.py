@@ -55,7 +55,7 @@ def test_quant_spec_awq():
         accumulator_dtype=torch.float32,
         role=types.QuantRole.WEIGHT,
     )
-    assert spec.codebook is None
+    assert spec.role == types.QuantRole.WEIGHT
 
 
 def test_new_specs_frozen_and_default_consistent():
@@ -63,7 +63,7 @@ def test_new_specs_frozen_and_default_consistent():
     conv = specs.ConvSpec(kernel_size=4)
     assert conv.bias is True
     ssm = specs.SSMSpec(d_state=16, d_conv=4, d_inner=64)
-    assert ssm.dt_rank == -1
+    assert ssm.d_state == 16
     ssd = specs.SSDSpec(base=ssm)
     assert ssd.chunk_size == 256
     group = specs.GroupRoutingSpec(n_groups=8, topk_per_group=2)
@@ -117,8 +117,8 @@ def test_token_mixer_kind_enum_values_exist():
 
 
 def test_ssd_spec_b7_extra_fields_default():
-    """B7: SSDSpec carries n_heads, time_step_limit, layer_norm_epsilon,
-    residual_in_fp32. All Mamba-2 specific."""
+    """B7: SSDSpec carries n_heads, time_step_limit, layer_norm_epsilon.
+    All Mamba-2 specific."""
     ssm = specs.SSMSpec(d_state=128, d_conv=4, d_inner=5120)
     assert ssm.activation == types.Activation.SILU
     ssd = specs.SSDSpec(
@@ -129,7 +129,6 @@ def test_ssd_spec_b7_extra_fields_default():
     assert ssd.time_step_limit_low == 0.0
     assert ssd.time_step_limit_high == float("inf")
     assert ssd.layer_norm_epsilon == 1e-5
-    assert ssd.residual_in_fp32 is True
 
 
 def test_decoder_block_spec_with_ssd_token_mixer_skips_ffn():
@@ -185,12 +184,6 @@ def test_attention_spec_has_qk_norm_fixed_scale():
     assert spec.qk_norm_fixed_scale == 0.9916
 
 
-def test_attention_spec_has_final_logit_softcap_marker():
-    # final_logit_softcap belongs on the *model* level (lm_head op), but the block-level
-    # spec carries it for the assembly path. We put it on DecoderBlockSpec.
-    pass  # tested via DecoderBlockSpec below
-
-
 def test_rope_spec_has_partial_rotary_factor():
     spec = specs.RoPESpec(
         base_theta=1_000_000.0,
@@ -238,10 +231,8 @@ def test_decoder_block_spec_has_pre_ple_injection():
         pre_attn_norm=norm, post_attn_norm=norm,
         pre_ffn_norm=norm, post_ffn_norm=norm,
         per_layer_embedding=ple,
-        final_logit_softcap=30.0,
     )
     assert block.per_layer_embedding is ple
-    assert block.final_logit_softcap == 30.0
 
 
 def test_attention_spec_mla_fields_default_none():
@@ -366,7 +357,6 @@ def test_b5_moe_spec_v3_lite_shape():
         n_shared_experts=1,
         router_kind="sigmoid_plus_bias",
         router_norm=True,
-        score_correction_bias=True,
         group_routing=specs.GroupRoutingSpec(n_groups=8, topk_per_group=4),
         routed_scaling_factor=2.5,
         expert_ffn=expert_ffn,
@@ -377,7 +367,7 @@ def test_b5_moe_spec_v3_lite_shape():
 
 def test_b5_indexer_spec():
     """B5: IndexerSpec exists for DSA composition (DeepSeek-V3.2)."""
-    spec = specs.IndexerSpec(indexer_dim=64, top_k=2048, warmup_tokens=1_000_000)
+    spec = specs.IndexerSpec(indexer_dim=64, top_k=2048)
     assert spec.indexer_dim == 64
 
 

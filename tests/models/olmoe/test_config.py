@@ -94,7 +94,6 @@ def test_olmoe_block_spec_moe_no_shared_no_group():
     assert moe.n_shared_experts == 0
     assert moe.group_routing is None
     assert moe.routed_scaling_factor == 1.0
-    assert moe.score_correction_bias is False
     # OLMoE-0924 ships norm_topk_prob=False.
     assert moe.router_norm is False
     assert moe.expert_ffn.intermediate_size == 1024

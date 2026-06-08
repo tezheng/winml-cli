@@ -55,7 +55,6 @@ def test_v3_moe_router_matches_hf_at_5e_4():
         n_shared_experts=hf_cfg.n_shared_experts,
         router_kind="sigmoid_plus_bias",
         router_norm=hf_cfg.norm_topk_prob,
-        score_correction_bias=True,
         group_routing=specs.GroupRoutingSpec(
             n_groups=hf_cfg.n_group, topk_per_group=hf_cfg.topk_group,
         ),

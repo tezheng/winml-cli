@@ -77,7 +77,6 @@ def test_block_spec_layer0_blocksparse_mask():
     assert fm.gate_kind == types.GateKind.GEGLU
     assert fm.fused_gate_up is True
     assert spec.pre_attn_norm.kind == types.NormKind.LAYER
-    assert spec.embedding_scale == 10.0
 
 
 def test_block_spec_layer1_dense_mask():

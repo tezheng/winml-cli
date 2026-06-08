@@ -80,9 +80,6 @@ def test_config_to_block_spec_mla():
     # Residual scale = scale_depth / sqrt(L) = 1.4 / sqrt(62).
     expected = 1.4 / math.sqrt(62)
     assert math.isclose(spec.residual_scale, expected, rel_tol=1e-12)
-    # μP model-level scalars are carried.
-    assert spec.embedding_scale == 12.0
-    assert math.isclose(spec.logits_scale, 256 / 2560, rel_tol=1e-12)
 
 
 def test_config_to_block_spec_default_rope_no_scaling():

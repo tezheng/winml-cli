@@ -215,7 +215,6 @@ class DeepseekOcr2Config:
                 n_shared_experts=self.n_shared_experts,
                 router_kind="softmax",        # HF: F.softmax + greedy top-k.
                 router_norm=False,            # HF source does NOT renorm topk.
-                score_correction_bias=False,
                 group_routing=group_routing,
                 routed_scaling_factor=self.routed_scaling_factor,
                 expert_ffn=expert_ffn,

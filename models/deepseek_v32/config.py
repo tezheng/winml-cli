@@ -70,7 +70,6 @@ class DeepSeekV32Config:
         indexer = specs.IndexerSpec(
             indexer_dim=self.indexer_dim,
             top_k=self.indexer_top_k,
-            warmup_tokens=self.indexer_warmup_tokens,
         )
         attn = specs.AttentionSpec(
             n_q_heads=self.num_attention_heads,
@@ -101,7 +100,6 @@ class DeepSeekV32Config:
                 n_shared_experts=self.n_shared_experts,
                 router_kind="sigmoid_plus_bias",
                 router_norm=self.norm_topk_prob,
-                score_correction_bias=True,
                 group_routing=specs.GroupRoutingSpec(
                     n_groups=self.n_group, topk_per_group=self.topk_group,
                 ),

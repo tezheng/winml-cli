@@ -211,7 +211,6 @@ class Granite4HConfig:
                 dt_init_floor=self.time_step_floor,
                 conv_bias=self.mamba_conv_bias,
                 bias=self.mamba_proj_bias,
-                use_fast_path=False,
                 activation=types.Activation.SILU,
             )
             token_mixer: object = specs.SSDSpec(
@@ -223,7 +222,6 @@ class Granite4HConfig:
                 time_step_limit_low=self.time_step_limit[0],
                 time_step_limit_high=self.time_step_limit[1],
                 layer_norm_epsilon=self.rms_norm_eps,
-                residual_in_fp32=True,
             )
         else:
             # NoPE attention with `attention_multiplier` as scale.
@@ -256,7 +254,5 @@ class Granite4HConfig:
             pre_attn_norm=norm_spec,
             pre_ffn_norm=norm_spec,
             residual_scale=self.residual_multiplier,
-            embedding_scale=self.embedding_multiplier,
-            logits_scale=self.logits_scaling,
             skip_ffn=False,                  # Granite-4-H always has the shared_mlp
         )

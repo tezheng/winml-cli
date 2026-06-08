@@ -231,7 +231,6 @@ class QuantSpec:
     packing: types.PackingLayout
     accumulator_dtype: torch.dtype
     role: types.QuantRole = types.QuantRole.WEIGHT
-    codebook: Optional[object] = None    # CodebookSpec — defined post-M1
 
 
 @dataclass(frozen=True)
@@ -277,13 +276,11 @@ class SSMSpec:
     d_conv: int                        # conv_kernel in HF config (default 4)
     d_inner: int                       # intermediate_size = hidden * expand
     expand_factor: int = 2
-    dt_rank: int = -1                  # -1 means "auto" (= hidden // 16) — UNUSED by Mamba-2 (per-head dt instead)
     dt_min: float = 0.001
     dt_max: float = 0.1
     dt_init_floor: float = 1e-4
     conv_bias: bool = True
     bias: bool = False
-    use_fast_path: bool = True
     activation: types.Activation = types.Activation.SILU
 
 
@@ -312,8 +309,6 @@ class SSDSpec:
       (line 179).
     - `use_bias` (carried via base.bias): bias of in_proj and out_proj.
     - `use_conv_bias` (carried via base.conv_bias): bias of conv1d.
-    - `residual_in_fp32`: when True, the residual stream is upcast to fp32
-      before the residual add (modeling_mamba2.py:622, 635).
     """
     base: SSMSpec
     chunk_size: int = 256
@@ -323,7 +318,6 @@ class SSDSpec:
     time_step_limit_low: float = 0.0
     time_step_limit_high: float = float("inf")
     layer_norm_epsilon: float = 1e-5
-    residual_in_fp32: bool = True
 
 
 @dataclass(frozen=True)
@@ -331,7 +325,6 @@ class GroupRoutingSpec:
     """DeepSeek-V3 group-limited routing."""
     n_groups: int
     topk_per_group: int
-    routed_expert_grouping: bool = True
 
 
 @dataclass(frozen=True)
@@ -372,7 +365,6 @@ class MoESpec:
     n_shared_experts: int = 0
     router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias"
     router_norm: bool = False         # V3 norm_topk_prob: renorm top-k weights to sum 1
-    score_correction_bias: bool = False  # V3 e_score_correction_bias buffer
     group_routing: Optional[GroupRoutingSpec] = None
     routed_scaling_factor: float = 1.0
     expert_ffn: Optional[FFNSpec] = None
@@ -390,15 +382,13 @@ class IndexerSpec:
 
     For B5 the indexer forward is NOT implemented — the spec is wired into
     the AttentionKind.DSA composition path and `Attention.forward` raises
-    NotImplementedError. `warmup_tokens` is the number of training tokens
-    used before activating DSA (informational; not used at inference).
+    NotImplementedError.
 
     Source: DeepSeek-V3.2 release notes (no upstream HF model file as of
     transformers 4.50; the architectural family is reserved here).
     """
     indexer_dim: int
     top_k: int
-    warmup_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -445,12 +435,9 @@ class DecoderBlockSpec:
     pre_ffn_norm: Optional[NormSpec] = None
     post_ffn_norm: Optional[NormSpec] = None
     residual_scale: Optional[float] = None
-    embedding_scale: Optional[float] = None
-    logits_scale: Optional[float] = None
 
     # B0.5
     per_layer_embedding: Optional[PLESpec] = None
-    final_logit_softcap: Optional[float] = None    # Gemma 4 = 30.0 (model-level; carried here for assembly)
 
     # B7: when the token_mixer is an SSM/SSD spec, the FFN may be optional —
     # Mamba-2 has NO FFN sublayer. When `channel_mixer` is None, the block

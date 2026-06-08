@@ -130,7 +130,6 @@ def test_qwen3_moe_moe_spec_no_shared_no_group_no_scaling():
     assert moe.n_shared_experts == 0
     assert moe.group_routing is None
     assert moe.routed_scaling_factor == 1.0
-    assert moe.score_correction_bias is False
     # norm_topk_prob = True for Qwen3-30B-A3B → router_norm True.
     assert moe.router_norm is True
 

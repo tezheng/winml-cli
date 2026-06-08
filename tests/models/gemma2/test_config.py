@@ -92,14 +92,6 @@ def test_gemma2_attn_scale_uses_query_pre_attn_scalar():
     assert abs(spec.token_mixer.attn_scale - expected) < 1e-10
 
 
-def test_gemma2_block_spec_carries_embedding_and_final_softcap():
-    """Model-level scalars carried on the per-layer DecoderBlockSpec."""
-    cfg = g2c.Gemma2Config.from_hf_dict(_fake_hf_dict_2b())
-    spec = cfg.to_block_spec(layer_idx=0)
-    assert spec.embedding_scale == 2304 ** 0.5
-    assert spec.final_logit_softcap == 30.0
-
-
 def test_gemma2_block_spec_geglu_ffn():
     cfg = g2c.Gemma2Config.from_hf_dict(_fake_hf_dict_2b())
     spec = cfg.to_block_spec(layer_idx=0)

@@ -83,7 +83,6 @@ def test_layer1_is_moe():
     assert moe.n_shared_experts == 2
     assert moe.router_kind == "softmax"
     assert moe.router_norm is False                # HF source does NOT renorm
-    assert moe.score_correction_bias is False      # NOT sigmoid+bias
     assert moe.group_routing is None               # n_group=1 collapses
     assert moe.routed_scaling_factor == 1.0
     assert moe.expert_ffn is not None

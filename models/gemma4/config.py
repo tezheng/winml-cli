@@ -190,8 +190,6 @@ class Gemma4Config:
             pre_attn_norm=norm_spec, post_attn_norm=norm_spec,
             pre_ffn_norm=norm_spec, post_ffn_norm=norm_spec,
             per_layer_embedding=ple_spec,
-            final_logit_softcap=self.final_logit_softcap,
-            embedding_scale=self.hidden_size ** 0.5,  # sqrt(D) - Gemma signature
         )
 
     def kv_source_layer_idx_map(self) -> dict[int, int]:

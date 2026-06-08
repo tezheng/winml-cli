@@ -170,7 +170,6 @@ class DeepSeekV3MoEConfig:
                 n_shared_experts=self.n_shared_experts,
                 router_kind="sigmoid_plus_bias",
                 router_norm=self.norm_topk_prob,
-                score_correction_bias=True,
                 group_routing=gr,
                 routed_scaling_factor=self.routed_scaling_factor,
                 expert_ffn=expert_ffn,

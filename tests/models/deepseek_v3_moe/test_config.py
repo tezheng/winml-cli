@@ -71,7 +71,6 @@ def test_v3_moe_layer_3_plus_is_moe_with_sigmoid_router_and_group_routing():
     moe = blk.channel_mixer
     assert isinstance(moe, specs.MoESpec)
     assert moe.router_kind == "sigmoid_plus_bias"
-    assert moe.score_correction_bias is True
     assert moe.router_norm is True
     assert moe.routed_scaling_factor == 2.5
     assert moe.n_experts == 256

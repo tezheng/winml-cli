@@ -177,6 +177,4 @@ class Gemma2Config:
             channel_mixer=ffn_spec,
             pre_attn_norm=norm_spec, post_attn_norm=norm_spec,
             pre_ffn_norm=norm_spec, post_ffn_norm=norm_spec,
-            embedding_scale=self.hidden_size ** 0.5,
-            final_logit_softcap=self.final_logit_softcap,
         )

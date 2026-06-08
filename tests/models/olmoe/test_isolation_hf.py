@@ -59,7 +59,6 @@ def test_olmoe_router_matches_hf_at_5e_4():
         n_shared_experts=0,
         router_kind="softmax",
         router_norm=hf_cfg.norm_topk_prob,
-        score_correction_bias=False,
         group_routing=None,
         routed_scaling_factor=1.0,
         expert_ffn=expert_ffn,

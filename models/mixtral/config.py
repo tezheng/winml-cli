@@ -169,7 +169,6 @@ class MixtralConfig:
             n_shared_experts=0,
             router_kind="softmax",
             router_norm=True,                    # Mixtral always renormalizes
-            score_correction_bias=False,
             group_routing=None,
             routed_scaling_factor=1.0,
             expert_ffn=expert_ffn,

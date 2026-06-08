@@ -163,5 +163,4 @@ class Phi3SmallConfig:
             channel_mixer=ffn_spec,
             pre_attn_norm=norm_spec,
             pre_ffn_norm=norm_spec,
-            embedding_scale=self.mup_embedding_multiplier,
         )

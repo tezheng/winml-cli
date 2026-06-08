@@ -122,7 +122,6 @@ class Mamba2Config:
             dt_init_floor=self.time_step_floor,
             conv_bias=self.use_conv_bias,
             bias=self.use_bias,
-            use_fast_path=False,
             activation=types.Activation.SILU,
         )
         ssd_spec = specs.SSDSpec(
@@ -134,7 +133,6 @@ class Mamba2Config:
             time_step_limit_low=self.time_step_limit[0],
             time_step_limit_high=self.time_step_limit[1],
             layer_norm_epsilon=self.layer_norm_epsilon,
-            residual_in_fp32=self.residual_in_fp32,
         )
         # Placeholder FFN spec — ignored due to skip_ffn=True.
         placeholder_ffn = specs.FFNSpec(

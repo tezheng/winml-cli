@@ -110,7 +110,6 @@ def test_mixtral_block_spec_moe_softmax_always_norm():
     assert isinstance(moe, specs.MoESpec)
     assert moe.router_kind == "softmax"
     assert moe.router_norm is True
-    assert moe.score_correction_bias is False
     assert moe.group_routing is None
     assert moe.routed_scaling_factor == 1.0
     assert moe.n_experts == 8

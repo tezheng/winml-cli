@@ -78,9 +78,6 @@ def test_granite_config_to_block_spec_wires_mu_p_scalars():
     assert spec.token_mixer.attn_scale == 0.015625
     # μP residual scale plumbed.
     assert spec.residual_scale == 0.22
-    # μP model-level scalars carried for assembly.
-    assert spec.embedding_scale == 12.0
-    assert spec.logits_scale == 8.0
     # Architectural sanity — Llama-shaped block.
     from api import types as _t
     assert spec.token_mixer.kind == _t.AttentionKind.STANDARD

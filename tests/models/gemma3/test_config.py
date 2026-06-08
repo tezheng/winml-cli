@@ -107,8 +107,7 @@ def test_gemma3_no_softcaps():
     spec_global = cfg.to_block_spec(layer_idx=5)
     assert spec_local.token_mixer.logit_softcap is None
     assert spec_global.token_mixer.logit_softcap is None
-    assert spec_local.final_logit_softcap is None
-    assert spec_global.final_logit_softcap is None
+    assert cfg.final_logit_softcap is None
 
 
 def test_gemma3_uses_full_rope_no_partial():

@@ -238,7 +238,6 @@ class DeepSeekV2LiteConfig:
             n_shared_experts=self.n_shared_experts,
             router_kind="softmax",
             router_norm=self.norm_topk_prob,
-            score_correction_bias=False,
             group_routing=group,
             routed_scaling_factor=self.routed_scaling_factor,
             expert_ffn=expert_ffn,

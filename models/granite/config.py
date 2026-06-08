@@ -144,9 +144,4 @@ class GraniteConfig:
             pre_ffn_norm=norm_spec,
             # μP residual scaling — applied inside DecoderBlock.forward.
             residual_scale=self.residual_multiplier,
-            # μP model-level scalars (carried for assembly; block does not apply
-            # these — `embedding_scale` is consumed by the embedding layer and
-            # `logits_scale` by the lm_head).
-            embedding_scale=self.embedding_multiplier,
-            logits_scale=self.logits_scaling,
         )
