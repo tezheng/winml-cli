@@ -92,7 +92,6 @@ class RoPESpec:
     base_theta: float
     basis: types.RoPEBasis
     scaling: types.RoPEScaling = types.RoPEScaling.NONE
-    scale_factor: Optional[float] = None
     llama3_extra: Optional[Llama3RoPEParams] = None
     longrope_extra: Optional[LongRoPEParams] = None
     yarn_extra: Optional[YarnRoPEParams] = None
@@ -128,9 +127,6 @@ class RoPESpec:
     # Source: `transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py:564-606`
     # (apply_multimodal_rotary_pos_emb).
     mrope_section: Optional[tuple[int, ...]] = None
-    # B8: 2D RoPE flag reserved for future axial-RoPE work (vision encoder
-    # path). Not exercised at the B8 LM-decoder layer — kept for v3 parity.
-    is_2d: bool = False
 
 
 @dataclass(frozen=True)

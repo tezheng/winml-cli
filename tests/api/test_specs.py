@@ -15,7 +15,6 @@ def test_norm_spec_is_frozen():
 def test_rope_spec_defaults():
     spec = specs.RoPESpec(base_theta=1_000_000.0, basis=types.RoPEBasis.SPLIT_HALF)
     assert spec.scaling == types.RoPEScaling.NONE
-    assert spec.scale_factor is None
 
 
 def test_attention_spec_minimum():
@@ -110,10 +109,7 @@ def test_decoder_block_spec_composition():
 def test_token_mixer_kind_enum_values_exist():
     """B7: TokenMixerKind enum carries ATTENTION + the SSM variants."""
     assert types.TokenMixerKind.ATTENTION
-    assert types.TokenMixerKind.SSM_MAMBA1
     assert types.TokenMixerKind.SSM_MAMBA2
-    assert types.TokenMixerKind.SSM_GRIFFIN
-    assert types.TokenMixerKind.SSM_RWKV
 
 
 def test_ssd_spec_b7_extra_fields_default():
@@ -155,11 +151,6 @@ def test_qk_norm_phase_has_pre_rope_fixed_scale():
     # Gemma 4 uses PRE_ROPE QK-norm with a fixed-scale (non-learned-absorbing-1/sqrt(Dh)).
     # We model this as the existing PRE_ROPE phase plus a fixed_scale field on AttentionSpec.
     assert types.QKNormPhase.PRE_ROPE
-
-
-def test_mask_kind_has_swa_global_alt():
-    # Gemma 3 / 4 alternate SWA local with full-attention global layers at 5:1.
-    assert types.MaskKind.SWA_GLOBAL_ALT
 
 
 def test_attention_spec_has_attention_k_eq_v():

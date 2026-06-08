@@ -6,10 +6,6 @@ from enum import Enum, auto
 class AttentionKind(Enum):
     STANDARD = auto()       # MHA / GQA / MQA — distinguished by n_kv_heads
     MLA = auto()            # Multi-head Latent Attention (DeepSeek)
-    LINEAR_RETENTION = auto()
-    LINEAR_DELTANET = auto()
-    LINEAR_GLA = auto()
-    DIFFERENTIAL = auto()
     DSA = auto()            # DeepSeek V3.2 Sparse Attention (Lightning Indexer)
 
 
@@ -28,10 +24,7 @@ class TokenMixerKind(Enum):
     the deferred-family stubs.
     """
     ATTENTION = auto()      # default — AttentionSpec
-    SSM_MAMBA1 = auto()     # SSMSpec — Mamba-1 selective scan (reserved)
     SSM_MAMBA2 = auto()     # SSDSpec — Mamba-2 SSD form (B7 lands this)
-    SSM_GRIFFIN = auto()    # RecurrentGemma — reserved (deferred stub)
-    SSM_RWKV = auto()       # RWKV-7 — reserved (deferred stub)
 
 
 class QKVLayout(Enum):
@@ -43,10 +36,7 @@ class QKVLayout(Enum):
 class MaskKind(Enum):
     CAUSAL = auto()
     SWA = auto()
-    SWA_GLOBAL_ALT = auto()
-    SINK = auto()
-    FULL = auto()
-    CUSTOM = auto()
+    SINK = auto()              # KEPT — Phase 2 wires it for GPT-OSS
     BLOCK_SPARSE = auto()
     # B8: Visual Causal Flow / block-bidirectional mask. Used by
     # the original DeepSeek-OCR architecture (and reserved as a v3
@@ -113,9 +103,6 @@ class RoPEBasis(Enum):
 
 class RoPEScaling(Enum):
     NONE = auto()
-    PI = auto()
-    NTK_STATIC = auto()
-    NTK_DYNAMIC = auto()
     YARN = auto()           # DeepSeek-V2 / V3 — NTK + linear ramp + mscale
     LLAMA3 = auto()         # Llama 3 smooth scaling
     LONGROPE = auto()       # Phi-3 short/long
@@ -141,21 +128,11 @@ class CacheOwnership(Enum):
 
 class QDType(Enum):
     INT4 = auto()
-    INT8 = auto()
-    FP8_E4M3 = auto()
-    FP8_E5M2 = auto()
-    FP4 = auto()
-    NF4 = auto()
-    MX_FP4 = auto()
 
 
 class PackingLayout(Enum):
     NONE = auto()
-    NIBBLE_LSB = auto()
-    NIBBLE_MSB = auto()
     AWQ_INTERLEAVE = auto()     # [0,2,4,6,1,3,5,7] nibble permutation
-    GPTQ_INT32_PACK = auto()
-    GGUF_K = auto()
 
 
 class QuantRole(Enum):
