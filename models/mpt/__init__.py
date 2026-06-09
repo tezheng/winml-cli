@@ -1,18 +1,22 @@
-"""MPT family (MosaicML) — ALiBi position encoding.
+"""MPT family (MosaicML).
 
-For v5-phase2 V1 we land ONLY the ALiBi attention sublayer:
-- AttentionSpec.alibi: build slopes; bias added pre-softmax via ops.apply_alibi.
+v5-phase2 V1 landed the ALiBi attention sublayer.
+v6 A1 lands the FULL decoder block:
+- LayerNorm(eps, has_bias=False) on both norm_1/norm_2
+- ALiBi-MHA attention
+- Ungated GELU (exact) FFN (`up_proj -> nn.GELU(approximate='none') -> down_proj`)
 
-The MPT FFN (ungated GELU — `up_proj` → GELU → `down_proj` with no
-gating) and LayerNorm-without-bias (norm_1.bias = None, norm_2.bias =
-None) are NOT yet expressible in the api/ IR. Both are Phase 3 work:
-- `GateKind.NO_GATING` / pure-FFN form (StarCoder 2, MPT, Pythia)
-- LayerNorm-with-optional-bias
+Wired via:
+- types.NormKind.LAYER + NormSpec.has_bias
+- types.GateKind.GELU_ONLY + types.Activation.GELU_EXACT
+- api/norm.py::LayerNorm and api/norm.py::build_norm dispatcher
+- api/feedforward.py::FeedForward GELU_ONLY path (up_proj -> gelu -> down_proj)
 
-Until those land, MPT decoder-block assembly is shape-only. The
-canonical numerical gate exercises the ATTENTION sublayer alone (see
-tests/models/mpt/test_alibi_attention.py).
-
-Source: `transformers/models/mpt/modeling_mpt.py:65-134` (MptAttention,
-ALiBi math at lines 42-62 and 121).
+Source:
+  `transformers/models/mpt/modeling_mpt.py`
+   - 42-62 (build_mpt_alibi_tensor — slopes)
+   - 65-134 (MptAttention — Wqkv fused, position_bias add)
+   - 137-155 (MptMLP — `nn.GELU(approximate='none')`, up_proj+down_proj only)
+   - 158-212 (MptBlock — norm_1 -> attn -> residual, norm_2 -> ffn -> residual,
+     with `norm_1.bias = None` / `norm_2.bias = None`)
 """

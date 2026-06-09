@@ -250,6 +250,16 @@ def gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
+def gelu_exact(x: torch.Tensor) -> torch.Tensor:
+    """Exact GELU — `F.gelu(x, approximate='none')`.
+
+    Used by MPT (modeling_mpt.py:143 `nn.GELU(approximate='none')`) and
+    Falcon-7B (configuration_falcon.py:88 `activation='gelu'` → exact GELU
+    via transformers' `get_activation('gelu')` registry).
+    """
+    return F.gelu(x, approximate="none")
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation — `(F.relu(x)) ** 2`.
 

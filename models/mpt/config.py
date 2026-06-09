@@ -40,6 +40,44 @@ class MptConfig:
             max_position_embeddings=2048,
         )
 
+    @property
+    def intermediate_size(self) -> int:
+        """MPT MLP expansion: `up_proj = Linear(hidden, 4*hidden)`.
+        Source: modeling_mpt.py:142."""
+        return 4 * self.hidden_size
+
+    def to_ffn_spec(self) -> specs.FFNSpec:
+        """MPT FFN: ungated exact-GELU. Source: modeling_mpt.py:137-155."""
+        return specs.FFNSpec(
+            intermediate_size=self.intermediate_size,
+            activation=types.Activation.GELU_EXACT,
+            gate_kind=types.GateKind.GELU_ONLY,
+            fused_gate_up=False,
+            gate_bias=False, up_bias=False, down_bias=False,
+        )
+
+    def to_norm_spec(self) -> specs.NormSpec:
+        """MPT LayerNorm with bias=None (`norm_1.bias = None`).
+        Source: modeling_mpt.py:163-165."""
+        return specs.NormSpec(
+            kind=types.NormKind.LAYER,
+            eps=self.layer_norm_epsilon,
+            has_bias=False,
+        )
+
+    def to_block_spec(self) -> specs.DecoderBlockSpec:
+        """MPT decoder block — sequential PRE-norm with LayerNorm-no-bias and
+        ungated GELU FFN. Source: modeling_mpt.py:158-212."""
+        norm_spec = self.to_norm_spec()
+        return specs.DecoderBlockSpec(
+            attn_norm_position=types.NormPosition.PRE,
+            ffn_norm_position=types.NormPosition.PRE,
+            token_mixer=self.to_attention_spec(),
+            channel_mixer=self.to_ffn_spec(),
+            pre_attn_norm=norm_spec,
+            pre_ffn_norm=norm_spec,
+        )
+
     def to_attention_spec(self) -> specs.AttentionSpec:
         """The MPT attention sublayer — ALiBi-only, MHA, fused-then-split
         Q/K/V on the IR side. Source: modeling_mpt.py:65-134."""

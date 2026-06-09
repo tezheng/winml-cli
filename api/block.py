@@ -93,8 +93,8 @@ class DecoderBlock(nn.Module):
         if spec.attn_norm_position == types.NormPosition.PRE_AND_POST:
             if spec.pre_attn_norm is None or spec.post_attn_norm is None:
                 raise ValueError("PRE_AND_POST attn norm requires pre and post norm specs")
-            self.pre_attn_norm = norm.RMSNorm(spec.pre_attn_norm, hidden_size, dtype=dtype)
-            self.post_attn_sublayer_norm = norm.RMSNorm(spec.post_attn_norm, hidden_size, dtype=dtype)
+            self.pre_attn_norm = norm.build_norm(spec.pre_attn_norm, hidden_size, dtype=dtype)
+            self.post_attn_sublayer_norm = norm.build_norm(spec.post_attn_norm, hidden_size, dtype=dtype)
         elif spec.attn_norm_position == types.NormPosition.POST:
             # B3 POST (OLMo 2): NO pre-norm; post-norm wraps the attention output
             # before the residual add. Source: modeling_olmo2.py:315-326.
@@ -106,11 +106,11 @@ class DecoderBlock(nn.Module):
                     "(OLMo 2 has only one norm per sublayer, post-side)"
                 )
             self.pre_attn_norm = None
-            self.post_attn_sublayer_norm = norm.RMSNorm(spec.post_attn_norm, hidden_size, dtype=dtype)
+            self.post_attn_sublayer_norm = norm.build_norm(spec.post_attn_norm, hidden_size, dtype=dtype)
         else:  # PRE
             if spec.pre_attn_norm is None:
                 raise ValueError("PRE attn-norm requires pre_attn_norm")
-            self.pre_attn_norm = norm.RMSNorm(spec.pre_attn_norm, hidden_size, dtype=dtype)
+            self.pre_attn_norm = norm.build_norm(spec.pre_attn_norm, hidden_size, dtype=dtype)
             self.post_attn_sublayer_norm = None
 
         if self._is_ssm_block:
@@ -135,8 +135,8 @@ class DecoderBlock(nn.Module):
         elif spec.ffn_norm_position == types.NormPosition.PRE_AND_POST:
             if spec.pre_ffn_norm is None or spec.post_ffn_norm is None:
                 raise ValueError("PRE_AND_POST ffn norm requires pre and post norm specs")
-            self.pre_ffn_norm = norm.RMSNorm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
-            self.post_ffn_sublayer_norm = norm.RMSNorm(spec.post_ffn_norm, hidden_size, dtype=dtype)
+            self.pre_ffn_norm = norm.build_norm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
+            self.post_ffn_sublayer_norm = norm.build_norm(spec.post_ffn_norm, hidden_size, dtype=dtype)
         elif spec.ffn_norm_position == types.NormPosition.POST:
             # B3 POST (OLMo 2): NO pre-norm on FFN. Source: modeling_olmo2.py:329-332.
             if spec.post_ffn_norm is None:
@@ -146,7 +146,7 @@ class DecoderBlock(nn.Module):
                     "POST ffn-norm must not also set pre_ffn_norm"
                 )
             self.pre_ffn_norm = None
-            self.post_ffn_sublayer_norm = norm.RMSNorm(spec.post_ffn_norm, hidden_size, dtype=dtype)
+            self.post_ffn_sublayer_norm = norm.build_norm(spec.post_ffn_norm, hidden_size, dtype=dtype)
         elif spec.block_layout == types.BlockLayout.PARALLEL:
             # v5-phase2 V2: PARALLEL block uses the shared pre_attn_norm
             # as the input to BOTH attn and FFN — pre_ffn_norm MUST be
@@ -161,7 +161,7 @@ class DecoderBlock(nn.Module):
         else:  # PRE
             if spec.pre_ffn_norm is None:
                 raise ValueError("PRE ffn-norm requires pre_ffn_norm")
-            self.pre_ffn_norm = norm.RMSNorm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
+            self.pre_ffn_norm = norm.build_norm(spec.pre_ffn_norm, hidden_size, dtype=dtype)
             self.post_ffn_sublayer_norm = None
 
         # B5: dense FFN vs MoE dispatch. The attribute name `feedforward`

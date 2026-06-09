@@ -41,9 +41,13 @@ class FeedForward(nn.Module):
         # `transformers/models/bitnet/modeling_bitnet.py:70-77`
         # (BitNetMLP with gate_proj/up_proj/down_proj + act_fn applied
         # to the gate path).
-        if spec.gate_kind not in (types.GateKind.SWIGLU, types.GateKind.GEGLU):
+        if spec.gate_kind not in (
+            types.GateKind.SWIGLU,
+            types.GateKind.GEGLU,
+            types.GateKind.GELU_ONLY,
+        ):
             raise NotImplementedError(
-                f"B0.5: SWIGLU and GEGLU only, got {spec.gate_kind}"
+                f"v6 A1: SWIGLU, GEGLU, and GELU_ONLY only, got {spec.gate_kind}"
             )
         if spec.gate_kind == types.GateKind.SWIGLU and spec.activation not in (
             types.Activation.SILU, types.Activation.RELU2,
@@ -55,9 +59,41 @@ class FeedForward(nn.Module):
             raise NotImplementedError(
                 f"B0.5: GEGLU requires GELU activation, got {spec.activation}"
             )
+        if spec.gate_kind == types.GateKind.GELU_ONLY and spec.activation != types.Activation.GELU_EXACT:
+            # v6 A1: MPT (modeling_mpt.py:143 `nn.GELU(approximate='none')`)
+            # and Falcon-7B (configuration_falcon.py:88 `activation='gelu'`,
+            # routed via get_activation('gelu') → nn.GELU(approximate='none'))
+            # both use the EXACT (erf-based) GELU, not the tanh approximation.
+            raise NotImplementedError(
+                f"v6 A1: GELU_ONLY requires GELU_EXACT activation, got {spec.activation}"
+            )
+        if spec.gate_kind == types.GateKind.GELU_ONLY and spec.fused_gate_up:
+            raise NotImplementedError(
+                "v6 A1: GELU_ONLY is an UNGATED FFN — fused_gate_up has no meaning"
+            )
         self.spec = spec
         self.hidden_size = hidden_size
         I = spec.intermediate_size
+        # v6 A1: GELU_ONLY (MPT, Falcon-7B). Ungated FFN: up_proj -> exact GELU
+        # -> down_proj. No gate_proj. Source:
+        # - modeling_mpt.py:137-155 (MptMLP — `up_proj`, `GELU(approximate='none')`,
+        #   `down_proj`)
+        # - modeling_falcon.py:531-544 (FalconMLP — `dense_h_to_4h`,
+        #   `act = get_activation('gelu')`, `dense_4h_to_h`)
+        # The HF Falcon FalconMLP uses the same dense_h_to_4h/dense_4h_to_h
+        # names but the math is identical to MPT's up_proj/down_proj.
+        if spec.gate_kind == types.GateKind.GELU_ONLY:
+            self.gate_up_proj = None
+            self.gate_proj = None
+            self.up_proj = nn.Linear(hidden_size, I, bias=spec.up_bias, dtype=dtype)
+            self.down_proj = nn.Linear(I, hidden_size, bias=spec.down_bias, dtype=dtype)
+            if spec.ffn_sub_norm is not None:
+                raise NotImplementedError(
+                    "v6 A1: GELU_ONLY + ffn_sub_norm is not in BitNet's mixing — "
+                    "no upstream pairing observed."
+                )
+            self.ffn_sub_norm = None
+            return
         if spec.fused_gate_up:
             # B2a: Phi-3 fused gate/up — one big projection of size 2*I,
             # chunked at forward time. Source: modeling_phi3.py:54 (
@@ -87,6 +123,10 @@ class FeedForward(nn.Module):
             self.ffn_sub_norm = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # v6 A1: GELU_ONLY ungated path — MPT/Falcon-7B.
+        if self.spec.gate_kind == types.GateKind.GELU_ONLY:
+            # exact GELU = F.gelu(x, approximate='none') — see ops.gelu_exact.
+            return self.down_proj(ops.gelu_exact(self.up_proj(x)))
         if self.spec.fused_gate_up:
             # Phi-3 order: chunk(2, dim=-1) → (gate, up) — verify modeling_phi3.py:61.
             up_states = self.gate_up_proj(x)

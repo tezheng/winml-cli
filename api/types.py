@@ -102,9 +102,16 @@ class BlockLayout(Enum):
 
 class Activation(Enum):
     SILU = auto()
-    GELU = auto()
+    GELU = auto()            # Used by GEGLU (Gemma) — internally dispatches to
+                             # gelu_pytorch_tanh. Historic naming kept for
+                             # back-compat.
     GEGELU = auto()
     RELU2 = auto()
+    GELU_EXACT = auto()      # GELU "exact" — nn.GELU(approximate='none').
+                             # Used by MPT, Falcon-7B for the ungated GELU
+                             # FFN path (GateKind.GELU_ONLY).
+                             # Source: modeling_mpt.py:143 (`nn.GELU(approximate='none')`)
+                             # and configuration_falcon.py:88 (`activation='gelu'`).
 
 
 class GateKind(Enum):

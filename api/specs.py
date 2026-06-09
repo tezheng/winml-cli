@@ -17,6 +17,14 @@ class NormSpec:
     eps: float
     weight_mode: types.NormWeightMode = types.NormWeightMode.STANDARD_W
 
+    # v6 A1/A2: LayerNorm bias. Only meaningful when `kind == LAYER`. MPT
+    # sets `norm_1.bias = None` (no bias), Falcon-7B's `LayerNorm(.., eps=..)`
+    # uses bias=True (default). RMSNorm has no bias concept — this field is
+    # ignored for `kind == RMS`. Source:
+    #   - modeling_mpt.py:163, 165 (`LayerNorm(hidden_size, eps=..); norm_1.bias = None`)
+    #   - modeling_falcon.py:574, 578 (`LayerNorm(hidden_size, eps=...)` -> bias=True)
+    has_bias: bool = True
+
 
 @dataclass(frozen=True)
 class Llama3RoPEParams:
