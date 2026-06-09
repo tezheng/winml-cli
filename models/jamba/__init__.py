@@ -1,24 +1,28 @@
-"""Jamba (ai21labs/Jamba-v0.1) — DEFERRED — pending B7+ follow-up.
+"""Jamba (ai21labs) family — Mamba-1 + attention alternation (v6 B2).
 
-Reason: Jamba uses **Mamba-1** selective scan, NOT Mamba-2 SSD. Specifically:
-- Mamba-1 has a LEARNED dt projection (`dt_proj: Linear(time_step_rank ->
-  d_inner)`) instead of Mamba-2's per-head dt scalar in `in_proj`.
-- A_log is per-channel `[d_inner]`, not per-head `[num_heads]`.
-- D is per-channel `[d_inner]`, not per-head `[num_heads]`.
-- The selective scan is the original recurrent form, NOT the SSD
-  chunk-parallel form we implemented in api/ops.selective_scan.
+Architectural alternation:
+- attention at layer indices where `i % attn_layer_period == attn_layer_offset`
+  (default period=8, offset=4 → layers 4, 12, 20, ...).
+- mamba (Mamba-1) at every other layer.
 
-Source: transformers/models/jamba/modeling_jamba.py:202-460 (JambaMambaMixer)
-and configuration_jamba.py:75-86 (no `mamba_n_heads`/`mamba_n_groups`/
-`mamba_chunk_size`/`mamba_d_head` — the structural absences confirm
-Mamba-1 form).
+Mamba layers use Mamba-1 selective scan with Jamba's intra-mixer
+LayerNorms on dt/B/C (modeling_jamba.py:249-251, 324-326).
 
-Implementing Mamba-1 requires:
-1. A separate `selective_scan_mamba1(x, A, B, C, D, dt)` op that runs the
-   per-time-step recurrence (NOT the SSD chunk form).
-2. A `Mamba1Mixer` class in api/ssm.py with `dt_proj`, full-d_inner A_log,
-   and per-channel D.
+Attention layers have NO rotary embedding — Jamba relies on the
+recurrent Mamba layers for positional information. The HF
+`apply_rotary_pos_emb` function is defined but NEVER CALLED in
+JambaAttention.forward (modeling_jamba.py:165-199).
 
-Recommended for the B7+ follow-up. Spec: research/05-kvcache-attention.v3.md
-section on Mamba-1.
+v6 B2 lands the DENSE-only Jamba path. The MoE branch (when
+`config.layers_num_experts[i] > 1`) is DEFERRED — Mamba+MoE composition
+needs a Jamba-specific JambaSparseMoeBlock router (no scaling,
+hidden_states dtype). See `models/jamba/__init__.py` for follow-ups.
+
+Source: `transformers/models/jamba/modeling_jamba.py`:
+- 56-74 (JambaRMSNorm)
+- 122-199 (JambaAttention — no rotary)
+- 202-474 (JambaMambaMixer with dt/B/C layernorms)
+- 477-490 (JambaMLP — standard SwiGLU)
+- 533-567 (JambaSparseMoeBlock — DEFERRED in B2)
+- 570-638 (JambaAttentionDecoderLayer / JambaMambaDecoderLayer)
 """
