@@ -183,11 +183,33 @@ class MoE(nn.Module):
             "softmax",
             "sigmoid_plus_bias",
             "topk_then_softmax_with_bias",
+            "hash",
         ):
             raise NotImplementedError(
-                f"B5/v6 A3: router_kind must be 'softmax', 'sigmoid_plus_bias' "
-                f"or 'topk_then_softmax_with_bias', got {spec.router_kind!r}"
+                f"B5/v6 A3/v7 P1: router_kind must be 'softmax', "
+                f"'sigmoid_plus_bias', 'topk_then_softmax_with_bias', or 'hash', "
+                f"got {spec.router_kind!r}"
             )
+        if spec.router_kind == "hash":
+            # v7 P1: hash routing requires a vocab size for the `tid2eid`
+            # buffer. Group routing is incompatible with hash (selection is
+            # deterministic, not score-driven). Source:
+            # modeling_deepseek_v4.py:1067.
+            if spec.hash_vocab_size is None or spec.hash_vocab_size <= 0:
+                raise ValueError(
+                    "router_kind='hash' requires hash_vocab_size > 0 "
+                    "(size of the tid2eid token-id → expert-id table)"
+                )
+            if spec.group_routing is not None:
+                raise NotImplementedError(
+                    "router_kind='hash' is incompatible with group_routing "
+                    "(hash selection is deterministic)"
+                )
+            if spec.hash_score_fn != "sigmoid":
+                raise NotImplementedError(
+                    f"router_kind='hash' only supports score_fn='sigmoid' "
+                    f"(DeepSeek-V4 default), got {spec.hash_score_fn!r}"
+                )
         if spec.expert_ffn is None:
             raise ValueError("MoESpec.expert_ffn is required")
         ffn = spec.expert_ffn
@@ -246,6 +268,18 @@ class MoE(nn.Module):
                 "e_score_correction_bias",
                 torch.zeros(0, dtype=torch.float32),
                 persistent=False,
+            )
+        elif spec.router_kind == "hash":
+            # v7 P1: DeepSeek-V4 hash router — Parameter `weight` (per-expert
+            # scoring head) + Buffer `tid2eid` (token-id → top_k experts).
+            # Source: modeling_deepseek_v4.py:1059-1067 (DeepseekV4HashRouter
+            # init).
+            self.gate = _HashRouter(
+                n_experts=spec.n_experts,
+                hidden_size=hidden_size,
+                vocab_size=spec.hash_vocab_size,
+                top_k=spec.top_k,
+                dtype=dtype,
             )
         else:  # sigmoid_plus_bias
             # V3 router: a small nn.Module wrapping nn.Parameter weight +
@@ -410,6 +444,48 @@ class MoE(nn.Module):
         topk_w = topk_w * self.routed_scaling_factor
         return topk_idx, topk_w
 
+    def _route_hash(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """v7 P1: DeepSeek-V4 hash router.
+
+        Source: modeling_deepseek_v4.py:1069-1078.
+
+            logits = F.linear(flat, self.weight)
+            scores = self.score_fn(logits)                  # sigmoid
+            indices = self.tid2eid[input_ids.reshape(-1)].long()
+            weights = scores.gather(1, indices)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            return logits, weights * self.routed_scaling_factor, indices
+
+        `input_ids` must be a LongTensor whose first dim flattens to N (==B*S);
+        the routing decision per token is purely deterministic from the
+        token id.
+        """
+        if input_ids is None:
+            raise ValueError("router_kind='hash' requires input_ids in forward")
+        ids_flat = input_ids.reshape(-1).long()
+        N_router = ids_flat.shape[0]
+        N_x = x.shape[0]
+        if N_router != N_x:
+            raise ValueError(
+                f"hash routing: input_ids has {N_router} tokens but "
+                f"hidden_states has {N_x}; counts must match"
+            )
+        # Scoring head: sigmoid over per-expert logits. We mirror HF's path
+        # exactly — no fp32 upcast (the V4 router runs in the activation
+        # dtype unlike V3's sigmoid_plus_bias).
+        logits = F.linear(x, self.gate.weight)               # [N, E]
+        scores = torch.sigmoid(logits)
+        topk_idx = self.gate.tid2eid[ids_flat].long()        # [N, top_k]
+        topk_w = scores.gather(1, topk_idx)
+        denom = topk_w.sum(dim=-1, keepdim=True) + 1e-20
+        topk_w = topk_w / denom
+        topk_w = topk_w * self.routed_scaling_factor
+        return topk_idx, topk_w
+
     def _route_topk_then_softmax_with_bias(
         self, x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -517,8 +593,14 @@ class MoE(nn.Module):
             out.index_add_(0, tok_idx, out_e.to(out.dtype))
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # x: [B, S, hidden]
+        # input_ids: [B, S] long — REQUIRED for router_kind='hash', ignored
+        #   otherwise. v7 P1: source modeling_deepseek_v4.py:1089-1098.
         residuals = x
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
@@ -527,6 +609,8 @@ class MoE(nn.Module):
             topk_idx, topk_w = self._route_softmax(x_flat)
         elif self.spec.router_kind == "sigmoid_plus_bias":
             topk_idx, topk_w = self._route_sigmoid_plus_bias(x_flat)
+        elif self.spec.router_kind == "hash":
+            topk_idx, topk_w = self._route_hash(x_flat, input_ids)
         else:  # topk_then_softmax_with_bias
             topk_idx, topk_w = self._route_topk_then_softmax_with_bias(x_flat)
         # IMPORTANT: HF runs experts on the BF16/FP32 hidden states (the
@@ -563,6 +647,43 @@ class _SigmoidRouter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # HF: F.linear(x.fp32, weight.fp32) — see modeling_deepseek_v3.py:150.
         return F.linear(x.float(), self.weight.float())
+
+
+class _HashRouter(nn.Module):
+    """v7 P1: DeepSeek-V4 hash router gate.
+
+    Mirrors HF state-dict keys exactly:
+        - `gate.weight`: Parameter [n_experts, hidden] — per-expert score head.
+        - `gate.tid2eid`: Buffer [vocab_size, top_k] long — frozen token-id →
+          expert-id table loaded from checkpoint.
+
+    Source: modeling_deepseek_v4.py:1059-1067.
+    """
+
+    def __init__(
+        self,
+        n_experts: int,
+        hidden_size: int,
+        vocab_size: int,
+        top_k: int,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(n_experts, hidden_size, dtype=dtype))
+        # tid2eid: persistent buffer carrying the frozen routing table; loaded
+        # from the checkpoint at runtime. Initialised to zeros — HF zeros
+        # this on init too (see modeling_deepseek_v4.py:1234).
+        self.register_buffer(
+            "tid2eid",
+            torch.zeros(vocab_size, top_k, dtype=torch.long),
+            persistent=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Provided for parity with the other gates; the MoE class calls
+        # F.linear directly via `_route_hash`. (HF's HashRouter.forward
+        # also returns logits, but the production path slices through it.)
+        return F.linear(x, self.weight)
 
 
 class _BiasedLinearRouter(nn.Module):

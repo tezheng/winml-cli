@@ -227,6 +227,7 @@ class DecoderBlock(nn.Module):
         per_layer_input: Optional[torch.Tensor] = None,
         vision_token_count: Optional[int] = None,
         kv_shared: Optional[tuple] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward.
 
@@ -285,7 +286,12 @@ class DecoderBlock(nn.Module):
                     "PARALLEL block_layout uses one shared pre-norm; "
                     "pre_ffn_norm must be None"
                 )
-            ffn_out = self.feedforward(attn_in)
+            # v7 P1: pass input_ids to MoE for hash routing. FeedForward
+            # ignores the kwarg via signature compatibility (it takes only x).
+            if isinstance(self.feedforward, feedforward.MoE):
+                ffn_out = self.feedforward(attn_in, input_ids=input_ids)
+            else:
+                ffn_out = self.feedforward(attn_in)
             if self.post_ffn_sublayer_norm is not None:
                 ffn_out = self.post_ffn_sublayer_norm(ffn_out)
             if self._residual_scale is not None:
@@ -302,7 +308,11 @@ class DecoderBlock(nn.Module):
                     ffn_in = self.pre_ffn_norm(x)
                 else:
                     ffn_in = x
-                ffn_out = self.feedforward(ffn_in)
+                # v7 P1: thread input_ids for hash-routing MoE.
+                if isinstance(self.feedforward, feedforward.MoE):
+                    ffn_out = self.feedforward(ffn_in, input_ids=input_ids)
+                else:
+                    ffn_out = self.feedforward(ffn_in)
                 if self.post_ffn_sublayer_norm is not None:
                     ffn_out = self.post_ffn_sublayer_norm(ffn_out)
                 if self._residual_scale is not None:

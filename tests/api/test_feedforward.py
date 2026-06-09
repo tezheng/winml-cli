@@ -309,3 +309,170 @@ def test_b5_moe_no_router_norm_v2_default():
     assert torch.allclose(w, ref_w, atol=1e-6)
     # Sanity: w does not sum to 1 across slots.
     assert not torch.allclose(w.sum(-1), torch.ones(4), atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# v7 P1: DeepSeek-V4 hash routing tests
+# ---------------------------------------------------------------------------
+
+
+def test_v7_p1_hash_router_shapes_and_buffers():
+    """v7 P1: hash router exposes Parameter `weight` + Buffer `tid2eid`.
+
+    Source: modeling_deepseek_v4.py:1059-1067.
+    """
+    V, E, K, H = 32, 6, 2, 8
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="hash", hash_vocab_size=V,
+        expert_ffn=_moe_expert_ffn(I=12),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    assert hasattr(moe.gate, "weight")
+    assert hasattr(moe.gate, "tid2eid")
+    assert moe.gate.weight.shape == (E, H)
+    assert moe.gate.tid2eid.shape == (V, K)
+    assert moe.gate.tid2eid.dtype == torch.long
+    # No e_score_correction_bias (the hash router has none).
+    assert not hasattr(moe.gate, "e_score_correction_bias")
+
+
+def test_v7_p1_hash_routing_deterministic_per_token_id():
+    """v7 P1: same token id → same expert selection regardless of hidden state.
+
+    The whole point of hash routing is that `tid2eid[input_ids]` is the WHICH;
+    only the per-expert WEIGHT gathered from `sigmoid(F.linear(x, weight))`
+    varies with x. Two different hidden states with the same input_ids must
+    select the same expert indices.
+
+    Source: modeling_deepseek_v4.py:1075.
+    """
+    torch.manual_seed(7)
+    V, E, K, H = 16, 4, 2, 6
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="hash", hash_vocab_size=V,
+        expert_ffn=_moe_expert_ffn(I=8),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        # Populate the tid2eid table deterministically.
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        for t in range(V):
+            moe.gate.tid2eid[t, 0] = t % E
+            moe.gate.tid2eid[t, 1] = (t + 1) % E
+
+    input_ids = torch.tensor([[0, 5, 10]], dtype=torch.long)
+    x1 = torch.randn(1, 3, H)
+    x2 = torch.randn(1, 3, H)
+    idx1, _ = moe._route_hash(x1.reshape(-1, H), input_ids)
+    idx2, _ = moe._route_hash(x2.reshape(-1, H), input_ids)
+    assert torch.equal(idx1, idx2), "hash routing must depend only on input_ids"
+    # And the expected table values.
+    expected = torch.tensor(
+        [[0 % E, 1 % E],
+         [5 % E, 6 % E],
+         [10 % E, 11 % E]],
+        dtype=torch.long,
+    )
+    assert torch.equal(idx1, expected)
+
+
+def test_v7_p1_hash_routing_weights_from_sigmoid_then_normed():
+    """v7 P1: hash router weights = sigmoid(F.linear(x, W)).gather(idx),
+    then renormed to sum-1 across the top_k axis, then scaled by
+    routed_scaling_factor.
+
+    Source: modeling_deepseek_v4.py:1073-1078.
+    """
+    torch.manual_seed(11)
+    V, E, K, H = 8, 4, 2, 4
+    scale = 1.3
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="hash", hash_vocab_size=V,
+        routed_scaling_factor=scale,
+        expert_ffn=_moe_expert_ffn(I=4),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        for t in range(V):
+            moe.gate.tid2eid[t, 0] = t % E
+            moe.gate.tid2eid[t, 1] = (t + 2) % E
+
+    input_ids = torch.tensor([[1, 3, 5, 7]], dtype=torch.long)
+    x = torch.randn(1, 4, H)
+    x_flat = x.reshape(-1, H)
+    idx, w = moe._route_hash(x_flat, input_ids)
+
+    # Reference inline matching HF L1073-1078.
+    logits = F.linear(x_flat, moe.gate.weight)
+    scores = torch.sigmoid(logits)
+    expected_idx = moe.gate.tid2eid[input_ids.reshape(-1)].long()
+    expected_w = scores.gather(1, expected_idx)
+    expected_w = expected_w / (expected_w.sum(dim=-1, keepdim=True) + 1e-20)
+    expected_w = expected_w * scale
+    assert torch.equal(idx, expected_idx)
+    assert torch.allclose(w, expected_w, atol=1e-6)
+    # Sum-to-1 (modulo scale).
+    assert torch.allclose(w.sum(dim=-1), torch.full((4,), scale), atol=1e-5)
+
+
+def test_v7_p1_hash_moe_forward_runs_with_input_ids():
+    """v7 P1: full MoE forward dispatches experts when input_ids supplied."""
+    torch.manual_seed(13)
+    V, E, K, H = 10, 4, 2, 6
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=1,
+        router_kind="hash", hash_vocab_size=V,
+        expert_ffn=_moe_expert_ffn(I=8),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        nn.init.normal_(moe.experts_gate_up, std=0.05)
+        nn.init.normal_(moe.experts_down, std=0.05)
+        # Distribute tids across experts so every expert is hit.
+        for t in range(V):
+            moe.gate.tid2eid[t, 0] = t % E
+            moe.gate.tid2eid[t, 1] = (t + 1) % E
+
+    input_ids = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
+    x = torch.randn(1, 5, H)
+    out = moe(x, input_ids=input_ids)
+    assert out.shape == (1, 5, H)
+    assert torch.isfinite(out).all()
+
+
+def test_v7_p1_hash_router_requires_vocab_size():
+    """v7 P1: spec validation — router_kind='hash' without vocab size raises."""
+    spec = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=0,
+        router_kind="hash",  # missing hash_vocab_size
+        expert_ffn=_moe_expert_ffn(I=4),
+    )
+    try:
+        feedforward.MoE(spec, hidden_size=6, dtype=torch.float32)
+    except ValueError as e:
+        assert "hash_vocab_size" in str(e)
+    else:
+        raise AssertionError("expected ValueError for missing hash_vocab_size")
+
+
+def test_v7_p1_hash_router_forward_requires_input_ids():
+    """v7 P1: calling MoE.forward without input_ids when router='hash' raises."""
+    V, E, K, H = 8, 4, 2, 4
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="hash", hash_vocab_size=V,
+        expert_ffn=_moe_expert_ffn(I=4),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    x = torch.randn(1, 3, H)
+    try:
+        moe(x)  # no input_ids
+    except ValueError as e:
+        assert "input_ids" in str(e)
+    else:
+        raise AssertionError("expected ValueError for missing input_ids")

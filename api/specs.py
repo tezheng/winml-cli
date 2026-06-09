@@ -477,11 +477,29 @@ class MoESpec:
     n_experts: int
     top_k: int
     n_shared_experts: int = 0
-    router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias" | "topk_then_softmax_with_bias"
+    # v7 P1: router_kind="hash" — DeepSeek-V4 hash routing. Expert selection is
+    # determined by a frozen `tid2eid[input_ids]` lookup (token-id → expert-id
+    # table) instead of a learned argmax / top-k from logits. The learned gate
+    # weight still produces the per-expert scores that weight the SELECTED
+    # experts' activations; only WHICH experts is static. Source:
+    # `transformers/models/deepseek_v4/modeling_deepseek_v4.py:1050-1078`
+    # (DeepseekV4HashRouter).
+    router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias" | "topk_then_softmax_with_bias" | "hash"
     router_norm: bool = False         # V3 norm_topk_prob: renorm top-k weights to sum 1
     group_routing: Optional[GroupRoutingSpec] = None
     routed_scaling_factor: float = 1.0
     expert_ffn: Optional[FFNSpec] = None
+
+    # v7 P1: vocabulary size — required only when router_kind == "hash" because
+    # the hash router owns a `tid2eid` buffer of shape [vocab_size, top_k].
+    # Source: modeling_deepseek_v4.py:1067 (`register_buffer("tid2eid",
+    # torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), ...)`).
+    hash_vocab_size: Optional[int] = None
+    # v7 P1: scoring function name for the hash router's per-expert score
+    # head. DeepSeek-V4 uses sigmoid (`config.scoring_func`). Reserved as an
+    # enum-by-string for forward compat — only "sigmoid" is implemented.
+    # Source: modeling_deepseek_v4.py:1065, 1074.
+    hash_score_fn: str = "sigmoid"
 
     # v6 A3: GPT-OSS expert layout — clamped SwiGLU with biased linears.
     # When True, the expert forward uses the GPT-OSS clamped SwiGLU math:
