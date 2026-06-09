@@ -153,6 +153,16 @@ class CacheOwnership(Enum):
 
 class QDType(Enum):
     INT4 = auto()
+    # v6 A4: BitNet b1.58 ternary weights — values in {-1, 0, +1}, i.e.
+    # log2(3) ≈ 1.58 bits per weight. Per-tensor scale (one fp16/bf16
+    # scalar per weight tensor). Packing: 4 ternary values per INT8 in a
+    # base-3 little-endian encoding (a0 + 3*a1 + 9*a2 + 27*a3 where each
+    # ai ∈ {0, 1, 2} ↔ {-1, 0, +1}). 4 * 1.58 ≈ 6.34 bits, fits in 8 bits.
+    # Source: BitNet b1.58 paper (Ma et al. 2024) +
+    # `transformers/models/bitnet/modeling_bitnet.py` (no quant code —
+    # the public checkpoint stores fp16; round-trip math lives here for
+    # IR-coverage and offline compression workflows).
+    TERNARY = auto()
 
 
 class PackingLayout(Enum):

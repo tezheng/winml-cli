@@ -717,3 +717,122 @@ def aqlm_dequantize(*_args, **_kwargs):
         "AQLM additive-codebook dequant is deferred to M3. Reference: "
         "https://github.com/Vahe1994/AQLM — modeling_aqlm.py + inference_kernels/."
     )
+
+
+# ============================================================================
+# BitNet b1.58 ternary
+# ============================================================================
+#
+# Ternary weights: values in {-1, 0, +1}. Encoded as offsets {0, 1, 2} in a
+# base-3 little-endian packing — 4 ternaries per INT8 fits 3^4 = 81 < 256
+# states, well within an INT8.
+#
+# Per-tensor symmetric scale `s` (one fp16/bf16 scalar):
+#     w_quant_offset = (round(w / s) clamped to {-1, 0, 1}) + 1     ∈ {0, 1, 2}
+#     packed[i] = w_q[4i] + 3*w_q[4i+1] + 9*w_q[4i+2] + 27*w_q[4i+3]
+# Dequant:
+#     w_q ∈ {-1, 0, 1} for each ternary slot
+#     w_recon = s * w_q
+#
+# Source: BitNet b1.58 paper. The HF v5.10.2 `modeling_bitnet.py` does NOT
+# carry the quant code (the public checkpoint stores fp16 weights), so this
+# is an IR-only round-trip for offline compression. The reconstructed
+# weight is mathematically lossy (matches HF inference exactly is moot —
+# HF runs fp16). Tolerance: per-element |w_recon - w| <= s (the ternary
+# quant grid spacing), since round() projects to the nearest ternary.
+
+_BASE3_POW = (1, 3, 9, 27)
+
+
+def ternary_quantize(
+    w: torch.Tensor,
+    spec: "specs.QuantSpec",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``w`` to BitNet ternary {-1, 0, +1} with per-tensor scale.
+
+    Args:
+        w: any-shape fp tensor.
+        spec: QuantSpec with qdtype=TERNARY, group_size=None (per-tensor),
+            has_zero_point=False (symmetric), packing=NONE.
+
+    Returns:
+        (packed_int8, scale)
+            packed_int8: int8 tensor with the LAST dim divided by 4 (the
+                packing axis). For a 2D `w` of shape [M, K] with K divisible
+                by 4, packed has shape [M, K // 4].
+            scale: a 0-dim fp tensor (per-tensor).
+
+    The scale `s` is chosen as `mean(|w|)` — the BitNet b1.58 paper's
+    canonical absmean per-tensor quant. Empirically this minimizes the
+    expected L1 dequant error under uniform-ish weight distributions.
+    """
+    if spec.qdtype != types.QDType.TERNARY:
+        raise ValueError(f"ternary_quantize requires TERNARY, got {spec.qdtype}")
+    if spec.group_size is not None:
+        raise NotImplementedError(
+            "ternary_quantize: only per-tensor scaling (group_size=None) supported"
+        )
+    if spec.has_zero_point:
+        raise ValueError("ternary is symmetric — has_zero_point must be False")
+    if spec.packing != types.PackingLayout.NONE:
+        # PackingLayout.NONE for our spec; the packing is fixed-format
+        # base-3 little-endian inside this function.
+        raise ValueError(f"ternary packing must be NONE in spec, got {spec.packing}")
+
+    if w.shape[-1] % 4 != 0:
+        raise ValueError(
+            f"ternary_quantize: last dim ({w.shape[-1]}) must be divisible by 4"
+        )
+
+    w32 = w.float()
+    # BitNet b1.58 absmean scale.
+    s = w32.abs().mean()
+    if s.item() == 0.0:
+        # Degenerate all-zero weight: any positive scale works; pick 1.0.
+        s = torch.tensor(1.0, dtype=torch.float32)
+
+    # Quantize: round(w / s), clamp to {-1, 0, 1}.
+    q = torch.clamp(torch.round(w32 / s), -1, 1).to(torch.int8)
+
+    # Offset to {0, 1, 2} for packing.
+    qo = (q + 1).to(torch.int32)
+    # Reshape last dim into groups of 4.
+    leading = qo.shape[:-1]
+    K = qo.shape[-1]
+    qo = qo.reshape(*leading, K // 4, 4)
+    weights = torch.tensor(_BASE3_POW, dtype=torch.int32, device=qo.device)
+    packed = (qo * weights).sum(dim=-1).to(torch.int8)
+    return packed, s.to(spec.scale_dtype)
+
+
+def ternary_dequantize(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    K: int,
+) -> torch.Tensor:
+    """Inverse of :func:`ternary_quantize`.
+
+    Args:
+        packed: int8 tensor with last dim K // 4.
+        scale: per-tensor scale (scalar fp tensor).
+        K: original last-dim length (must equal 4 * packed.shape[-1]).
+
+    Returns:
+        fp32 tensor with last dim K, values in {-s, 0, +s}.
+    """
+    if packed.shape[-1] * 4 != K:
+        raise ValueError(
+            f"ternary_dequantize: K={K} mismatches packed last dim "
+            f"{packed.shape[-1]}*4"
+        )
+    p32 = packed.to(torch.int32) & 0xFF
+    # Unpack base-3 little-endian.
+    a0 = p32 % 3
+    a1 = (p32 // 3) % 3
+    a2 = (p32 // 9) % 3
+    a3 = (p32 // 27) % 3
+    leading = packed.shape[:-1]
+    qo = torch.stack([a0, a1, a2, a3], dim=-1).reshape(*leading, K)
+    # Offset back from {0, 1, 2} to {-1, 0, 1}.
+    q = qo - 1
+    return q.float() * scale.float()
