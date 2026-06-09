@@ -355,7 +355,8 @@ class ConvSpec:
 class SSMSpec:
     """Mamba-1 SSM (state-space) parameters.
 
-    Used directly by Mamba-1 models; embedded as `SSDSpec.base` for Mamba-2.
+    Used directly by Mamba-1 models (v6 B1 forward); embedded as
+    `SSDSpec.base` for Mamba-2.
 
     For Mamba-2, several of these fields carry duplicate meaning at the
     SSDSpec layer (`d_inner`, `d_state`, `d_conv`); the SSDSpec is the
@@ -363,9 +364,10 @@ class SSMSpec:
     inside is a convenient carrier for the per-head time-step / activation
     defaults.
 
-    Source: `modeling_mamba2.py:121-220` (Mamba2Mixer init).
+    Source: `modeling_mamba.py:58-120` (MambaMixer init — Mamba-1) and
+    `modeling_mamba2.py:121-220` (Mamba2Mixer init — Mamba-2).
     """
-    d_state: int                       # state_size in HF config (default 128 for Mamba-2)
+    d_state: int                       # state_size in HF config (default 16 for Mamba-1, 128 for Mamba-2)
     d_conv: int                        # conv_kernel in HF config (default 4)
     d_inner: int                       # intermediate_size = hidden * expand
     expand_factor: int = 2
@@ -375,6 +377,25 @@ class SSMSpec:
     conv_bias: bool = True
     bias: bool = False
     activation: types.Activation = types.Activation.SILU
+
+    # v6 B1: SSMKind dispatcher. MAMBA2_SSD is implied when this SSMSpec is
+    # carried inside an SSDSpec (B7 SSD path doesn't read this field).
+    # MAMBA1 selects the selective-scan reference forward + Mamba-1 shapes
+    # (per-channel A_log, learned dt_proj). Default is MAMBA2_SSD for
+    # backward-compat with the B7 SSDSpec carriers.
+    kind: types.SSMKind = types.SSMKind.MAMBA2_SSD
+
+    # v6 B1: Mamba-1 dt-rank (delta time step). Required when kind=MAMBA1.
+    # `dt_proj` is `Linear(dt_rank, d_inner, bias=True)`.
+    # Source: modeling_mamba.py:73, 96.
+    dt_rank: Optional[int] = None
+
+    # v6 B1: Jamba adds intra-mixer norms to dt, B, C. Each is a RMSNorm
+    # on the per-token vector (dim = dt_rank, d_state, d_state). When None,
+    # no norms are inserted. Source: modeling_jamba.py:249-251, 324-326.
+    dt_layernorm: Optional[NormSpec] = None
+    b_layernorm: Optional[NormSpec] = None
+    c_layernorm: Optional[NormSpec] = None
 
 
 @dataclass(frozen=True)

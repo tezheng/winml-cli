@@ -550,6 +550,85 @@ def _segment_sum(input_tensor: torch.Tensor) -> torch.Tensor:
     return tensor_segsum
 
 
+def selective_scan_mamba1(
+    hidden_states: torch.Tensor,    # [B, d_inner, S]
+    discrete_time_step: torch.Tensor,  # [B, d_inner, S] after softplus(dt_proj(dt_seed) + dt_proj.bias)
+    A: torch.Tensor,                # [d_inner, d_state] — typically -exp(A_log)
+    B: torch.Tensor,                # [B, S, d_state]
+    C: torch.Tensor,                # [B, S, d_state]
+    D: torch.Tensor,                # [d_inner]
+    gate: torch.Tensor,             # [B, d_inner, S] — silu(gate) multiplied AFTER scan
+    initial_state: Optional[torch.Tensor] = None,   # [B, d_inner, d_state]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mamba-1 selective_scan reference (pure-PyTorch sequential).
+
+    Faithfully mirrors `transformers/models/mamba/modeling_mamba.py:318-356`
+    (`slow_forward` SSM transformation, lines 318-356):
+
+        discrete_A = exp(A[None,:,None,:] * dt[:,:,:,None])
+        discrete_B = dt[:,:,:,None] * B[:,None,:,:]
+        deltaB_u   = discrete_B * hidden_states[:,:,:,None]
+        ssm_state  = initial_state or zeros
+        for i in 0..S-1:
+            ssm_state = discrete_A[:,:,i] * ssm_state + deltaB_u[:,:,i]
+            y_i       = ssm_state @ C[:,i,:]                    # [B, d_inner]
+        scan_output = stack(y_i, dim=-1)                        # [B, d_inner, S]
+        scan_output = scan_output + hidden_states * D[None,:,None]
+        scan_output = scan_output * silu(gate)
+
+    The sequential loop is O(S * d_state); production would use a fused
+    kernel (mamba_ssm package) but we prefer correctness over speed for
+    the IR reference.
+
+    Returns:
+        scan_output: [B, d_inner, S]
+        ssm_state:   [B, d_inner, d_state]  (final state after S steps)
+    """
+    if hidden_states.dim() != 3:
+        raise ValueError(
+            f"hidden_states must be [B, d_inner, S], got rank {hidden_states.dim()}"
+        )
+    B_n, d_inner, S = hidden_states.shape
+    d_state = A.shape[-1]
+    if A.shape != (d_inner, d_state):
+        raise ValueError(
+            f"A shape {tuple(A.shape)} must be [d_inner, d_state]=({d_inner},{d_state})"
+        )
+
+    h_fp32 = hidden_states.float()
+    dt_fp32 = discrete_time_step.float()
+    # discrete_A: [B, d_inner, S, d_state]
+    discrete_A = torch.exp(A[None, :, None, :] * dt_fp32[:, :, :, None])
+    # discrete_B: [B, d_inner, S, d_state]
+    discrete_B = dt_fp32[:, :, :, None] * B[:, None, :, :].float()
+    deltaB_u = discrete_B * h_fp32[:, :, :, None]
+
+    if initial_state is None:
+        ssm_state = torch.zeros(
+            B_n, d_inner, d_state,
+            device=hidden_states.device, dtype=torch.float32,
+        )
+    else:
+        ssm_state = initial_state.to(torch.float32)
+
+    out_dtype = hidden_states.dtype
+    scan_outputs = []
+    for i in range(S):
+        ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
+        # y_i = ssm_state @ C[:, i, :].unsqueeze(-1)  -> [B, d_inner, 1]
+        # HF uses (ssm_state.to(dtype)) @ C[:, i, :].unsqueeze(-1) so the
+        # cast back to input dtype happens BEFORE the matmul (line 351).
+        y_i = torch.matmul(ssm_state.to(out_dtype), C[:, i, :].unsqueeze(-1))
+        scan_outputs.append(y_i[:, :, 0])
+    scan_output = torch.stack(scan_outputs, dim=-1)              # [B, d_inner, S]
+
+    # D-residual.
+    scan_output = scan_output + hidden_states * D[None, :, None]
+    # Final gate: silu(gate) multiplied elementwise.
+    scan_output = scan_output * F.silu(gate)
+    return scan_output, ssm_state
+
+
 def selective_scan(
     hidden_states: torch.Tensor,    # [B, S, num_heads, head_dim] — discretized x = x * dt
     A: torch.Tensor,                # [B, S, num_heads]           — discretized A = A_log_neg * dt

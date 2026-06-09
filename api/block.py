@@ -59,15 +59,21 @@ class DecoderBlock(nn.Module):
             raise NotImplementedError(
                 f"B3: PRE, PRE_AND_POST, and POST ffn-norm only, got {spec.ffn_norm_position}"
             )
-        # B7: token_mixer can be AttentionSpec or SSDSpec.
-        # AttentionSpec -> api.attention.Attention. SSDSpec -> api.ssm.Mamba2Mixer.
-        # (SSMSpec / Mamba-1 is reserved but not landed in B7.)
-        if not isinstance(spec.token_mixer, (specs.AttentionSpec, specs.SSDSpec)):
+        # B7/v6 B1: token_mixer can be AttentionSpec, SSDSpec (Mamba-2),
+        # or SSMSpec (Mamba-1). AttentionSpec -> api.attention.Attention.
+        # SSDSpec -> api.ssm.Mamba2Mixer. SSMSpec -> api.ssm.Mamba1Mixer
+        # (v6 B1 — requires spec.kind=MAMBA1).
+        if not isinstance(
+            spec.token_mixer,
+            (specs.AttentionSpec, specs.SSDSpec, specs.SSMSpec),
+        ):
             raise NotImplementedError(
-                f"B7: token_mixer must be AttentionSpec or SSDSpec, "
-                f"got {type(spec.token_mixer).__name__}"
+                f"v6 B1: token_mixer must be AttentionSpec, SSDSpec, or "
+                f"SSMSpec, got {type(spec.token_mixer).__name__}"
             )
-        self._is_ssm_block = isinstance(spec.token_mixer, specs.SSDSpec)
+        self._is_ssm_block = isinstance(
+            spec.token_mixer, (specs.SSDSpec, specs.SSMSpec),
+        )
         # B5: channel_mixer can be FFNSpec (dense) OR MoESpec (DeepSeek-V2/V3
         # MoE layers). The DecoderBlock dispatches between FeedForward and
         # MoE based on type. Source: modeling_deepseek_v2.py:404
@@ -114,12 +120,18 @@ class DecoderBlock(nn.Module):
             self.post_attn_sublayer_norm = None
 
         if self._is_ssm_block:
-            # B7: SSM token mixer (Mamba-2). `self.attention` carries the
+            # B7/v6 B1: SSM token mixer — Mamba-2 (SSDSpec) or Mamba-1
+            # (SSMSpec with kind=MAMBA1). `self.attention` carries the
             # mixer for backward-compat with existing factories that index
-            # `blk.attention.*`; for SSM blocks it's a `Mamba2Mixer`.
-            self.attention = _ssm.Mamba2Mixer(
-                spec.token_mixer, hidden_size, dtype=dtype,
-            )
+            # `blk.attention.*`.
+            if isinstance(spec.token_mixer, specs.SSDSpec):
+                self.attention = _ssm.Mamba2Mixer(
+                    spec.token_mixer, hidden_size, dtype=dtype,
+                )
+            else:
+                self.attention = _ssm.Mamba1Mixer(
+                    spec.token_mixer, hidden_size, dtype=dtype,
+                )
         else:
             self.attention = _attention.Attention(spec.token_mixer, hidden_size,
                                                   max_seq=max_seq, dtype=dtype)

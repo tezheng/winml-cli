@@ -90,6 +90,185 @@ class _MambaRMSNormGated(nn.Module):
         return self.weight * x32.to(input_dtype)
 
 
+class Mamba1Mixer(nn.Module):
+    """Mamba-1 selective-scan mixer (v6 B1).
+
+    Layout (`modeling_mamba.py:58-120` MambaMixer init):
+      - in_proj    : Linear(hidden, 2*d_inner, bias=use_bias)
+      - conv1d     : depthwise Conv1d(d_inner, kernel=d_conv,
+                                      groups=d_inner, padding=d_conv-1,
+                                      bias=use_conv_bias)
+      - x_proj     : Linear(d_inner, dt_rank + 2*d_state, bias=False)
+      - dt_proj    : Linear(dt_rank, d_inner, bias=True)
+      - A_log      : Parameter [d_inner, d_state] — A = -exp(A_log)
+      - D          : Parameter [d_inner]
+      - out_proj   : Linear(d_inner, hidden, bias=use_bias)
+
+    Forward (`modeling_mamba.py::MambaMixer.slow_forward` lines 270-363):
+
+        projected = in_proj(x).transpose(1, 2)             # [B, 2*d_inner, S]
+        hidden_states, gate = projected.chunk(2, dim=1)    # each [B, d_inner, S]
+        # conv1d + silu
+        hidden_states = silu(conv1d(hidden_states)[..., :S])
+        # x_proj
+        ssm_params = x_proj(hidden_states.transpose(1, 2))  # [B, S, dt_rank+2*ds]
+        dt, B, C = split(ssm_params, [dt_rank, ds, ds], dim=-1)
+        # Optional dt/B/C layernorms (Jamba — modeling_jamba.py:249-251).
+        dt = dt_proj(dt)                                   # [B, S, d_inner]
+        dt = softplus(dt).transpose(1, 2)                  # [B, d_inner, S]
+        # SSM scan (api.ops.selective_scan_mamba1).
+        y, ssm_state = selective_scan_mamba1(
+            hidden_states, dt, A=-exp(A_log), B, C, D, gate,
+        )
+        out = out_proj(y.transpose(1, 2))                  # [B, S, hidden]
+    """
+
+    def __init__(
+        self,
+        spec: specs.SSMSpec,
+        hidden_size: int,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        if spec.kind != types.SSMKind.MAMBA1:
+            raise ValueError(
+                f"Mamba1Mixer requires spec.kind=MAMBA1, got {spec.kind}"
+            )
+        if spec.dt_rank is None:
+            raise ValueError("Mamba1Mixer requires spec.dt_rank")
+        self.spec = spec
+        self.hidden_size = hidden_size
+        self.d_inner = spec.d_inner
+        self.d_state = spec.d_state
+        self.d_conv = spec.d_conv
+        self.dt_rank = spec.dt_rank
+
+        # in_proj: hidden -> 2 * d_inner (chunk(2) → hidden, gate).
+        self.in_proj = nn.Linear(
+            hidden_size, 2 * self.d_inner, bias=spec.bias, dtype=dtype,
+        )
+
+        # Depthwise conv1d.
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=self.d_conv,
+            groups=self.d_inner,
+            padding=self.d_conv - 1,
+            bias=spec.conv_bias,
+            dtype=dtype,
+        )
+
+        # x_proj: d_inner -> dt_rank + 2*d_state.
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + 2 * self.d_state, bias=False, dtype=dtype,
+        )
+
+        # dt_proj: dt_rank -> d_inner, with bias.
+        self.dt_proj = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, dtype=dtype,
+        )
+
+        # A_log: [d_inner, d_state]; D: [d_inner].
+        self.A_log = nn.Parameter(torch.zeros(self.d_inner, self.d_state, dtype=dtype))
+        self.D = nn.Parameter(torch.ones(self.d_inner, dtype=dtype))
+
+        # out_proj: d_inner -> hidden.
+        self.out_proj = nn.Linear(
+            self.d_inner, hidden_size, bias=spec.bias, dtype=dtype,
+        )
+
+        # v6 B1: optional dt/B/C layernorms (Jamba).
+        if spec.dt_layernorm is not None:
+            from api import norm as _norm
+            self.dt_layernorm = _norm.RMSNorm(spec.dt_layernorm, self.dt_rank, dtype=dtype)
+        else:
+            self.dt_layernorm = None
+        if spec.b_layernorm is not None:
+            from api import norm as _norm
+            self.b_layernorm = _norm.RMSNorm(spec.b_layernorm, self.d_state, dtype=dtype)
+        else:
+            self.b_layernorm = None
+        if spec.c_layernorm is not None:
+            from api import norm as _norm
+            self.c_layernorm = _norm.RMSNorm(spec.c_layernorm, self.d_state, dtype=dtype)
+        else:
+            self.c_layernorm = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache: Optional[_kvcache.SSMStateCache] = None,
+    ) -> torch.Tensor:
+        """Prefill forward. cache=None or has_previous_state=False.
+
+        Args:
+            hidden_states: [B, S, hidden_size]
+            cache: optional SSMStateCache (not used for decode in v6 B1).
+
+        Returns: [B, S, hidden_size]
+        """
+        B_n, S, _ = hidden_states.shape
+        dtype = hidden_states.dtype
+
+        # 1. in_proj → chunk to (hidden_states, gate).
+        # Source: modeling_mamba.py:274-275.
+        projected = self.in_proj(hidden_states).transpose(1, 2)   # [B, 2*d_inner, S]
+        x, gate = projected.chunk(2, dim=1)                       # each [B, d_inner, S]
+
+        # 2. Depthwise causal conv1d + silu.
+        # Source: modeling_mamba.py:289-306 (slow_forward, no cache path).
+        if cache is not None and cache.has_previous_state:
+            raise NotImplementedError(
+                "Mamba-1 decode (single-step recurrent state advance) is "
+                "deferred — v6 B1 lands prefill numerical gate only."
+            )
+        if cache is not None:
+            conv_state = F.pad(x, (self.d_conv - x.shape[-1], 0))
+            if conv_state.shape[-1] != self.d_conv:
+                conv_state = conv_state[..., -self.d_conv:]
+            cache.update_conv_state(conv_state)
+        x = self.conv1d(x)[..., :S]
+        # Use SiLU activation (Mamba-1 hidden_act='silu').
+        x = F.silu(x)
+
+        # 3. x_proj → split dt, B, C.
+        # Source: modeling_mamba.py:313-316.
+        ssm_params = self.x_proj(x.transpose(1, 2))               # [B, S, dt_rank+2*ds]
+        dt, B_in, C_in = torch.split(
+            ssm_params, [self.dt_rank, self.d_state, self.d_state], dim=-1,
+        )
+
+        # 3b. Jamba-style intra-mixer norms on dt/B/C (modeling_jamba.py:324-326).
+        if self.dt_layernorm is not None:
+            dt = self.dt_layernorm(dt)
+        if self.b_layernorm is not None:
+            B_in = self.b_layernorm(B_in)
+        if self.c_layernorm is not None:
+            C_in = self.c_layernorm(C_in)
+
+        # 4. dt_proj + softplus.
+        # Source: modeling_mamba.py:317-318.
+        discrete_dt = self.dt_proj(dt)                            # [B, S, d_inner]
+        discrete_dt = F.softplus(discrete_dt).transpose(1, 2)     # [B, d_inner, S]
+
+        # 5. SSM scan.
+        A = -torch.exp(self.A_log.float())                        # [d_inner, d_state]
+        scan_output, ssm_state = ops.selective_scan_mamba1(
+            x, discrete_dt, A, B_in, C_in, self.D, gate,
+            initial_state=None,
+        )
+
+        if cache is not None:
+            cache.update_recurrent_state(ssm_state.to(cache.dtype))
+
+        # 6. out_proj.
+        # scan_output: [B, d_inner, S] → transpose → out_proj → [B, S, hidden]
+        # Source: modeling_mamba.py:362.
+        out = self.out_proj(scan_output.transpose(1, 2).to(dtype))
+        return out
+
+
 class Mamba2Mixer(nn.Module):
     """Mamba-2 SSM mixer.
 

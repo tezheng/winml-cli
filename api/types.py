@@ -19,12 +19,26 @@ class TokenMixerKind(Enum):
     factory chooses the appropriate kind per layer index in `to_block_spec`.
 
     Source-grounded: v3 design spec §5.2.5 lists `SSM_MAMBA1, SSM_MAMBA2,
-    SSM_GRIFFIN, SSM_RWKV, HYBRID_PARALLEL` etc. For B7 we land
-    `ATTENTION`, `SSM_MAMBA2`, and reserve `SSM_GRIFFIN` / `SSM_RWKV` for
-    the deferred-family stubs.
+    SSM_GRIFFIN, SSM_RWKV, HYBRID_PARALLEL` etc.
     """
     ATTENTION = auto()      # default — AttentionSpec
-    SSM_MAMBA2 = auto()     # SSDSpec — Mamba-2 SSD form (B7 lands this)
+    SSM_MAMBA1 = auto()     # SSMSpec — Mamba-1 selective scan (v6 B1)
+    SSM_MAMBA2 = auto()     # SSDSpec — Mamba-2 SSD form (B7)
+
+
+class SSMKind(Enum):
+    """v6 B1: distinguishes Mamba-1 selective scan vs Mamba-2 SSD.
+
+    Mamba-1: per-CHANNEL A_log (shape [d_inner, d_state]), per-channel D,
+    learned dt_proj (Linear(dt_rank -> d_inner) with bias), sequential
+    time-step loop. Source: modeling_mamba.py:58-120.
+
+    Mamba-2 (SSD): per-HEAD A_log (shape [n_heads]), per-head D, dt_bias
+    only (no projection — dt is a slice of in_proj), chunk-parallel SSD
+    scan. Source: modeling_mamba2.py:121-220.
+    """
+    MAMBA1 = auto()
+    MAMBA2_SSD = auto()
 
 
 class QKVLayout(Enum):
