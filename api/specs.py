@@ -229,6 +229,19 @@ class AttentionSpec:
     # dimension and the per-query top-k.
     indexer: Optional["IndexerSpec"] = None
 
+    # v7 P2: DeepSeek-V4 CSA + HCA composition. When `kind == CSA_HCA`,
+    # AT LEAST ONE of `csa` / `hca` must be set. V4 dispatches per-layer:
+    # `compressed_sparse_attention` layers carry CSA; `heavily_compressed_attention`
+    # layers carry HCA; we expose both as optional fields on the same spec so a
+    # single AttentionSpec can describe either pure-CSA, pure-HCA, or (for the
+    # combined V4 stack at the BLOCK layer) carry both via per-layer config.
+    # The runtime carries the shape-only init; forward raises NotImplementedError.
+    # Source: `transformers/models/deepseek_v4/modeling_deepseek_v4.py:751-869`
+    # (DeepseekV4Attention init/forward — dispatches via
+    # `COMPRESSOR_CLASSES[self.layer_type]`).
+    csa: Optional["CSASpec"] = None
+    hca: Optional["HCASpec"] = None
+
     # v5-phase2 V1: ALiBi position encoding (MPT / Baichuan / Bloom).
     # When set, ALiBi adds head-specific linear position biases to the
     # attention scores BEFORE softmax — no RoPE, no learned positions.
@@ -516,6 +529,62 @@ class MoESpec:
     expert_bias: bool = False
     expert_swiglu_alpha: float = 1.702
     expert_clamp_limit: float = 7.0
+
+
+@dataclass(frozen=True)
+class CSASpec:
+    """v7 P2: DeepSeek-V4 Compressed Sparse Attention (paper §2.3.1).
+
+    CSA compresses every `compress_rate` source tokens into a single compressed
+    KV entry using a two-series (Ca/Cb) overlap window scheme. A Lightning
+    Indexer scores queries against the compressed keys with
+    `Σ_h w_{t,h} · ReLU(q_{t,h} · K^IComp_s)` and keeps `index_topk` entries.
+
+    Fields (verified against
+    `transformers/models/deepseek_v4/modeling_deepseek_v4.py:587-749`):
+    - compress_rate: int — m, source tokens per compressed entry
+      (V4-Flash default 4; `config.compress_rates["compressed_sparse_attention"]`).
+    - block_size: int — alias for `compress_rate` (kept for spec stability —
+      v3 design spec §5.2.5 mentions block_size).
+    - indexer_n_heads: int — number of heads in the Lightning Indexer scorer
+      (`config.index_n_heads`, V4-Flash 64).
+    - indexer_head_dim: int — per-head dim of the indexer
+      (`config.index_head_dim`, V4-Flash 128).
+    - indexer_topk: int — top-k compressed entries kept per query
+      (`config.index_topk`, V4-Flash 512).
+
+    The v7 IR composition only carries these dims — the forward is shape-only
+    (raises NotImplementedError) because the full CSA forward needs the
+    overlap-state cache and rope plumbing which is a larger landing.
+    """
+    compress_rate: int
+    block_size: int           # alias of compress_rate per v3 spec; usually equal
+    indexer_n_heads: int
+    indexer_head_dim: int
+    indexer_topk: int
+
+
+@dataclass(frozen=True)
+class HCASpec:
+    """v7 P2: DeepSeek-V4 Heavily Compressed Attention (paper §2.3.2).
+
+    HCA compresses every `compress_rate` source tokens (m' = 128 by default —
+    much coarser than CSA's m = 4) into a single compressed entry via
+    `Σ_j softmax(Z_j + B)_j ⊙ C_j`. There is no indexer; the full compressed
+    sequence is concatenated to the per-layer KV axis and attended over.
+
+    Fields (verified against
+    `transformers/models/deepseek_v4/modeling_deepseek_v4.py:362-444`):
+    - compress_rate: int — m', source tokens per compressed entry
+      (`config.compress_rates["heavily_compressed_attention"]`, default 128).
+    - hierarchy_levels: int — number of HCA hierarchy levels. V4 uses 1
+      (a single HCA pass per layer); reserved as a spec field for forward-
+      compat with multi-level hierarchies.
+
+    Forward is shape-only — see CSASpec docstring.
+    """
+    compress_rate: int
+    hierarchy_levels: int = 1
 
 
 @dataclass(frozen=True)

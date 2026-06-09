@@ -29,10 +29,29 @@ class Attention(nn.Module):
         super().__init__()
         if spec.kind not in (types.AttentionKind.STANDARD,
                              types.AttentionKind.MLA,
-                             types.AttentionKind.DSA):
+                             types.AttentionKind.DSA,
+                             types.AttentionKind.CSA_HCA):
             raise NotImplementedError(
-                f"B5: STANDARD, MLA, and DSA only, got {spec.kind}"
+                f"v7 P2: STANDARD, MLA, DSA, and CSA_HCA only, got {spec.kind}"
             )
+        if spec.kind == types.AttentionKind.CSA_HCA:
+            # v7 P2: DeepSeek-V4 CSA + HCA composition — SHAPE-ONLY.
+            # We allocate compressor projections sized off the head_dim and
+            # indexer dims so the module composes correctly, but forward
+            # raises NotImplementedError until the overlap-state cache,
+            # two-series window scheme, and Lightning Indexer scorer are
+            # ported. Source:
+            #   - HCA compressor: modeling_deepseek_v4.py:362-444
+            #   - CSA compressor + Indexer: modeling_deepseek_v4.py:587-749
+            #   - Attention dispatch: modeling_deepseek_v4.py:751-869
+            if spec.csa is None and spec.hca is None:
+                raise ValueError(
+                    "CSA_HCA kind requires at least one of "
+                    "AttentionSpec.csa / AttentionSpec.hca"
+                )
+            self._init_csa_hca(spec, hidden_size, dtype)
+            self._is_csa_hca = True
+            return
         if spec.kind == types.AttentionKind.DSA:
             # B5: DSA shape-only — allocate the indexer module and the
             # full MLA backbone, but raise on forward.
@@ -383,6 +402,118 @@ class Attention(nn.Module):
         # Tag so forward dispatches.
         self._is_mla = True
 
+    def _init_csa_hca(
+        self,
+        spec: specs.AttentionSpec,
+        hidden_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """v7 P2: CSA + HCA shape-only init.
+
+        Allocates compressor projections at the dims V4 uses:
+        - HCA compressor (modeling_deepseek_v4.py:384-392): kv_proj /
+          gate_proj are Linear(hidden, head_dim) and a position_bias
+          Parameter of shape [compress_rate, head_dim], plus a kv_norm
+          RMSNorm.
+        - CSA compressor (modeling_deepseek_v4.py:610-619): kv_proj /
+          gate_proj are Linear(hidden, 2*head_dim) — the Ca/Cb two-series
+          layout — and position_bias is [compress_rate, 2*head_dim]. Has an
+          embedded Indexer (modeling_deepseek_v4.py:493-506) whose own
+          kv_proj / gate_proj are Linear(hidden, 2*indexer_head_dim), with a
+          weights_proj for the scoring head and a q_b_proj from the MLA
+          q_lora_rank to the indexer Q.
+
+        Because V4 is built on the MLA backbone (q_lora_rank, kv_lora_rank,
+        rope+nope split), the OUTER attention init mirrors the MLA path. For
+        the v7 IR shape-only landing we DO NOT build the MLA backbone here —
+        the spec is intended to compose with an outer MLA. We only build the
+        compressor / indexer projections so the module attribute tree is
+        present. Source: modeling_deepseek_v4.py:751-869 (DeepseekV4Attention).
+        """
+        self.spec = spec
+        self.hidden_size = hidden_size
+        Dh = spec.head_dim
+        if spec.hca is not None:
+            self.hca_kv_proj = nn.Linear(hidden_size, Dh, bias=False, dtype=dtype)
+            self.hca_gate_proj = nn.Linear(hidden_size, Dh, bias=False, dtype=dtype)
+            self.hca_position_bias = nn.Parameter(
+                torch.empty(spec.hca.compress_rate, Dh, dtype=dtype),
+            )
+            # Compressor RMSNorm — eps matches the rms_norm_eps of any
+            # outer qk_norm; if not provided default to 1e-5 per V4 config.
+            eps = spec.qk_norm.eps if spec.qk_norm is not None else 1e-5
+            from api import norm as _norm
+            self.hca_kv_norm = _norm.RMSNorm(
+                specs.NormSpec(
+                    kind=types.NormKind.RMS, eps=eps,
+                    weight_mode=types.NormWeightMode.STANDARD_W,
+                ),
+                Dh, dtype=dtype,
+            )
+        else:
+            self.hca_kv_proj = None
+            self.hca_gate_proj = None
+            self.hca_position_bias = None
+            self.hca_kv_norm = None
+        if spec.csa is not None:
+            csa = spec.csa
+            self.csa_kv_proj = nn.Linear(hidden_size, 2 * Dh, bias=False, dtype=dtype)
+            self.csa_gate_proj = nn.Linear(hidden_size, 2 * Dh, bias=False, dtype=dtype)
+            self.csa_position_bias = nn.Parameter(
+                torch.empty(csa.compress_rate, 2 * Dh, dtype=dtype),
+            )
+            eps = spec.qk_norm.eps if spec.qk_norm is not None else 1e-5
+            from api import norm as _norm
+            self.csa_kv_norm = _norm.RMSNorm(
+                specs.NormSpec(
+                    kind=types.NormKind.RMS, eps=eps,
+                    weight_mode=types.NormWeightMode.STANDARD_W,
+                ),
+                Dh, dtype=dtype,
+            )
+            # Embedded Lightning Indexer.
+            i_dim = csa.indexer_head_dim
+            i_heads = csa.indexer_n_heads
+            self.indexer_kv_proj = nn.Linear(hidden_size, 2 * i_dim,
+                                             bias=False, dtype=dtype)
+            self.indexer_gate_proj = nn.Linear(hidden_size, 2 * i_dim,
+                                               bias=False, dtype=dtype)
+            self.indexer_position_bias = nn.Parameter(
+                torch.empty(csa.compress_rate, 2 * i_dim, dtype=dtype),
+            )
+            self.indexer_kv_norm = _norm.RMSNorm(
+                specs.NormSpec(
+                    kind=types.NormKind.RMS, eps=eps,
+                    weight_mode=types.NormWeightMode.STANDARD_W,
+                ),
+                i_dim, dtype=dtype,
+            )
+            self.indexer_weights_proj = nn.Linear(hidden_size, i_heads,
+                                                  bias=False, dtype=dtype)
+        else:
+            self.csa_kv_proj = None
+            self.csa_gate_proj = None
+            self.csa_position_bias = None
+            self.csa_kv_norm = None
+            self.indexer_kv_proj = None
+            self.indexer_gate_proj = None
+            self.indexer_position_bias = None
+            self.indexer_kv_norm = None
+            self.indexer_weights_proj = None
+        # The MLA / STANDARD backbone is NOT built here (shape-only).
+        # Mark unused attrs.
+        self.qkv_proj = None
+        self.q_proj = None
+        self.k_proj = None
+        self.v_proj = None
+        self.o_proj = None
+        self.rope = None
+        self.q_norm = None
+        self.k_norm = None
+        self._v_norm_eps = None
+        self._v_norm_mode = None
+        self._v_norm_with_scale = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -395,6 +526,14 @@ class Attention(nn.Module):
         spec = self.spec
         if getattr(self, "_is_dsa", False):
             raise NotImplementedError("DSA forward implementation deferred")
+        if getattr(self, "_is_csa_hca", False):
+            # v7 P2: CSA+HCA shape-only landing. The compressor projections
+            # are allocated; the forward (two-series overlap window scheme +
+            # Lightning Indexer top-k gather + concat-onto-KV-axis) is
+            # deferred. Source: modeling_deepseek_v4.py:797-869.
+            raise NotImplementedError(
+                "CSA+HCA forward implementation deferred"
+            )
         if getattr(self, "_is_mla", False):
             return self._forward_mla(x, position_ids, cache, start_pos)
         B, S, _ = x.shape

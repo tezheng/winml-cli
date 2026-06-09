@@ -7,6 +7,16 @@ class AttentionKind(Enum):
     STANDARD = auto()       # MHA / GQA / MQA — distinguished by n_kv_heads
     MLA = auto()            # Multi-head Latent Attention (DeepSeek)
     DSA = auto()            # DeepSeek V3.2 Sparse Attention (Lightning Indexer)
+    # v7 P2: DeepSeek-V4 compressed sparse attention combined with hierarchical
+    # compressed attention. CSA compresses every `compress_rate_csa` source
+    # tokens and runs a Lightning Indexer to pick top-k compressed entries.
+    # HCA compresses every `compress_rate_hca` source tokens (typically a
+    # much larger m', e.g. 128). Per-layer config in V4 dispatches between
+    # CSA, HCA, and sliding via `config.layer_types`. The IR composition keeps
+    # both fields on AttentionSpec; the runtime branches on which is non-None.
+    # Source: `transformers/models/deepseek_v4/modeling_deepseek_v4.py:362-444`
+    # (HCA compressor), `:587-749` (CSA compressor + Indexer).
+    CSA_HCA = auto()
 
 
 class TokenMixerKind(Enum):

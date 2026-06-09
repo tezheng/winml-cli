@@ -495,3 +495,133 @@ def test_b5_attention_mla_direct_q_proj_v2_lite():
     x = torch.randn(1, 4, 128)
     out = attn(x, position_ids=torch.arange(4), cache=cache, start_pos=0)
     assert out.shape == (1, 4, 128)
+
+
+# ---------------------------------------------------------------------------
+# v7 P2: CSA + HCA composition tests (shape-only — forward deferred)
+# ---------------------------------------------------------------------------
+
+
+def _csa_hca_spec(with_csa: bool, with_hca: bool) -> specs.AttentionSpec:
+    """Build a minimal CSA_HCA attention spec for shape composition tests."""
+    csa = specs.CSASpec(
+        compress_rate=4, block_size=4,
+        indexer_n_heads=8, indexer_head_dim=32, indexer_topk=16,
+    ) if with_csa else None
+    hca = specs.HCASpec(compress_rate=128, hierarchy_levels=1) if with_hca else None
+    return specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=8, head_dim=64,
+        kind=types.AttentionKind.CSA_HCA,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        csa=csa, hca=hca,
+    )
+
+
+def test_v7_p2_csa_hca_kind_requires_at_least_one_of_csa_hca():
+    """v7 P2: CSA_HCA without either field is a spec error."""
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=8, head_dim=64,
+        kind=types.AttentionKind.CSA_HCA,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        csa=None, hca=None,
+    )
+    with pytest.raises(ValueError, match="CSA_HCA"):
+        attention.Attention(spec, hidden_size=64, max_seq=32, dtype=torch.float32)
+
+
+def test_v7_p2_hca_only_allocates_compressor_projections():
+    """v7 P2: HCA-only init builds kv_proj/gate_proj/position_bias/kv_norm.
+
+    Source: modeling_deepseek_v4.py:384-392.
+    """
+    spec = _csa_hca_spec(with_csa=False, with_hca=True)
+    attn = attention.Attention(spec, hidden_size=128, max_seq=64,
+                               dtype=torch.float32)
+    # HCA projections present.
+    assert attn.hca_kv_proj is not None
+    assert attn.hca_kv_proj.weight.shape == (spec.head_dim, 128)
+    assert attn.hca_gate_proj.weight.shape == (spec.head_dim, 128)
+    assert attn.hca_position_bias.shape == (spec.hca.compress_rate, spec.head_dim)
+    assert attn.hca_kv_norm is not None
+    # CSA path is None.
+    assert attn.csa_kv_proj is None
+    assert attn.csa_position_bias is None
+    assert attn.indexer_kv_proj is None
+
+
+def test_v7_p2_csa_only_allocates_compressor_and_indexer():
+    """v7 P2: CSA-only init builds 2*head_dim Ca/Cb projections plus the
+    embedded Lightning Indexer at 2*indexer_head_dim.
+
+    Source: modeling_deepseek_v4.py:610-619 (CSA compressor),
+    :493-506 (Indexer).
+    """
+    spec = _csa_hca_spec(with_csa=True, with_hca=False)
+    attn = attention.Attention(spec, hidden_size=128, max_seq=64,
+                               dtype=torch.float32)
+    Dh = spec.head_dim
+    iDh = spec.csa.indexer_head_dim
+    # CSA compressor at 2*head_dim — Ca/Cb two-series layout.
+    assert attn.csa_kv_proj.weight.shape == (2 * Dh, 128)
+    assert attn.csa_gate_proj.weight.shape == (2 * Dh, 128)
+    assert attn.csa_position_bias.shape == (spec.csa.compress_rate, 2 * Dh)
+    # Embedded Lightning Indexer at 2*indexer_head_dim.
+    assert attn.indexer_kv_proj.weight.shape == (2 * iDh, 128)
+    assert attn.indexer_gate_proj.weight.shape == (2 * iDh, 128)
+    assert attn.indexer_position_bias.shape == (spec.csa.compress_rate, 2 * iDh)
+    assert attn.indexer_weights_proj.weight.shape == (spec.csa.indexer_n_heads, 128)
+    # HCA path is None.
+    assert attn.hca_kv_proj is None
+
+
+def test_v7_p2_csa_and_hca_combined_composes():
+    """v7 P2: when both csa AND hca are set, BOTH compressor stacks coexist."""
+    spec = _csa_hca_spec(with_csa=True, with_hca=True)
+    attn = attention.Attention(spec, hidden_size=64, max_seq=32,
+                               dtype=torch.float32)
+    assert attn.csa_kv_proj is not None
+    assert attn.hca_kv_proj is not None
+    assert attn.indexer_kv_proj is not None
+
+
+def test_v7_p2_csa_hca_forward_raises_not_implemented():
+    """v7 P2: forward is deferred — must raise NotImplementedError."""
+    spec = _csa_hca_spec(with_csa=True, with_hca=False)
+    attn = attention.Attention(spec, hidden_size=64, max_seq=32,
+                               dtype=torch.float32)
+    cache_spec = specs.KVCacheSpec(
+        layout=types.CacheLayout.CONTIGUOUS,
+        memory_layout=types.MemoryLayout.HND,
+        k_dtype=torch.float32, v_dtype=torch.float32,
+    )
+    cache = kvcache.ContiguousKVCache(
+        cache_spec, batch_size=1,
+        n_kv_heads=spec.n_kv_heads, head_dim=spec.head_dim, max_seq=32,
+    )
+    x = torch.randn(1, 4, 64)
+    with pytest.raises(NotImplementedError, match="CSA"):
+        attn(x, position_ids=torch.arange(4), cache=cache, start_pos=0)
+
+
+def test_v7_p2_csa_spec_fields_carry_v4_defaults():
+    """v7 P2: spec field documentation pins V4-Flash defaults — m=4, indexer
+    n_heads=64, head_dim=128, top_k=512 (per
+    transformers/models/deepseek_v4/configuration_deepseek_v4.py:158-172).
+    """
+    csa = specs.CSASpec(
+        compress_rate=4, block_size=4,
+        indexer_n_heads=64, indexer_head_dim=128, indexer_topk=512,
+    )
+    assert csa.compress_rate == csa.block_size == 4
+    assert csa.indexer_n_heads == 64
+    assert csa.indexer_head_dim == 128
+    assert csa.indexer_topk == 512
+
+
+def test_v7_p2_hca_spec_fields_carry_v4_defaults():
+    """v7 P2: HCA defaults — m'=128 per V4 paper §2.3.2 (configuration_deepseek_v4.py:159)."""
+    hca = specs.HCASpec(compress_rate=128, hierarchy_levels=1)
+    assert hca.compress_rate == 128
+    assert hca.hierarchy_levels == 1
