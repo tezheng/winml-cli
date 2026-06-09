@@ -456,11 +456,27 @@ class MoESpec:
     n_experts: int
     top_k: int
     n_shared_experts: int = 0
-    router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias"
+    router_kind: str = "softmax"      # "softmax" | "sigmoid_plus_bias" | "topk_then_softmax_with_bias"
     router_norm: bool = False         # V3 norm_topk_prob: renorm top-k weights to sum 1
     group_routing: Optional[GroupRoutingSpec] = None
     routed_scaling_factor: float = 1.0
     expert_ffn: Optional[FFNSpec] = None
+
+    # v6 A3: GPT-OSS expert layout — clamped SwiGLU with biased linears.
+    # When True, the expert forward uses the GPT-OSS clamped SwiGLU math:
+    #   gate, up = gate_up[..., ::2], gate_up[..., 1::2]   # INTERLEAVED
+    #   gate.clamp_(max=expert_clamp_limit)
+    #   up.clamp_(min=-expert_clamp_limit, max=expert_clamp_limit)
+    #   glu = gate * sigmoid(gate * expert_swiglu_alpha)
+    #   gated = (up + 1) * glu
+    # and the experts have biases on BOTH gate_up_proj and down_proj.
+    # Source: `transformers/models/gpt_oss/modeling_gpt_oss.py:73-119`
+    # (GptOssExperts with `has_bias=True`, `is_transposed=True`,
+    # `is_concatenated=False`, `alpha=1.702`, `limit=7.0`).
+    expert_kind: str = "swiglu"        # "swiglu" | "gpt_oss_clamped_swiglu"
+    expert_bias: bool = False
+    expert_swiglu_alpha: float = 1.702
+    expert_clamp_limit: float = 7.0
 
 
 @dataclass(frozen=True)

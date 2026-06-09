@@ -53,6 +53,33 @@ class GptOssConfig:
             return False
         return self.layer_types[layer_idx] == "sliding_attention"
 
+    def to_moe_spec(self) -> specs.MoESpec:
+        """GPT-OSS MoE — top-k softmax + clamped-SwiGLU experts with bias.
+
+        Source: modeling_gpt_oss.py:73-151 (GptOssExperts +
+        GptOssTopKRouter + GptOssMLP).
+        """
+        expert_ffn = specs.FFNSpec(
+            intermediate_size=self.intermediate_size,
+            activation=types.Activation.SILU,    # ignored for gpt_oss
+            gate_kind=types.GateKind.SWIGLU,     # ignored
+            fused_gate_up=False,
+            gate_bias=False, up_bias=False, down_bias=False,
+        )
+        return specs.MoESpec(
+            n_experts=self.num_local_experts,
+            top_k=self.num_experts_per_tok,
+            n_shared_experts=0,
+            router_kind="topk_then_softmax_with_bias",
+            router_norm=False,
+            routed_scaling_factor=1.0,
+            expert_ffn=expert_ffn,
+            expert_kind="gpt_oss_clamped_swiglu",
+            expert_bias=True,
+            expert_swiglu_alpha=1.702,
+            expert_clamp_limit=7.0,
+        )
+
     def to_attention_spec(self, layer_idx: int = 0) -> specs.AttentionSpec:
         """GPT-OSS attention sublayer with trained sinks.
 

@@ -179,26 +179,41 @@ class MoE(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        if spec.router_kind not in ("softmax", "sigmoid_plus_bias"):
+        if spec.router_kind not in (
+            "softmax",
+            "sigmoid_plus_bias",
+            "topk_then_softmax_with_bias",
+        ):
             raise NotImplementedError(
-                f"B5: router_kind must be 'softmax' or 'sigmoid_plus_bias', "
-                f"got {spec.router_kind!r}"
+                f"B5/v6 A3: router_kind must be 'softmax', 'sigmoid_plus_bias' "
+                f"or 'topk_then_softmax_with_bias', got {spec.router_kind!r}"
             )
         if spec.expert_ffn is None:
             raise ValueError("MoESpec.expert_ffn is required")
         ffn = spec.expert_ffn
-        if ffn.gate_kind != types.GateKind.SWIGLU or ffn.activation != types.Activation.SILU:
+        # v6 A3: GPT-OSS clamped SwiGLU is the only expert_kind != 'swiglu'.
+        if spec.expert_kind not in ("swiglu", "gpt_oss_clamped_swiglu"):
             raise NotImplementedError(
-                "B5: MoE experts require SwiGLU + SILU (DeepSeek family)"
+                f"v6 A3: expert_kind must be 'swiglu' or 'gpt_oss_clamped_swiglu', "
+                f"got {spec.expert_kind!r}"
             )
+        if spec.expert_kind == "swiglu":
+            if ffn.gate_kind != types.GateKind.SWIGLU or ffn.activation != types.Activation.SILU:
+                raise NotImplementedError(
+                    "B5: MoE swiglu experts require SwiGLU + SILU (DeepSeek family)"
+                )
+            if ffn.gate_bias or ffn.up_bias or ffn.down_bias or spec.expert_bias:
+                raise NotImplementedError("B5: MoE swiglu experts must have no biases")
+        # gpt_oss_clamped_swiglu: any gate_kind/activation is ignored — the
+        # clamped SwiGLU math is fixed. We still require fused gate_up
+        # layout (per HF's `is_concatenated=False, is_transposed=True`,
+        # the underlying tensor is one big [E, H, 2*I] block).
         if ffn.fused_gate_up:
             raise NotImplementedError(
                 "B5: MoE expert_ffn.fused_gate_up=True not used by DeepSeek "
                 "family — experts.gate_up_proj is packed across experts, "
                 "but the per-expert gate/up is two separate halves spliced."
             )
-        if ffn.gate_bias or ffn.up_bias or ffn.down_bias:
-            raise NotImplementedError("B5: MoE experts must have no biases")
         if spec.group_routing is not None:
             gr = spec.group_routing
             if spec.n_experts % gr.n_groups != 0:
@@ -216,7 +231,14 @@ class MoE(nn.Module):
         self.intermediate_size = ffn.intermediate_size
 
         # Router gate.
-        if spec.router_kind == "softmax":
+        if spec.router_kind == "topk_then_softmax_with_bias":
+            # v6 A3: GPT-OSS router — gate.weight + gate.bias, F.linear,
+            # top_k BEFORE softmax (NOT after, unlike V2). Source:
+            # modeling_gpt_oss.py:122-135 (GptOssTopKRouter).
+            self.gate = _BiasedLinearRouter(
+                spec.n_experts, hidden_size, dtype=dtype,
+            )
+        elif spec.router_kind == "softmax":
             # V2: nn.Linear(hidden, n_experts, bias=False), gate.weight at
             # [n_experts, hidden]. Source: modeling_deepseek_v2.py:90.
             self.gate = nn.Linear(hidden_size, spec.n_experts, bias=False, dtype=dtype)
@@ -242,12 +264,42 @@ class MoE(nn.Module):
         # which corresponds to the FIRST output-axis of W. Therefore in W
         # the gate weights are rows [0, I) and up weights are rows [I, 2I).
         I = ffn.intermediate_size
-        self.experts_gate_up = nn.Parameter(
-            torch.empty(spec.n_experts, 2 * I, hidden_size, dtype=dtype)
-        )
-        self.experts_down = nn.Parameter(
-            torch.empty(spec.n_experts, hidden_size, I, dtype=dtype)
-        )
+        # v6 A3: GPT-OSS uses a transposed expert layout:
+        #   gate_up_proj  : [E, hidden, 2*I]
+        #   gate_up_bias  : [E, 2*I]
+        #   down_proj     : [E, I, hidden]
+        #   down_bias     : [E, hidden]
+        # `is_transposed=True, is_concatenated=False, has_bias=True`.
+        # The expert forward does `current_state @ gate_up_proj[e] + bias`
+        # rather than `F.linear`. Source: modeling_gpt_oss.py:74-117.
+        if spec.expert_kind == "gpt_oss_clamped_swiglu":
+            self.experts_gate_up = nn.Parameter(
+                torch.empty(spec.n_experts, hidden_size, 2 * I, dtype=dtype)
+            )
+            self.experts_down = nn.Parameter(
+                torch.empty(spec.n_experts, I, hidden_size, dtype=dtype)
+            )
+            if spec.expert_bias:
+                self.experts_gate_up_bias = nn.Parameter(
+                    torch.empty(spec.n_experts, 2 * I, dtype=dtype)
+                )
+                self.experts_down_bias = nn.Parameter(
+                    torch.empty(spec.n_experts, hidden_size, dtype=dtype)
+                )
+            else:
+                self.experts_gate_up_bias = None
+                self.experts_down_bias = None
+        else:
+            # Original DeepSeek layout: gate_up_proj [E, 2I, hidden],
+            # down_proj [E, hidden, I]. No biases.
+            self.experts_gate_up = nn.Parameter(
+                torch.empty(spec.n_experts, 2 * I, hidden_size, dtype=dtype)
+            )
+            self.experts_down = nn.Parameter(
+                torch.empty(spec.n_experts, hidden_size, I, dtype=dtype)
+            )
+            self.experts_gate_up_bias = None
+            self.experts_down_bias = None
 
         # Shared experts (FFN with intermediate = I * n_shared_experts).
         if spec.n_shared_experts > 0:
@@ -358,6 +410,27 @@ class MoE(nn.Module):
         topk_w = topk_w * self.routed_scaling_factor
         return topk_idx, topk_w
 
+    def _route_topk_then_softmax_with_bias(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """v6 A3: GPT-OSS router.
+
+        Source: modeling_gpt_oss.py:122-135 (GptOssTopKRouter):
+            router_logits = F.linear(x, weight, bias)   # gate has BIAS
+            top_value, top_idx = topk(router_logits, top_k)
+            router_scores = softmax(top_value)          # ONLY over top-k
+            return logits, scores, indices
+        """
+        router_logits = F.linear(
+            x, self.gate.weight,
+            self.gate.bias if hasattr(self.gate, "bias") else None,
+        )                                              # [N, E]
+        topk_val, topk_idx = torch.topk(router_logits, self.top_k, dim=-1)
+        topk_w = torch.softmax(topk_val, dim=-1, dtype=topk_val.dtype)
+        # GPT-OSS does not norm beyond softmax and does not scale (no
+        # `routed_scaling_factor`).
+        return topk_idx, topk_w
+
     def _experts_forward(
         self,
         x: torch.Tensor,           # [N, hidden]
@@ -389,6 +462,61 @@ class MoE(nn.Module):
             out.index_add_(0, tok_idx, inner.to(out.dtype))
         return out
 
+    def _experts_forward_gpt_oss(
+        self,
+        x: torch.Tensor,           # [N, hidden]
+        topk_idx: torch.Tensor,    # [N, top_k] long
+        topk_w: torch.Tensor,      # [N, top_k] float
+    ) -> torch.Tensor:
+        """v6 A3: GPT-OSS clamped-SwiGLU experts with biased linears.
+
+        Source: modeling_gpt_oss.py:87-117 (GptOssExperts._apply_gate +
+        forward loop).
+
+        Per-expert math:
+            gate_up = current_state @ gate_up_proj[e] + gate_up_bias[e]
+            gate, up = gate_up[..., ::2], gate_up[..., 1::2]   # INTERLEAVED
+            gate = gate.clamp(max=limit)
+            up   = up.clamp(min=-limit, max=limit)
+            glu = gate * sigmoid(gate * alpha)
+            gated = (up + 1) * glu
+            out_e = gated @ down_proj[e] + down_bias[e]
+            out += routing_weight * out_e
+
+        Note: in HF the per-expert matmul is `state @ W[e]` (NOT
+        F.linear), so W layout is [hidden, 2*I] / [I, hidden] —
+        already-transposed.
+        """
+        N, H = x.shape
+        out = torch.zeros_like(x)
+        alpha = self.spec.expert_swiglu_alpha
+        limit = self.spec.expert_clamp_limit
+        with torch.no_grad():
+            one_hot = F.one_hot(topk_idx, num_classes=self.n_experts)
+            expert_mask = one_hot.permute(2, 1, 0)         # [E, top_k, N]
+            hit = expert_mask.sum(dim=(-1, -2)).gt(0).nonzero().squeeze(-1)
+        gu_bias = self.experts_gate_up_bias
+        d_bias = self.experts_down_bias
+        for e in hit.tolist():
+            slot_pos, tok_idx = torch.where(expert_mask[e])
+            current_x = x[tok_idx]                          # [Ne, H]
+            gate_up = current_x @ self.experts_gate_up[e]   # [Ne, 2I]
+            if gu_bias is not None:
+                gate_up = gate_up + gu_bias[e]
+            gate = gate_up[..., ::2]
+            up = gate_up[..., 1::2]
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+            glu = gate * torch.sigmoid(gate * alpha)
+            gated = (up + 1) * glu                          # [Ne, I]
+            out_e = gated @ self.experts_down[e]            # [Ne, H]
+            if d_bias is not None:
+                out_e = out_e + d_bias[e]
+            w = topk_w[tok_idx, slot_pos, None].to(out_e.dtype)
+            out_e = out_e * w
+            out.index_add_(0, tok_idx, out_e.to(out.dtype))
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, S, hidden]
         residuals = x
@@ -397,12 +525,17 @@ class MoE(nn.Module):
 
         if self.spec.router_kind == "softmax":
             topk_idx, topk_w = self._route_softmax(x_flat)
-        else:
+        elif self.spec.router_kind == "sigmoid_plus_bias":
             topk_idx, topk_w = self._route_sigmoid_plus_bias(x_flat)
+        else:  # topk_then_softmax_with_bias
+            topk_idx, topk_w = self._route_topk_then_softmax_with_bias(x_flat)
         # IMPORTANT: HF runs experts on the BF16/FP32 hidden states (the
         # original input dtype), NOT on the fp32-cast router input. So the
         # gather x[token_idx] is from the original `x_flat` (in x's dtype).
-        routed = self._experts_forward(x_flat, topk_idx, topk_w)
+        if self.spec.expert_kind == "gpt_oss_clamped_swiglu":
+            routed = self._experts_forward_gpt_oss(x_flat, topk_idx, topk_w)
+        else:
+            routed = self._experts_forward(x_flat, topk_idx, topk_w)
         routed = routed.reshape(*orig_shape)
 
         if self.shared_experts is not None:
@@ -430,3 +563,21 @@ class _SigmoidRouter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # HF: F.linear(x.fp32, weight.fp32) — see modeling_deepseek_v3.py:150.
         return F.linear(x.float(), self.weight.float())
+
+
+class _BiasedLinearRouter(nn.Module):
+    """v6 A3: GPT-OSS router — biased nn.Linear-equivalent.
+
+    Source: modeling_gpt_oss.py:122-135 (GptOssTopKRouter).
+
+    Mirrors HF state-dict keys exactly: `gate.weight` (shape [n_experts,
+    hidden]) and `gate.bias` (shape [n_experts]).
+    """
+
+    def __init__(self, n_experts: int, hidden_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(n_experts, hidden_size, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(n_experts, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias)
