@@ -555,6 +555,26 @@ class MoESpec:
     # Source: modeling_deepseek_v4.py:1065, 1074.
     hash_score_fn: str = "sigmoid"
 
+    # v7 P4: Nemotron-H latent MoE. When `routing_in_latent` is True, the
+    # routed-experts forward inserts a pair of linear projections AROUND the
+    # expert dispatch:
+    #     residuals = x
+    #     x = fc1_latent_proj(x)              # hidden -> latent_dim
+    #     x = experts(x, topk_idx, topk_w)    # operate in latent space
+    #     x = fc2_latent_proj(x)              # latent_dim -> hidden
+    #     out = x + shared_experts(residuals)
+    # The expert per-token cost drops from O(hidden) to O(latent_dim) for the
+    # gate_up/down matmuls. Routing itself runs on the full hidden_size x
+    # (pre-projection) — confirmed at modeling_nemotron_h.py:734-735.
+    # Source: `transformers/models/nemotron_h/modeling_nemotron_h.py:672-745`
+    # (NemotronHMoE init + forward).
+    routing_in_latent: bool = False
+    latent_dim: Optional[int] = None
+    # v7 P4: latent projection biases — Nemotron-H's fc1/fc2 latent projections
+    # take `bias=config.mlp_bias`. We default to False (the most common
+    # configuration), but expose the knob.
+    latent_bias: bool = False
+
     # v6 A3: GPT-OSS expert layout — clamped SwiGLU with biased linears.
     # When True, the expert forward uses the GPT-OSS clamped SwiGLU math:
     #   gate, up = gate_up[..., ::2], gate_up[..., 1::2]   # INTERLEAVED

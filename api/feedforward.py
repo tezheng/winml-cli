@@ -210,6 +210,13 @@ class MoE(nn.Module):
                     f"router_kind='hash' only supports score_fn='sigmoid' "
                     f"(DeepSeek-V4 default), got {spec.hash_score_fn!r}"
                 )
+        if spec.routing_in_latent:
+            # v7 P4: latent MoE — projection dim required.
+            if spec.latent_dim is None or spec.latent_dim <= 0:
+                raise ValueError(
+                    "routing_in_latent=True requires latent_dim > 0 "
+                    "(Nemotron-H fc1_latent_proj output dim)"
+                )
         if spec.expert_ffn is None:
             raise ValueError("MoESpec.expert_ffn is required")
         ffn = spec.expert_ffn
@@ -289,6 +296,27 @@ class MoE(nn.Module):
             # Source: modeling_deepseek_v3.py:139-151.
             self.gate = _SigmoidRouter(spec.n_experts, hidden_size, dtype=dtype)
 
+        # v7 P4: latent MoE — Nemotron-H. fc1/fc2 latent projections wrap
+        # the routed-experts dispatch. The expert input/output dim is
+        # `latent_dim` (smaller than hidden) for both gate_up_proj and
+        # down_proj, dropping per-token expert FLOPs to O(latent_dim).
+        # Source: modeling_nemotron_h.py:625-632, 699-704.
+        if spec.routing_in_latent:
+            self.fc1_latent_proj = nn.Linear(
+                hidden_size, spec.latent_dim,
+                bias=spec.latent_bias, dtype=dtype,
+            )
+            self.fc2_latent_proj = nn.Linear(
+                spec.latent_dim, hidden_size,
+                bias=spec.latent_bias, dtype=dtype,
+            )
+            # The expert internal dim is keyed off latent_dim, not hidden.
+            expert_in_dim = spec.latent_dim
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
+            expert_in_dim = hidden_size
+
         # Expert packed tensors.
         # gate_up_proj packs gate (rows 0..I) above up (rows I..2I) per the
         # V2/V3 ordering — verify by chunk(2, dim=-1) in HF:
@@ -308,29 +336,31 @@ class MoE(nn.Module):
         # rather than `F.linear`. Source: modeling_gpt_oss.py:74-117.
         if spec.expert_kind == "gpt_oss_clamped_swiglu":
             self.experts_gate_up = nn.Parameter(
-                torch.empty(spec.n_experts, hidden_size, 2 * I, dtype=dtype)
+                torch.empty(spec.n_experts, expert_in_dim, 2 * I, dtype=dtype)
             )
             self.experts_down = nn.Parameter(
-                torch.empty(spec.n_experts, I, hidden_size, dtype=dtype)
+                torch.empty(spec.n_experts, I, expert_in_dim, dtype=dtype)
             )
             if spec.expert_bias:
                 self.experts_gate_up_bias = nn.Parameter(
                     torch.empty(spec.n_experts, 2 * I, dtype=dtype)
                 )
                 self.experts_down_bias = nn.Parameter(
-                    torch.empty(spec.n_experts, hidden_size, dtype=dtype)
+                    torch.empty(spec.n_experts, expert_in_dim, dtype=dtype)
                 )
             else:
                 self.experts_gate_up_bias = None
                 self.experts_down_bias = None
         else:
-            # Original DeepSeek layout: gate_up_proj [E, 2I, hidden],
-            # down_proj [E, hidden, I]. No biases.
+            # Original DeepSeek layout: gate_up_proj [E, 2I, hidden_in],
+            # down_proj [E, hidden_in, I]. No biases.
+            # v7 P4: hidden_in is replaced by `expert_in_dim` (== latent_dim
+            # when routing_in_latent, else == hidden_size).
             self.experts_gate_up = nn.Parameter(
-                torch.empty(spec.n_experts, 2 * I, hidden_size, dtype=dtype)
+                torch.empty(spec.n_experts, 2 * I, expert_in_dim, dtype=dtype)
             )
             self.experts_down = nn.Parameter(
-                torch.empty(spec.n_experts, hidden_size, I, dtype=dtype)
+                torch.empty(spec.n_experts, expert_in_dim, I, dtype=dtype)
             )
             self.experts_gate_up_bias = None
             self.experts_down_bias = None
@@ -613,13 +643,29 @@ class MoE(nn.Module):
             topk_idx, topk_w = self._route_hash(x_flat, input_ids)
         else:  # topk_then_softmax_with_bias
             topk_idx, topk_w = self._route_topk_then_softmax_with_bias(x_flat)
+
+        # v7 P4: latent MoE — project x → latent_dim BEFORE expert dispatch.
+        # Routing happens on `x_flat` (in hidden_size), experts operate in
+        # latent_dim. Shared experts always run on the original hidden_size.
+        # Source: modeling_nemotron_h.py:737-744 (route on `hidden_states`,
+        # then fc1_latent_proj → experts → fc2_latent_proj → shared add).
+        if self.spec.routing_in_latent:
+            expert_in = self.fc1_latent_proj(x_flat)
+        else:
+            expert_in = x_flat
+
         # IMPORTANT: HF runs experts on the BF16/FP32 hidden states (the
         # original input dtype), NOT on the fp32-cast router input. So the
         # gather x[token_idx] is from the original `x_flat` (in x's dtype).
         if self.spec.expert_kind == "gpt_oss_clamped_swiglu":
-            routed = self._experts_forward_gpt_oss(x_flat, topk_idx, topk_w)
+            routed = self._experts_forward_gpt_oss(expert_in, topk_idx, topk_w)
         else:
-            routed = self._experts_forward(x_flat, topk_idx, topk_w)
+            routed = self._experts_forward(expert_in, topk_idx, topk_w)
+
+        # v7 P4: project back from latent_dim → hidden.
+        if self.spec.routing_in_latent:
+            routed = self.fc2_latent_proj(routed)
+
         routed = routed.reshape(*orig_shape)
 
         if self.shared_experts is not None:

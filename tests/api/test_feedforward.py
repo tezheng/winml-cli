@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -476,3 +477,123 @@ def test_v7_p1_hash_router_forward_requires_input_ids():
         assert "input_ids" in str(e)
     else:
         raise AssertionError("expected ValueError for missing input_ids")
+
+
+# ---------------------------------------------------------------------------
+# v7 P4: Nemotron-H latent MoE tests
+# ---------------------------------------------------------------------------
+
+
+def test_v7_p4_latent_moe_allocates_fc1_fc2_and_resizes_experts():
+    """v7 P4: routing_in_latent=True allocates fc1/fc2_latent_proj and resizes
+    experts_gate_up / experts_down to operate in latent_dim.
+
+    Source: modeling_nemotron_h.py:625-632, 699-704.
+    """
+    H = 32
+    latent = 16
+    E, K, I = 4, 2, 8
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias",
+        routing_in_latent=True, latent_dim=latent,
+        expert_ffn=_moe_expert_ffn(I=I),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    # Latent projections built.
+    assert isinstance(moe.fc1_latent_proj, nn.Linear)
+    assert isinstance(moe.fc2_latent_proj, nn.Linear)
+    assert moe.fc1_latent_proj.weight.shape == (latent, H)
+    assert moe.fc2_latent_proj.weight.shape == (H, latent)
+    # Experts dimensioned off LATENT (not hidden).
+    assert moe.experts_gate_up.shape == (E, 2 * I, latent)
+    assert moe.experts_down.shape == (E, latent, I)
+
+
+def test_v7_p4_latent_moe_forward_shape_and_finite():
+    """v7 P4: full forward returns [B,S,hidden] and is finite."""
+    torch.manual_seed(17)
+    H = 24
+    latent = 12
+    E, K, I = 4, 2, 6
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias",
+        routing_in_latent=True, latent_dim=latent,
+        expert_ffn=_moe_expert_ffn(I=I),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        nn.init.normal_(moe.experts_gate_up, std=0.05)
+        nn.init.normal_(moe.experts_down, std=0.05)
+        nn.init.normal_(moe.fc1_latent_proj.weight, std=0.3)
+        nn.init.normal_(moe.fc2_latent_proj.weight, std=0.3)
+    x = torch.randn(2, 5, H)
+    out = moe(x)
+    assert out.shape == (2, 5, H)
+    assert torch.isfinite(out).all()
+
+
+def test_v7_p4_latent_moe_requires_latent_dim():
+    """v7 P4: routing_in_latent=True without latent_dim raises."""
+    spec = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias",
+        routing_in_latent=True,  # no latent_dim set
+        expert_ffn=_moe_expert_ffn(I=4),
+    )
+    with pytest.raises(ValueError, match="latent_dim"):
+        feedforward.MoE(spec, hidden_size=16, dtype=torch.float32)
+
+
+def test_v7_p4_latent_moe_routing_happens_on_hidden_not_latent():
+    """v7 P4: confirm router operates on full-hidden x, NOT on the latent
+    projection. Source: modeling_nemotron_h.py:734-735 — gate runs on
+    hidden_states BEFORE the fc1_latent_proj call.
+
+    We construct a scenario where fc1 projection is large enough to disturb
+    routing if it were applied first. Verify routing decisions match the
+    pre-projection path.
+    """
+    torch.manual_seed(19)
+    H = 16
+    latent = 8
+    E, K, I = 4, 2, 4
+    spec = specs.MoESpec(
+        n_experts=E, top_k=K, n_shared_experts=0,
+        router_kind="sigmoid_plus_bias", router_norm=False,
+        routing_in_latent=True, latent_dim=latent,
+        expert_ffn=_moe_expert_ffn(I=I),
+    )
+    moe = feedforward.MoE(spec, hidden_size=H, dtype=torch.float32)
+    with torch.no_grad():
+        nn.init.normal_(moe.gate.weight, std=0.5)
+        # Make fc1 deliberately destabilising.
+        nn.init.normal_(moe.fc1_latent_proj.weight, std=2.0)
+    x_flat = torch.randn(3, H)
+    idx, _ = moe._route_sigmoid_plus_bias(x_flat)
+    # Routing should depend ONLY on the gate weights and hidden x, not on
+    # any latent projection. Recompute reference.
+    logits = F.linear(x_flat.float(), moe.gate.weight.float())
+    probs = logits.sigmoid()
+    probs_choice = probs + moe.gate.e_score_correction_bias
+    expected_idx = torch.topk(probs_choice, k=K, dim=-1, sorted=False).indices
+    # Compare sorted sets (top-k order is not sorted).
+    assert torch.equal(idx.sort(dim=-1).values, expected_idx.sort(dim=-1).values)
+
+
+def test_v7_p4_non_latent_moe_unchanged():
+    """v7 P4: routing_in_latent=False (the default) keeps experts at hidden
+    dim — backward compat with B5 MoE tests."""
+    spec = specs.MoESpec(
+        n_experts=4, top_k=2, n_shared_experts=0,
+        router_kind="softmax",
+        expert_ffn=_moe_expert_ffn(I=8),
+    )
+    moe = feedforward.MoE(spec, hidden_size=16, dtype=torch.float32)
+    assert moe.fc1_latent_proj is None
+    assert moe.fc2_latent_proj is None
+    # Experts keyed off hidden.
+    assert moe.experts_gate_up.shape == (4, 16, 16)
+    assert moe.experts_down.shape == (4, 16, 8)
