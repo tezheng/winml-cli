@@ -448,6 +448,47 @@ class SSDSpec:
 
 
 @dataclass(frozen=True)
+class GatedDeltaNetSpec:
+    """v7 P3: Qwen3-Next Gated DeltaNet (linear-attention variant).
+
+    Architecture (source: `transformers/models/qwen3_next/modeling_qwen3_next.py
+    :499-717` Qwen3NextGatedDeltaNet):
+
+    - Two input projections in_proj_qkvz / in_proj_ba:
+        * in_proj_qkvz : Linear(hidden, 2*key_dim + 2*value_dim, bias=False)
+          → split into (q, k, v, z) where z is the output gate for the
+          gated RMSNorm.
+        * in_proj_ba   : Linear(hidden, 2*num_v_heads, bias=False)
+          → split into (b, a) where `b` produces beta (sigmoid value-update
+          coefficient) and `a` feeds the time-step `g = -exp(A_log) * softplus(a + dt_bias)`.
+    - One depthwise Conv1d over `q_dim + k_dim + v_dim` with kernel=4,
+      bias=False, padding=kernel-1.
+    - Per-head A_log Parameter[num_v_heads], dt_bias Parameter[num_v_heads].
+    - Qwen3NextRMSNormGated(head_v_dim, eps) — silu-gated RMS norm on the
+      DeltaNet output (`z` is the gate).
+    - out_proj: Linear(value_dim, hidden_size, bias=False).
+
+    Field semantics (Qwen3-Next 80B-A3B defaults, configuration_qwen3_next.py:25-56):
+    - num_v_heads (linear_num_value_heads): 32
+    - num_k_heads (linear_num_key_heads):   16
+    - head_k_dim  (linear_key_head_dim):    128
+    - head_v_dim  (linear_value_head_dim):  128
+    - conv_kernel (linear_conv_kernel_dim): 4
+    """
+    num_v_heads: int
+    num_k_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    conv_kernel: int = 4
+    # eps for both Qwen3NextRMSNormGated and the QK l2norm inside the
+    # delta-rule kernel. Source: modeling_qwen3_next.py:514, 70, 370.
+    norm_eps: float = 1e-6
+    # Output-gating switch. Qwen3-Next always silu-gates via the RMSNormGated
+    # module. Exposed as a knob for forward-compat with ungated variants.
+    silu_gate: bool = True
+
+
+@dataclass(frozen=True)
 class GroupRoutingSpec:
     """DeepSeek-V3 group-limited routing."""
     n_groups: int

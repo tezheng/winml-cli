@@ -769,3 +769,98 @@ def selective_scan(
     if pad_size > 0:
         y = y[:, :S, :, :]
     return y, ssm_state
+
+
+# ---------------------------------------------------------------------------
+# v7 P3: Qwen3-Next Gated DeltaNet — sequential delta-rule reference
+# ---------------------------------------------------------------------------
+
+
+def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """v7 P3: L2 norm matching the FLA convention used inside the Gated
+    DeltaNet kernel.
+
+    Source: `transformers/models/qwen3_next/modeling_qwen3_next.py:368-371`.
+    """
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+
+
+def gated_delta_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    use_qk_l2norm: bool = True,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """v7 P3: sequential per-step Gated DeltaNet recurrence.
+
+    Mirrors `torch_recurrent_gated_delta_rule` exactly
+    (`transformers/models/qwen3_next/modeling_qwen3_next.py:455-496`):
+
+        for i in range(S):
+            g_t   = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+            beta_t = beta[:, :, i].unsqueeze(-1)
+            state = state * g_t                       # decay
+            kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+            delta  = (v_t - kv_mem) * beta_t          # innovation
+            state  = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+            out[i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    Tensors come in with layout `[B, S, H, D]`; per the HF kernel we transpose
+    to `[B, H, S, D]` and run in fp32, then transpose back to `[B, S, H, D]`
+    on the way out.
+
+    Args:
+        q, k, v: [B, S, num_heads, head_dim_k] (q, k) and
+                  [B, S, num_heads, head_dim_v] (v).
+        g:        [B, S, num_heads] — log-decay term (negative).
+        beta:     [B, S, num_heads] — sigmoid-gated value-update coefficient.
+        initial_state: [B, num_heads, head_dim_k, head_dim_v] (optional).
+        use_qk_l2norm: if True, l2-normalize q,k along head_dim_k before the
+            scale-by-1/sqrt(d) and recurrence (kernel flag in HF).
+
+    Returns:
+        out:   [B, S, num_heads, head_dim_v]
+        state: [B, num_heads, head_dim_k, head_dim_v] — final recurrent state.
+    """
+    initial_dtype = q.dtype
+    if use_qk_l2norm:
+        q = l2norm(q, dim=-1, eps=eps)
+        k = l2norm(k, dim=-1, eps=eps)
+    # Transpose to [B, H, S, D].
+    q = q.transpose(1, 2).contiguous().to(torch.float32)
+    k = k.transpose(1, 2).contiguous().to(torch.float32)
+    v = v.transpose(1, 2).contiguous().to(torch.float32)
+    beta = beta.transpose(1, 2).contiguous().to(torch.float32)
+    g = g.transpose(1, 2).contiguous().to(torch.float32)
+
+    B, H, S, d_k = k.shape
+    d_v = v.shape[-1]
+    scale = 1.0 / (q.shape[-1] ** 0.5)
+    q = q * scale
+
+    out = torch.zeros(B, H, S, d_v, dtype=v.dtype, device=v.device)
+    if initial_state is None:
+        state = torch.zeros(B, H, d_k, d_v, dtype=v.dtype, device=v.device)
+    else:
+        state = initial_state.to(v)
+
+    for i in range(S):
+        q_t = q[:, :, i]                       # [B, H, d_k]
+        k_t = k[:, :, i]                       # [B, H, d_k]
+        v_t = v[:, :, i]                       # [B, H, d_v]
+        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)   # [B, H, 1, 1]
+        beta_t = beta[:, :, i].unsqueeze(-1)                 # [B, H, 1]
+
+        state = state * g_t
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)     # [B, H, d_v]
+        delta = (v_t - kv_mem) * beta_t                      # [B, H, d_v]
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    out = out.transpose(1, 2).contiguous().to(initial_dtype)  # [B, S, H, d_v]
+    return out, state

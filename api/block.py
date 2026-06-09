@@ -59,20 +59,25 @@ class DecoderBlock(nn.Module):
             raise NotImplementedError(
                 f"B3: PRE, PRE_AND_POST, and POST ffn-norm only, got {spec.ffn_norm_position}"
             )
-        # B7/v6 B1: token_mixer can be AttentionSpec, SSDSpec (Mamba-2),
-        # or SSMSpec (Mamba-1). AttentionSpec -> api.attention.Attention.
-        # SSDSpec -> api.ssm.Mamba2Mixer. SSMSpec -> api.ssm.Mamba1Mixer
-        # (v6 B1 — requires spec.kind=MAMBA1).
+        # B7/v6 B1/v7 P3: token_mixer can be AttentionSpec, SSDSpec (Mamba-2),
+        # SSMSpec (Mamba-1), or GatedDeltaNetSpec (Qwen3-Next).
         if not isinstance(
             spec.token_mixer,
-            (specs.AttentionSpec, specs.SSDSpec, specs.SSMSpec),
+            (specs.AttentionSpec, specs.SSDSpec, specs.SSMSpec,
+             specs.GatedDeltaNetSpec),
         ):
             raise NotImplementedError(
-                f"v6 B1: token_mixer must be AttentionSpec, SSDSpec, or "
-                f"SSMSpec, got {type(spec.token_mixer).__name__}"
+                f"v7 P3: token_mixer must be AttentionSpec, SSDSpec, "
+                f"SSMSpec, or GatedDeltaNetSpec, "
+                f"got {type(spec.token_mixer).__name__}"
             )
         self._is_ssm_block = isinstance(
             spec.token_mixer, (specs.SSDSpec, specs.SSMSpec),
+        )
+        # v7 P3: Gated DeltaNet is also a sequence-axis mixer (no
+        # position_ids / KV cache plumbing). Treat as SSM-like at forward.
+        self._is_gated_deltanet = isinstance(
+            spec.token_mixer, specs.GatedDeltaNetSpec,
         )
         # B5: channel_mixer can be FFNSpec (dense) OR MoESpec (DeepSeek-V2/V3
         # MoE layers). The DecoderBlock dispatches between FeedForward and
@@ -132,6 +137,11 @@ class DecoderBlock(nn.Module):
                 self.attention = _ssm.Mamba1Mixer(
                     spec.token_mixer, hidden_size, dtype=dtype,
                 )
+        elif self._is_gated_deltanet:
+            # v7 P3: Qwen3-Next Gated DeltaNet.
+            self.attention = _ssm.GatedDeltaNetMixer(
+                spec.token_mixer, hidden_size, dtype=dtype,
+            )
         else:
             self.attention = _attention.Attention(spec.token_mixer, hidden_size,
                                                   max_seq=max_seq, dtype=dtype)
@@ -259,6 +269,10 @@ class DecoderBlock(nn.Module):
         if self._is_ssm_block:
             # B7: SSM mixer takes (hidden_states, cache). Source:
             # modeling_mamba2.py:638 — `mixer(hidden_states, cache_params=...)`.
+            attn_out = self.attention(attn_in, cache=cache)
+        elif self._is_gated_deltanet:
+            # v7 P3: Gated DeltaNet — sequence-axis mixer, no position_ids /
+            # KV-cache. Source: modeling_qwen3_next.py:856-861.
             attn_out = self.attention(attn_in, cache=cache)
         else:
             attn_out = self.attention(attn_in, position_ids=position_ids,

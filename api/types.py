@@ -34,6 +34,13 @@ class TokenMixerKind(Enum):
     ATTENTION = auto()      # default — AttentionSpec
     SSM_MAMBA1 = auto()     # SSMSpec — Mamba-1 selective scan (v6 B1)
     SSM_MAMBA2 = auto()     # SSDSpec — Mamba-2 SSD form (B7)
+    # v7 P3: Qwen3-Next Gated DeltaNet — a linear-attention variant with
+    # matrix-valued recurrent state, sigmoid-gated value updates (beta), and
+    # silu-gated output mixing. Composes into a 3:1 hybrid stack with full
+    # attention (3 linear-attention layers per 1 full-attention layer).
+    # Source: `transformers/models/qwen3_next/modeling_qwen3_next.py:499-717`
+    # (Qwen3NextGatedDeltaNet).
+    GATED_DELTANET = auto()
 
 
 class SSMKind(Enum):
