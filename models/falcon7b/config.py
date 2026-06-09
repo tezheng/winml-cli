@@ -1,10 +1,19 @@
 """Falcon-7B config + spec adapter.
 
-Verified against `transformers.FalconConfig` for `tiiuae/falcon-7b`.
+Verified against `transformers.FalconConfig` for `tiiuae/falcon-7b`:
+- hidden_size=4544, num_attention_heads=71, num_kv_heads=1 (MQA)
+- num_hidden_layers=32, intermediate_size = 4 * hidden_size = 18176
+- parallel_attn=True, new_decoder_architecture=False (=> num_ln_in_parallel_attn=1)
+- bias=False (Linear bias OFF), but LayerNorm bias is the PyTorch default (=True)
+- activation="gelu" (exact, via get_activation('gelu') → nn.GELU(approximate='none'))
+- alibi=False (Falcon-7B uses RoPE)
 
-The decoder block uses PARALLEL residual + MQA. See models/falcon7b/
-__init__.py for the FFN-form caveat (SwiGLU substitution for the
-ungated GELU FFN).
+The decoder block uses PARALLEL residual (shared pre-norm fed to both
+attention and FFN) + MQA + RoPE SPLIT_HALF + ungated exact GELU FFN +
+LayerNorm-with-bias.
+
+v6 A2 lands the full decoder block; v5-phase2 V2 landed the attention
+sublayer only.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -56,36 +65,43 @@ class Falcon7BConfig:
             ),
         )
 
-    def to_block_spec(self) -> specs.DecoderBlockSpec:
-        """Falcon-7B decoder block.
-
-        block_layout=PARALLEL, num_ln_in_parallel_attn=1 — one shared
-        LayerNorm feeds both attn and FFN. We substitute RMSNorm for LN
-        and SwiGLU for the ungated GELU FFN (both substitutions are
-        documented Phase-3 gaps — the PARALLEL topology and MQA
-        attention are the V2 contribution).
-        """
-        norm_spec = specs.NormSpec(
-            kind=types.NormKind.RMS, eps=self.layer_norm_epsilon,
-            weight_mode=types.NormWeightMode.STANDARD_W,
-        )
-        # FFN substitution: Falcon's actual FFN is `dense_h_to_4h` →
-        # GELU → `dense_4h_to_h` (no gating). We use SwiGLU as a
-        # placeholder — same shape budget, different math. See
-        # models/falcon7b/__init__.py.
-        ffn_spec = specs.FFNSpec(
+    def to_ffn_spec(self) -> specs.FFNSpec:
+        """Falcon-7B FFN: ungated exact GELU.
+        Source: modeling_falcon.py:531-544 (FalconMLP — `dense_h_to_4h`,
+        `act = get_activation('gelu')`, `dense_4h_to_h`)."""
+        return specs.FFNSpec(
             intermediate_size=self.intermediate_size,
-            activation=types.Activation.SILU,
-            gate_kind=types.GateKind.SWIGLU,
+            activation=types.Activation.GELU_EXACT,
+            gate_kind=types.GateKind.GELU_ONLY,
             fused_gate_up=False,
             gate_bias=False, up_bias=False, down_bias=False,
         )
+
+    def to_norm_spec(self) -> specs.NormSpec:
+        """Falcon-7B LayerNorm with bias (Falcon `bias` config field only
+        affects Linears; LayerNorm uses PyTorch defaults i.e. bias=True).
+        Source: modeling_falcon.py:574-578."""
+        return specs.NormSpec(
+            kind=types.NormKind.LAYER,
+            eps=self.layer_norm_epsilon,
+            has_bias=True,
+        )
+
+    def to_block_spec(self) -> specs.DecoderBlockSpec:
+        """Falcon-7B decoder block — PARALLEL residual + MQA + RoPE + ungated
+        GELU FFN + LayerNorm with bias.
+
+        For Falcon-7B parallel_attn=True with new_decoder_architecture=False,
+        HF sets num_ln_in_parallel_attn=1 → ONE shared `input_layernorm` feeds
+        both the attention and the MLP. Source: modeling_falcon.py:565-578,
+        594-634.
+        """
         return specs.DecoderBlockSpec(
             attn_norm_position=types.NormPosition.PRE,
             ffn_norm_position=types.NormPosition.PRE,
             token_mixer=self.to_attention_spec(),
-            channel_mixer=ffn_spec,
-            pre_attn_norm=norm_spec,
+            channel_mixer=self.to_ffn_spec(),
+            pre_attn_norm=self.to_norm_spec(),
             pre_ffn_norm=None,          # PARALLEL: shared pre_attn_norm
             block_layout=types.BlockLayout.PARALLEL,
         )
