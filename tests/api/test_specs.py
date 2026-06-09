@@ -403,3 +403,97 @@ def test_b5_decoder_block_spec_accepts_moe():
         pre_ffn_norm=norm,
     )
     assert isinstance(block.channel_mixer, specs.MoESpec)
+
+
+# ---------------------------------------------------------------------------
+# v7 spec coverage
+# ---------------------------------------------------------------------------
+
+
+def test_v7_p1_moe_spec_hash_router_fields():
+    """v7 P1: MoESpec carries hash routing fields, default to safe values."""
+    spec = specs.MoESpec(
+        n_experts=8, top_k=2, router_kind="hash",
+        hash_vocab_size=32000,
+        expert_ffn=specs.FFNSpec(
+            intermediate_size=64, activation=types.Activation.SILU,
+            gate_kind=types.GateKind.SWIGLU,
+        ),
+    )
+    assert spec.router_kind == "hash"
+    assert spec.hash_vocab_size == 32000
+    assert spec.hash_score_fn == "sigmoid"
+    # Frozen.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.hash_vocab_size = 1  # type: ignore
+
+
+def test_v7_p2_csa_spec_frozen_and_carries_v4_defaults():
+    """v7 P2: CSASpec is frozen and exposes paper-cited fields."""
+    spec = specs.CSASpec(
+        compress_rate=4, block_size=4,
+        indexer_n_heads=64, indexer_head_dim=128, indexer_topk=512,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.compress_rate = 8  # type: ignore
+
+
+def test_v7_p2_hca_spec_frozen():
+    spec = specs.HCASpec(compress_rate=128, hierarchy_levels=1)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.compress_rate = 64  # type: ignore
+
+
+def test_v7_p2_attention_kind_csa_hca_enum_present():
+    """v7 P2: types.AttentionKind.CSA_HCA exists and is distinct from DSA."""
+    assert types.AttentionKind.CSA_HCA is not types.AttentionKind.DSA
+    assert types.AttentionKind.CSA_HCA is not types.AttentionKind.MLA
+    # Round-trip through AttentionSpec.
+    spec = specs.AttentionSpec(
+        n_q_heads=8, n_kv_heads=8, head_dim=64,
+        kind=types.AttentionKind.CSA_HCA,
+        qkv_layout=types.QKVLayout.SPLIT,
+        mask_kind=types.MaskKind.CAUSAL,
+        hca=specs.HCASpec(compress_rate=128),
+    )
+    assert spec.kind == types.AttentionKind.CSA_HCA
+    assert spec.hca is not None
+    assert spec.csa is None
+
+
+def test_v7_p3_gated_deltanet_spec_frozen_and_defaults():
+    """v7 P3: GatedDeltaNetSpec frozen + canonical Qwen3-Next defaults."""
+    spec = specs.GatedDeltaNetSpec(
+        num_v_heads=32, num_k_heads=16,
+        head_k_dim=128, head_v_dim=128,
+    )
+    assert spec.conv_kernel == 4
+    assert spec.norm_eps == 1e-6
+    assert spec.silu_gate is True
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.num_v_heads = 1  # type: ignore
+
+
+def test_v7_p3_token_mixer_kind_gated_deltanet_enum_present():
+    """v7 P3: types.TokenMixerKind.GATED_DELTANET exists."""
+    assert hasattr(types.TokenMixerKind, "GATED_DELTANET")
+    assert (
+        types.TokenMixerKind.GATED_DELTANET
+        is not types.TokenMixerKind.SSM_MAMBA1
+    )
+
+
+def test_v7_p4_moe_spec_latent_routing_fields():
+    """v7 P4: MoESpec exposes routing_in_latent / latent_dim / latent_bias."""
+    spec = specs.MoESpec(
+        n_experts=64, top_k=4,
+        router_kind="sigmoid_plus_bias",
+        routing_in_latent=True, latent_dim=512,
+        expert_ffn=specs.FFNSpec(
+            intermediate_size=1024, activation=types.Activation.SILU,
+            gate_kind=types.GateKind.SWIGLU,
+        ),
+    )
+    assert spec.routing_in_latent is True
+    assert spec.latent_dim == 512
+    assert spec.latent_bias is False
