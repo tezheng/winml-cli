@@ -72,6 +72,68 @@ class Gemma4Config:
         else:
             dtype = _TORCH_DTYPE_MAP.get(dt_raw, torch.bfloat16)
 
+        # Accept BOTH shapes for backward compatibility:
+        #   (1) Legacy flat shape — pre-bridged by callers / synthetic test dicts.
+        #       Top-level `rope_theta`, `rope_global_theta`,
+        #       `partial_rotary_factor_global`, `sliding_window_pattern`.
+        #   (2) Raw HF shape — exactly what `hf_model.config.text_config.to_dict()`
+        #       emits (verified against `google/gemma-4-e2b-it/config.json` and
+        #       `transformers/models/gemma4/configuration_gemma4.py:210-215`).
+        #       RoPE lives under `rope_parameters.{sliding,full}_attention.*` and
+        #       the SWA period is encoded as a per-layer `layer_types` list.
+        rope_params = d.get("rope_parameters") or {}
+        sliding_rope = rope_params.get("sliding_attention", {})
+        full_rope = rope_params.get("full_attention", {})
+
+        # rope_theta_local: prefer flat > nested.sliding_attention > 10000.0
+        if "rope_theta" in d:
+            rope_theta_local = float(d["rope_theta"])
+        elif "rope_theta" in sliding_rope:
+            rope_theta_local = float(sliding_rope["rope_theta"])
+        else:
+            rope_theta_local = 10_000.0
+
+        # rope_theta_global: prefer flat > nested.full_attention > rope_theta_local
+        if "rope_global_theta" in d:
+            rope_theta_global = float(d["rope_global_theta"])
+        elif "rope_theta" in full_rope:
+            rope_theta_global = float(full_rope["rope_theta"])
+        else:
+            rope_theta_global = rope_theta_local
+
+        # partial_rotary_factor_global: prefer flat > nested.full_attention > 1.0
+        # The 1.0 default is intentional fallback for non-Gemma-4 callers; on raw
+        # HF dicts the nested value (0.25 for E2B) wins, which is the bug fix.
+        if "partial_rotary_factor_global" in d:
+            partial_rotary_factor_global = float(d["partial_rotary_factor_global"])
+        elif "partial_rotary_factor" in full_rope:
+            partial_rotary_factor_global = float(full_rope["partial_rotary_factor"])
+        else:
+            partial_rotary_factor_global = 1.0
+
+        # sliding_window_pattern: prefer flat > derive from `layer_types` > 4.
+        # HF encodes the pattern as a per-layer list `["sliding_attention", ...,
+        # "full_attention", ...]`. The period is the index of the first
+        # `full_attention` entry (matches Gemma4TextConfig.__post_init__ which
+        # generates `bool((i+1) % sliding_window_pattern)` => global every Nth).
+        if "sliding_window_pattern" in d:
+            sliding_window_pattern = d["sliding_window_pattern"]
+        else:
+            layer_types = d.get("layer_types")
+            if layer_types and "full_attention" in layer_types:
+                sliding_window_pattern = layer_types.index("full_attention")
+            else:
+                sliding_window_pattern = 4
+
+        # Per-Layer Embedding: HF text config exposes `hidden_size_per_layer_input`
+        # (presence => PLE is active on E2B/E4B). Legacy flat dicts use the
+        # explicit `use_per_layer_embedding` boolean + `ple_dim`. Accept both.
+        if "use_per_layer_embedding" in d:
+            use_per_layer_embedding = bool(d["use_per_layer_embedding"])
+        else:
+            use_per_layer_embedding = "hidden_size_per_layer_input" in d
+        ple_dim = d.get("ple_dim", d.get("hidden_size_per_layer_input", 256))
+
         return Gemma4Config(
             hidden_size=d["hidden_size"],
             num_hidden_layers=d["num_hidden_layers"],
@@ -80,11 +142,11 @@ class Gemma4Config:
             head_dim=d["head_dim"],
             global_head_dim=d.get("global_head_dim", d["head_dim"]),
             intermediate_size=d["intermediate_size"],
-            rope_theta_local=float(d["rope_theta"]),
-            rope_theta_global=float(d.get("rope_global_theta", d["rope_theta"])),
-            partial_rotary_factor_global=float(d.get("partial_rotary_factor_global", 1.0)),
+            rope_theta_local=rope_theta_local,
+            rope_theta_global=rope_theta_global,
+            partial_rotary_factor_global=partial_rotary_factor_global,
             sliding_window=d["sliding_window"],
-            sliding_window_pattern=d.get("sliding_window_pattern", 4),
+            sliding_window_pattern=sliding_window_pattern,
             rms_norm_eps=float(d["rms_norm_eps"]),
             vocab_size=d["vocab_size"],
             max_position_embeddings=d["max_position_embeddings"],
@@ -94,8 +156,8 @@ class Gemma4Config:
             final_logit_softcap=d.get("final_logit_softcapping"),
             attn_logit_softcap=d.get("attn_logit_softcapping"),
             num_kv_shared_layers=d.get("num_kv_shared_layers", 0),
-            use_per_layer_embedding=bool(d.get("use_per_layer_embedding", False)),
-            ple_dim=d.get("ple_dim", 256),
+            use_per_layer_embedding=use_per_layer_embedding,
+            ple_dim=ple_dim,
             attention_k_eq_v=bool(d.get("attention_k_eq_v", False)),
             qk_norm_local_fixed_scale=float(d.get("qk_norm_local_fixed_scale", 0.9916)),
             qk_norm_global_fixed_scale=float(d.get("qk_norm_global_fixed_scale", 1.0228)),

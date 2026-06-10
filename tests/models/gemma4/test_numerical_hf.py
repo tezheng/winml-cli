@@ -129,21 +129,10 @@ def test_layer0_forward_matches_hf(hf_model):
     text_cfg_dict = (cfg_hf.text_config.to_dict()
                      if hasattr(cfg_hf, "text_config")
                      else cfg_hf.to_dict())
-    # Bridge from the HF dual-RoPE shape to our flat config.
-    rope_params = text_cfg_dict.get("rope_parameters", {})
-    bridged = dict(text_cfg_dict)
-    if rope_params:
-        sliding = rope_params.get("sliding_attention", {})
-        full = rope_params.get("full_attention", {})
-        bridged["rope_theta"] = sliding.get("rope_theta", 10000.0)
-        bridged["rope_global_theta"] = full.get("rope_theta", 1_000_000.0)
-        bridged["partial_rotary_factor_global"] = full.get("partial_rotary_factor", 1.0)
-    # Sliding-window pattern — HF uses `layer_types` list; we encode as period.
-    layer_types = text_cfg_dict.get("layer_types")
-    if layer_types and "full_attention" in layer_types:
-        first_global = layer_types.index("full_attention")
-        bridged["sliding_window_pattern"] = first_global
-    cfg = g4_config.Gemma4Config.from_hf_dict(bridged)
+    # B0.6 (post-fix): `from_hf_dict` now reads the raw HF dual-RoPE shape
+    # directly (rope_parameters.{sliding,full}_attention.*, layer_types list).
+    # No pre-bridging required — exercise the new path with the raw dict.
+    cfg = g4_config.Gemma4Config.from_hf_dict(text_cfg_dict)
 
     # Build our layer-0 (local SWA)
     api_blk = g4_layer.build_gemma4_decoder_layer(
@@ -241,19 +230,9 @@ def test_layer4_global_forward_matches_hf(hf_model):
     text_cfg_dict = (cfg_hf.text_config.to_dict()
                      if hasattr(cfg_hf, "text_config")
                      else cfg_hf.to_dict())
-    rope_params = text_cfg_dict.get("rope_parameters", {})
-    bridged = dict(text_cfg_dict)
-    if rope_params:
-        sliding = rope_params.get("sliding_attention", {})
-        full = rope_params.get("full_attention", {})
-        bridged["rope_theta"] = sliding.get("rope_theta", 10000.0)
-        bridged["rope_global_theta"] = full.get("rope_theta", 1_000_000.0)
-        bridged["partial_rotary_factor_global"] = full.get("partial_rotary_factor", 1.0)
-    layer_types = text_cfg_dict.get("layer_types")
-    if layer_types and "full_attention" in layer_types:
-        first_global = layer_types.index("full_attention")
-        bridged["sliding_window_pattern"] = first_global
-    cfg = g4_config.Gemma4Config.from_hf_dict(bridged)
+    # B0.6 (post-fix): `from_hf_dict` reads raw HF nested rope_parameters /
+    # layer_types directly. No pre-bridging.
+    cfg = g4_config.Gemma4Config.from_hf_dict(text_cfg_dict)
 
     LAYER_IDX = 4
     if LAYER_IDX >= cfg.num_hidden_layers:

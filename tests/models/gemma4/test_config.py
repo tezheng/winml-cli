@@ -73,6 +73,79 @@ def test_gemma4_e2b_to_block_spec_global_layer():
     assert block_spec.token_mixer.rope.base_theta == 1_000_000.0
 
 
+def test_gemma4_from_hf_dict_accepts_raw_nested_rope_parameters():
+    """Real HF Gemma 4 config stores RoPE under `rope_parameters.{sliding,full}_attention.*`.
+
+    Verified against `google/gemma-4-e2b-it/config.json` and
+    `transformers/models/gemma4/configuration_gemma4.py::Gemma4TextConfig.__post_init__`
+    (default_rope_params, lines 210-215). The raw `hf_model.config.text_config.to_dict()`
+    has NO top-level `rope_theta`, `rope_global_theta`, or `partial_rotary_factor_global` —
+    they're all nested. `from_hf_dict` must read the nested shape directly without
+    requiring callers to pre-bridge.
+
+    Pre-B0.6: `from_hf_dict` raised `KeyError("rope_theta")` on the raw dict, and
+    when callers manually flattened only `rope_theta` it silently defaulted
+    `partial_rotary_factor_global` to 1.0 (wrong — correct is 0.25 for E2B globals).
+    """
+    # Raw HF text-config shape — exact structure emitted by
+    # `hf_model.config.text_config.to_dict()` for `google/gemma-4-e2b-it`.
+    hf = {
+        "model_type": "gemma4_text",
+        "hidden_size": 1536,
+        "num_hidden_layers": 35,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 1,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "intermediate_size": 8192,
+        # NO top-level rope_theta / rope_global_theta / partial_rotary_factor_global
+        "rope_parameters": {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0},
+            "full_attention": {
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 1_000_000.0,
+            },
+        },
+        "sliding_window": 512,
+        # HF emits `layer_types` (per-layer list), not `sliding_window_pattern`.
+        "layer_types": (
+            ["sliding_attention"] * 4 + ["full_attention"]
+        ) * 7,  # 35 layers, 4:1 SWA:global
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 262144,
+        "max_position_embeddings": 32768,
+        "tie_word_embeddings": True,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "dtype": "bfloat16",
+        "final_logit_softcapping": 30.0,
+        "attn_logit_softcapping": None,
+        "num_kv_shared_layers": 20,
+        "hidden_size_per_layer_input": 256,  # HF name for ple_dim; presence => PLE used
+        "attention_k_eq_v": False,
+    }
+    c = config.Gemma4Config.from_hf_dict(hf)
+    assert c.rope_theta_local == 10_000.0
+    assert c.rope_theta_global == 1_000_000.0
+    # The critical silent-bug check: must be 0.25, not the old 1.0 default.
+    assert c.partial_rotary_factor_global == 0.25
+    # sliding_window_pattern must be derived from layer_types: index of first
+    # full_attention is 4 (after 4 sliding layers).
+    assert c.sliding_window_pattern == 4
+
+
+def test_gemma4_from_hf_dict_still_accepts_legacy_flat_shape():
+    """Backward compat: existing call sites that pre-bridge to a flat dict
+    (top-level `rope_theta`, `rope_global_theta`, `partial_rotary_factor_global`,
+    `sliding_window_pattern`) must continue to work unchanged."""
+    hf = _e2b_minimal_hf_dict()
+    c = config.Gemma4Config.from_hf_dict(hf)
+    assert c.rope_theta_local == 10_000.0
+    assert c.rope_theta_global == 1_000_000.0
+    assert c.partial_rotary_factor_global == 0.25
+    assert c.sliding_window_pattern == 4
+
+
 def test_gemma4_e2b_shared_layer_indices():
     c = _e2b_config()
     # E2B: num_kv_shared_layers=20 means the last 20 layers reuse the K/V from
