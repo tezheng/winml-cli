@@ -27,9 +27,14 @@ def _small_cfg(**overrides):
 
 
 def test_layer_forward_shape():
+    torch.manual_seed(0)
     cfg = _small_cfg()
     blk = _l.build_minimax_m2_decoder_layer(cfg, layer_idx=0)
     blk.eval()
+    # MoE expert tensors are torch.empty(); initialise before forward.
+    with torch.no_grad():
+        for p in blk.feedforward.parameters():
+            p.normal_(0.0, 0.02)
     assert isinstance(blk.feedforward, feedforward.MoE)
     B, S = 1, 6
     cache_spec = specs.KVCacheSpec(

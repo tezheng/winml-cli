@@ -84,9 +84,14 @@ def test_dense_ffn_sublayer_forward():
 
 def test_moe_sublayer_forward():
     """The MoE forward runs on a sparse-layer block."""
+    torch.manual_seed(0)
     cfg = _small_cfg()
     blk = _l.build_glm_moe_dsa_decoder_layer(cfg, layer_idx=3)
     blk.eval()
+    # MoE expert tensors are torch.empty(); initialise before forward.
+    with torch.no_grad():
+        for p in blk.feedforward.parameters():
+            p.normal_(0.0, 0.02)
     x = torch.randn(1, 4, cfg.hidden_size)
     with torch.no_grad():
         y = blk.feedforward(x)

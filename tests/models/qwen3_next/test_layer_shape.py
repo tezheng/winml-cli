@@ -40,6 +40,7 @@ def _small_cfg(**overrides):
 
 
 def test_linear_attention_layer_forward_shape():
+    torch.manual_seed(0)
     cfg = _small_cfg()
     blk = _l.build_qwen3_next_decoder_layer(cfg, layer_idx=0)
     blk.eval()

@@ -66,9 +66,17 @@ def test_block_constructs_for_topk_sliding_layer():
 def test_hash_moe_sublayer_forward_runs():
     """The MoE sublayer forward (hash routing) returns the right shape and
     requires input_ids."""
+    torch.manual_seed(0)
     cfg = _small_cfg()
     blk = _l.build_deepseek_v4_decoder_layer(cfg, layer_idx=0)
     blk.eval()
+    # The MoE expert tensors are allocated via `torch.empty()` (uninitialized
+    # memory) — initialise them with sensible randn before the forward so the
+    # output stays finite regardless of test ordering / memory state.
+    with torch.no_grad():
+        for p in blk.feedforward.parameters():
+            p.normal_(0.0, 0.02)
+        blk.feedforward.gate.tid2eid.random_(0, cfg.n_routed_experts)
     B, S = 2, 5
     moe = blk.feedforward
     x = torch.randn(B, S, cfg.hidden_size)
