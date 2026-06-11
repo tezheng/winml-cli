@@ -4,6 +4,23 @@ Minimal, evidence-grounded API for assembling mainstream small language models
 (<8B params) as decoder graphs, with quantization and KV-cache as first-class
 parameters.
 
+## Status — M1 → M2 → v5 → v6 → v7 complete
+
+41 architecturally distinct model families landed (39 with full layer.py +
+2 shape-only stubs `gpt_oss`, `hunyuan_large`), 6 quant schemes operational,
+751 tests collected, 22 git tags placed (latest `v7-complete`).
+
+```powershell
+uv sync --extra test --extra dev
+uv run pytest -v
+```
+
+The v5 → v7 release waves extended the M2 IR to cover ALiBi, parallel
+residual blocks, BitNet ternary, GPT-OSS trained attention sinks, CLA
+cross-layer KV pointers, Mamba-1 selective scan, the Jamba Mamba/attention
+alternation, and the four v7 frontier-MoE patterns: DeepSeek-V4 hash routing
++ CSA/HCA, Qwen3-Next Gated DeltaNet, GLM-MoE-DSA, MiniMax-M2.
+
 ## Design
 
 See `docs/superpowers/specs/2026-06-04-llm-layers-design.v2.md` (M1) and
@@ -41,10 +58,9 @@ See:
 
 B0.5 lands the v3 IR extensions needed by Gemma 4 (the most architecturally
 divergent SLM family in the M2 census). All spec and code is in place; the
-four new spec fields, the new `PLESpec` and `ShareScheme` enum, the
-`SharedLayerKVCache` wrapper, and the new `api/embedding.py` module are
-exercised by 30+ B0.5 tests. See `models/gemma4/layer.md` for the layer
-documentation.
+new spec fields, the new `PLESpec`, the `SharedLayerKVCache` wrapper, and
+the new `api/embedding.py` module are exercised by 30+ B0.5 tests. See
+`models/gemma4/layer.md` for the layer documentation.
 
 New spec fields:
 - `AttentionSpec.attention_k_eq_v` — Gemma 4 12B+ global K=V aliasing.
@@ -52,9 +68,12 @@ New spec fields:
 - `RoPESpec.partial_rotary_factor` — Gemma 4 global partial-RoPE 0.25, Phi-3.
 - `DecoderBlockSpec.per_layer_embedding` (`PLESpec`) — Gemma 4 E2B PLE.
 
-New enums / types:
-- `types.ShareScheme` (NONE / SAME_BLOCK_SHARED / CROSS_BLOCK_SHARED).
+New types:
 - `specs.PLESpec` (Per-Layer Embedding parameters).
+- Cross-layer KV sharing is now expressed via
+  `AttentionSpec.kv_source_layer_offset` (v5 Phase 1 cleanup) plus the
+  per-family `kv_source_layer_idx_map()` on the model config (see
+  `models/gemma4/config.py:257-285` for the canonical dispatcher).
 
 New modules:
 - `api/embedding.py` — `PerLayerEmbedding` (Gemma 4 PLE table + projection).
