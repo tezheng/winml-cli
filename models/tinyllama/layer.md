@@ -1,5 +1,14 @@
 # TinyLlama 1.1B — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Llama-2 backbone at 1.1B scale — GQA-32:4 (unusual: 32 Q / 4 KV) + vanilla RoPE (θ=10k) + SwiGLU + RMSNorm
+- **Active params:** 1.1B total
+- **Layer mix:** 22 attn (GQA-32:4, all causal)
+- **KV cache / token (bf16):** 22 L × 4 KV × 64 Dh × 2 × 2 = 22 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** TinyLlama (community model — Llama architecture).

@@ -1,5 +1,14 @@
 # MiniCPM-3 (openbmb/MiniCPM3-4B) — layer.md
 
+## 0. At-a-glance
+
+- **Signature:** MLA (q_lora_rank=768, kv_lora_rank=256) + Llama-shape PRE-norm backbone + partial-rotary on qk_rope slice + μP residual scaling
+- **Active params:** ~4B (MiniCPM3-4B, dense)
+- **Layer mix:** 62 attn (dense, MLA throughout)
+- **KV cache / token (bf16):** ~35 kB (62 layers × (256 + 32) × 2 B = 35712 B)
+
+---
+
 This document captures the decoder-layer architecture of MiniCPM-3 as
 understood from the openbmb HF repo (`configuration_minicpm.py`,
 `modeling_minicpm.py`, `config.json`). It serves as the source-of-truth for

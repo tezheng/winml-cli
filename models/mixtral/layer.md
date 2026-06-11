@@ -1,5 +1,14 @@
 # Mixtral 8x7B — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Llama backbone + softmax MoE (8 experts, top-2, no shared experts, always-on renorm)
+- **Active params:** ~12.9B active / ~46.7B total (28%)
+- **Layer mix:** 32 attn (all MoE channel mixer, GQA 32Q/8KV)
+- **KV cache / token (bf16):** 128 kB (32 layers × 8 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Mixtral 8x7B (Mistral AI) — canonical softmax-routed MoE.

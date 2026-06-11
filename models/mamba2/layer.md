@@ -1,5 +1,14 @@
 # Mamba-2 — one decoder layer (B7)
 
+## 0. At-a-glance
+
+- **Signature:** Pure Mamba-2 SSD selective scan, no attention, no FFN sublayer (skip_ffn=True)
+- **Active params:** ~2.7B (state-spaces/mamba2-2.7b reference)
+- **Layer mix:** 64 SSM-mamba2 + 0 attn
+- **KV cache / token (bf16):** `n/a (SSM state, not KV)`
+
+---
+
 **Reference HF model:** `state-spaces/mamba2-2.7b` (variants: 130M, 370M,
 780M, 1.3B, 2.7B at `state-spaces/`).
 

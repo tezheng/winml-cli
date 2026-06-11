@@ -1,5 +1,14 @@
 # DeepSeek-V3 (671B) — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Production-dim wrapper around V3 architecture — MLA + sigmoid+bias group-routing MoE (shape-only at 671B scale)
+- **Active params:** ~37B active / ~671B total (6%) (approximate, real config)
+- **Layer mix:** 61 attn (3 dense + 58 MoE, sigmoid+bias top-8 + 1 shared)
+- **KV cache / token (bf16):** ~69 kB (61 layers × (512 + 64) × 2 B = 70272 B, MLA formula)
+
+---
+
 ## 1. Identity
 
 - **Family:** DeepSeek-V3 (DeepSeek). 671B total params, ~37B active per token.

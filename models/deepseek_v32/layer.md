@@ -1,5 +1,14 @@
 # DeepSeek-V3.2 — DSA Lightning Indexer (shape-only)
 
+## 0. At-a-glance
+
+- **Signature:** MLA + DSA Lightning Indexer (indexer_dim=64, top-k scoring per query) on V3 backbone (shape-only forward)
+- **Active params:** ~37B active / ~671B total (6%) (approximate, real config; no published HF weights yet)
+- **Layer mix:** 61 attn (3 dense + 58 MoE, V3-identical MoE routing)
+- **KV cache / token (bf16):** ~69 kB (61 layers × (512 + 64) × 2 B = 70272 B, MLA formula)
+
+---
+
 V3.2 = V3 + **DeepSeek Sparse Attention (DSA)**. The architectural delta
 relative to V3 is a new **Lightning Indexer** head per attention layer
 that scores `(query, key)` pairs cheaply via a separate Q/K projection of

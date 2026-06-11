@@ -1,5 +1,14 @@
 # DeepSeek-OCR-2 — LM-Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Standard MHA (no MLA) + softmax MoE LM portion (causal mask, not block-bidirectional) — vision encoder out of scope
+- **Active params:** ~570M active / ~3B total (19%) (3B-MoE-A570M canonical checkpoint)
+- **Layer mix:** 12 attn (1 dense + 11 MoE, softmax top-6 + 2 shared)
+- **KV cache / token (bf16):** 60 kB (12 layers × 10 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** DeepSeek-OCR-2 (DeepSeek-AI)

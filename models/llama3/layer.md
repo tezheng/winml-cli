@@ -1,5 +1,14 @@
 # Llama 3 / 3.1 / 3.2 — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** GQA + vanilla RoPE (θ=500k, Llama-3 smooth-scaling for 3.1/3.2) + SwiGLU + RMSNorm; no QK-norm
+- **Active params:** 1.2B total (3.2 1B) / 3.2B total (3.2 3B) / 8.0B total (3.0/3.1 8B)
+- **Layer mix:** 32 attn (dense) — all layers uniform
+- **KV cache / token (bf16):** 3.2 1B: 32 L × 8 KV × 64 Dh × 2 × 2 = 64 kB; 3.2 3B: 28 L × 8 KV × 128 Dh × 2 × 2 = 112 kB; 8B: 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Llama 3 (Meta)

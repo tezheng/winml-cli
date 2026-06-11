@@ -1,5 +1,14 @@
 # MiniMax-M2 — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** GQA + FULL_HDH QK-norm (OLMo-2 style) + sigmoid+bias MoE (no group routing, no shared experts) — confirmed NOT Lightning Attention
+- **Active params:** ~45.9B active / ~456B total (10%) for MiniMax-Text-01
+- **Layer mix:** 80 attn (all MoE, sigmoid+bias top-8, 256 experts)
+- **KV cache / token (bf16):** 320 kB (80 layers × 8 kv heads × 128 head_dim × 4 B)
+
+---
+
 **Source-of-truth**: `transformers/models/minimax_m2/{configuration,modeling}_minimax_m2.py`
 (transformers 5.10.x).
 

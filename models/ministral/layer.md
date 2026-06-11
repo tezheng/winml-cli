@@ -1,5 +1,14 @@
 # Ministral 8B (and Ministral-3-3B) — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Mistral backbone + interleaved SWA (1:3 full:sliding pattern per layer_types) + SwiGLU + RMSNorm; θ=100M
+- **Active params:** 3B / 8B total
+- **Layer mix:** 36 attn (8B, GQA-32:8), 1 full + 3 sliding alternating (1:3 per 4-layer period)
+- **KV cache / token (bf16):** 8B: 36 L × 8 KV × 128 Dh × 2 × 2 = 144 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Ministral (Mistral AI, 2024 release "les Ministraux")

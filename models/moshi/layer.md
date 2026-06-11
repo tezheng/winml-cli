@@ -1,5 +1,14 @@
 # Moshi 7B — Main-Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Helium MHA + fused gate-up SwiGLU (CAUSAL mask, no QK-norm) — dual-stream text+audio handled at model level, not per-layer
+- **Active params:** ~7B (main decoder dense, Helium backbone)
+- **Layer mix:** 32 attn (dense GQA 32Q/8KV, all causal)
+- **KV cache / token (bf16):** 128 kB (32 layers × 8 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Moshi (Kyutai)

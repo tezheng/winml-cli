@@ -1,5 +1,14 @@
 # Gemma 3 Reference Layer
 
+## 0. At-a-glance
+
+- **Signature:** Sandwich norm (ONE_PLUS_W) + QK-norm PRE-RoPE PER_HEAD_DH + 5:1 SWA/global + dual θ (local=10k/global=1M) + GeGLU; no softcap
+- **Active params:** 1B / 4B total
+- **Layer mix:** 24 attn (1B, 5 SWA + 1 global per 6-layer period) / 36 attn (4B, same pattern)
+- **KV cache / token (bf16):** 1B: 24 L × 4 KV × 256 Dh × 2 × 2 = 96 kB; 4B: 36 L × 4 KV × 256 Dh × 2 × 2 = 144 kB
+
+---
+
 This document describes the architectural primitives of the Gemma 3 decoder
 layer as implemented by `models.gemma3.{config,layer}`, mapped to the IR types
 in `api/`.

@@ -1,5 +1,14 @@
 # Gemma 2 Reference Layer
 
+## 0. At-a-glance
+
+- **Signature:** Sandwich norm (ONE_PLUS_W) + alternating 1:1 SWA/global + GeGLU + attn_logit_softcap=50 + final_logit_softcap=30; no QK-norm
+- **Active params:** 2.6B / 9B total
+- **Layer mix:** 26 attn (2B, 1:1 SWA/global) / 42 attn (9B, 1:1 SWA/global)
+- **KV cache / token (bf16):** 2B: 26 L × 4 KV × 256 Dh × 2 × 2 = 104 kB; 9B: 42 L × 4 KV × 256 Dh × 2 × 2 = 168 kB
+
+---
+
 This document describes the architectural primitives of the Gemma 2 decoder
 layer as implemented by `models.gemma2.{config,layer}`, mapped to the IR types
 in `api/`.

@@ -1,5 +1,14 @@
 # SmolLM3-3B — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** GQA-16:4 + NoPE every 4th layer (iRoPE precursor) + SwiGLU + RMSNorm; θ=5M
+- **Active params:** 3B total
+- **Layer mix:** 28 attn (GQA-16:4), NoPE at layers 3, 7, 11, ... (every 4th)
+- **KV cache / token (bf16):** 28 L × 4 KV × 128 Dh × 2 × 2 = 56 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** SmolLM3 (HuggingFaceTB)

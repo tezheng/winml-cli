@@ -1,5 +1,14 @@
 # Qwen3-MoE — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Qwen3 backbone + per-layer dense/MoE dispatch (mlp_only_layers in config) + PRE-RoPE QK-norm
+- **Active params:** ~3B active / ~30B total (10%) for Qwen3-30B-A3B; ~22B active / ~235B total for Qwen3-235B-A22B
+- **Layer mix:** 28 attn (all layers; MoE channel unless in mlp_only_layers, 128 experts top-8)
+- **KV cache / token (bf16):** 56 kB (28 layers × 4 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Qwen3-MoE (Alibaba). Reference checkpoints: `Qwen/Qwen3-30B-A3B`

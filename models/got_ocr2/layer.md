@@ -1,5 +1,14 @@
 # GOT-OCR 2.0 — LM-Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Qwen2-0.5B LM portion + linear vision connector (LM-decoder only in scope); Qwen2-style QKV biases, no QK-norm
+- **Active params:** ~0.5B (LM decoder; 0.58B total including vision encoder)
+- **Layer mix:** 24 attn (dense MHA 16Q/16KV, all causal)
+- **KV cache / token (bf16):** 96 kB (24 layers × 16 kv heads × 64 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** GOT-OCR 2.0 (StepFun)

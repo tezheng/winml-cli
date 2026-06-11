@@ -1,5 +1,14 @@
 # Phi-4-mini-instruct — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Phi-3 code path + GQA-24:8 + partial RoPE (factor=0.75, 96/128 channels) + LongRoPE (4096→131072) + fused QKV + fused gate_up + RMSNorm
+- **Active params:** 3.8B total
+- **Layer mix:** 32 attn (GQA-24:8, all causal, no SWA)
+- **KV cache / token (bf16):** 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Phi-4 (Microsoft)

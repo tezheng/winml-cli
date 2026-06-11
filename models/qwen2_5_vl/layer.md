@@ -1,5 +1,14 @@
 # Qwen2.5-VL — LM-Decoder Layer (with M-RoPE)
 
+## 0. At-a-glance
+
+- **Signature:** M-RoPE 2D/3D multi-dim position (mrope_section=[16,24,24]) + Qwen2.5 backbone (QKV biases, no QK-norm)
+- **Active params:** ~3B (Qwen2.5-VL-3B-Instruct LM decoder)
+- **Layer mix:** 36 attn (dense GQA 16Q/2KV, all causal)
+- **KV cache / token (bf16):** 36 kB (36 layers × 2 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Qwen2.5-VL (Alibaba)

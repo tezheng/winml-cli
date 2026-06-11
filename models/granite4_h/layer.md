@@ -1,5 +1,14 @@
 # Granite 4 H — one decoder layer (B7)
 
+## 0. At-a-glance
+
+- **Signature:** 9:1 Mamba-2 : GQA hybrid with Granite μP scalars on all layers (residual_multiplier, attention_multiplier, embedding_multiplier)
+- **Active params:** ~3B (granite-4.0-h-micro dense, no MoE)
+- **Layer mix:** 40 layers (36 Mamba-2 SSM + 4 attn GQA, 9:1)
+- **KV cache / token (bf16):** ~8 kB (4 attn layers × 8 kv heads × 64 head_dim × 4 B)
+
+---
+
 **Reference HF model:** `ibm-granite/granite-4.0-h-micro` (open, ~3B).
 
 **HF source file:** `transformers/models/granitemoehybrid/modeling_granitemoehybrid.py` (1412 LoC).

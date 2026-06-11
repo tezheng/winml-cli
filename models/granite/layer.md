@@ -1,5 +1,14 @@
 # Granite 3.x — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Llama backbone + μP scalars (attention_multiplier, residual_multiplier, embedding_multiplier, logits_scaling) + SwiGLU + RMSNorm; no QK-norm
+- **Active params:** 2B / 3B / 8B total (dense, per variant)
+- **Layer mix:** 24 attn (2B, GQA-24:8) / 32 attn (3B-8B, GQA-32:8), all dense causal
+- **KV cache / token (bf16):** 2B: 24 L × 8 KV × 128 Dh × 2 × 2 = 96 kB; 8B: 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Granite (IBM)

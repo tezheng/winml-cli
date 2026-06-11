@@ -1,5 +1,14 @@
 # OLMoE 1B-7B — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** OLMo-style backbone + FULL_HDH QK-norm (flat-tensor, not per-head) + softmax MoE (64 experts, top-8, no shared)
+- **Active params:** ~1B active / ~7B total (14%)
+- **Layer mix:** 16 attn (all MoE channel mixer, MHA 16Q/16KV)
+- **KV cache / token (bf16):** 128 kB (16 layers × 16 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** OLMoE 1B-7B (Allen Institute for AI) — 7B params total, 1B active.

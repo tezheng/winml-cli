@@ -1,5 +1,14 @@
 # Qwen3 — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** GQA + QK-norm PRE-RoPE per-Dh + SwiGLU + RMSNorm (Llama family with QK-norm, θ=1M)
+- **Active params:** 0.6B / 1.7B / 4B / 8B total (dense, all four variants)
+- **Layer mix:** 28 attn (0.6B) / 28 attn (1.7B) / 36 attn (4B) / 36 attn (8B) — GQA-N:8 standard, all dense
+- **KV cache / token (bf16):** 0.6B: 28 L × 8 KV × 128 Dh × 2 × 2 = 114 kB; 1.7B: 28 L × 8 KV × 128 Dh × 2 × 2 = 114 kB; 4B: 36 L × 8 KV × 128 Dh × 2 × 2 = 147 kB; 8B: 36 L × 8 KV × 128 Dh × 2 × 2 = 147 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Qwen3 (Alibaba)

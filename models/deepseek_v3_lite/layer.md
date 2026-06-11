@@ -1,5 +1,14 @@
 # DeepSeek-V3-Lite — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** MLA + sigmoid+bias MoE router with group routing (n_group=8, topk_group=4) + sum-of-top-2 group score (synthetic shape-only config)
+- **Active params:** ~37B active / ~671B total (6%) for V3-full production dims (synthetic config mirrors V3 architecture)
+- **Layer mix:** 61 attn (3 dense + 58 MoE, sigmoid+bias top-8 + 1 shared)
+- **KV cache / token (bf16):** ~69 kB (61 layers × (512 + 64) × 2 B = 70272 B, MLA formula)
+
+---
+
 **Source-of-truth**: `transformers/models/deepseek_v3/modeling_deepseek_v3.py`.
 
 V3-full is 671B (out-of-scope for SLM gates). V3-Lite is the

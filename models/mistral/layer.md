@@ -1,5 +1,14 @@
 # Mistral 7B — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** GQA-32:8 + RoPE (θ=1M, v0.3 drops SWA) + SwiGLU + RMSNorm; no biases, no QK-norm
+- **Active params:** 7.2B total
+- **Layer mix:** 32 attn (GQA-32:8, all causal, no SWA on v0.3)
+- **KV cache / token (bf16):** 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Mistral 7B (Mistral AI)

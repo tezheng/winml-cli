@@ -1,5 +1,14 @@
 # Voxtral — LM-Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Llama/Mistral-style LM decoder in audio-LM wrapper — GQA-32:8 + RoPE (θ=1e8) + SwiGLU + RMSNorm; no SWA
+- **Active params:** 3B total (LM-decoder only; full Voxtral-Mini-3B-2507 includes audio frontend)
+- **Layer mix:** 30 attn (GQA-32:8, all causal)
+- **KV cache / token (bf16):** 30 L × 8 KV × 128 Dh × 2 × 2 = 120 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Voxtral (Mistral.ai)

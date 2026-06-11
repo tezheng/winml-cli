@@ -1,5 +1,14 @@
 # Gemma 4 — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** Sandwich norm (PRE_AND_POST) + proportional p-RoPE on global layers + Per-Layer Embeddings + SharedLayerKVCache (num_kv_shared_layers=20/35) + v_norm + layer_scalar
+- **Active params:** ~2.4B active / ~5B total (E2B); larger variants up to 4B-A / 31B
+- **Layer mix:** 35 layers (28 local SWA + 7 global full-causal, 4:1 repeating)
+- **KV cache / token (bf16):** ~18 kB (15 unshared layers own KV: 12 local × 1 kv × 256 hd × 4 B + 3 global × 1 kv × 512 hd × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Gemma 4 (Google DeepMind)

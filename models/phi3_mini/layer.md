@@ -1,5 +1,14 @@
 # Phi-3 mini — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** MHA (32:32) + fused QKV + fused gate_up + SWA all-layers + RMSNorm; no QK-norm, no biases
+- **Active params:** 3.8B total
+- **Layer mix:** 32 attn (MHA-32:32, SWA W=2047 on all layers)
+- **KV cache / token (bf16):** 32 L × 32 KV × 96 Dh × 2 × 2 = 393 kB
+
+---
+
 ## 1. Identity
 
 - **Family:** Phi-3 (Microsoft)

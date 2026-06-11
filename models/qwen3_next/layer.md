@@ -1,5 +1,14 @@
 # Qwen3-Next — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** Gated DeltaNet 3:1 linear-attention hybrid (75% DeltaNet, 25% softmax attn every 4th) + ultra-sparse MoE (512 experts, top-10, + 1 shared)
+- **Active params:** ~3B active / ~80B total (4%) for Qwen3-Next-80B-A3B
+- **Layer mix:** ~71 DeltaNet + ~23 attn (GQA 16Q/2KV), 3:1 ratio; MoE channel on most layers
+- **KV cache / token (bf16):** ~46 kB (23 softmax-attn layers × 2 kv heads × 256 head_dim × 4 B; DeltaNet layers have no KV)
+
+---
+
 **Source-of-truth**: `transformers/models/qwen3_next/{configuration_qwen3_next,
 modeling_qwen3_next}.py` (transformers 5.10.x).
 

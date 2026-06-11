@@ -1,5 +1,14 @@
 # Llama 4 Scout (17B-16E) — Decoder Layer
 
+## 0. At-a-glance
+
+- **Signature:** iRoPE per-layer NoPE alternation (NoPE every 4th layer) + INTERLEAVED RoPE basis + L2Norm QK on RoPE layers (shape-only)
+- **Active params:** ~17B active / ~109B total (16%) (approximate, real config)
+- **Layer mix:** 48 attn (36 RoPE full-causal + 12 NoPE chunked, NoPE every 4th; all MoE 16-expert top-1)
+- **KV cache / token (bf16):** 192 kB (48 layers × 8 kv heads × 128 head_dim × 4 B)
+
+---
+
 ## 1. Identity
 
 - **Family:** Llama 4 (Meta)

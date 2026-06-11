@@ -1,5 +1,14 @@
 # OLMo 2 Reference Layer
 
+## 0. At-a-glance
+
+- **Signature:** POST-norm + QK-norm (FULL_HDH, PRE-RoPE) + SwiGLU + RMSNorm; no sandwich, no biases
+- **Active params:** 1B / 7B total (two variants)
+- **Layer mix:** 16 attn (1B, GQA-16:8) / 32 attn (7B, GQA-32:8), all dense causal
+- **KV cache / token (bf16):** 1B: 16 L × 8 KV × 64 Dh × 2 × 2 = 32 kB; 7B: 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 This document describes the architectural primitives of the OLMo 2 decoder
 layer as implemented by `models.olmo2.{config,layer}`, mapped to the IR types
 in `api/{specs,types,block,attention,norm,rope,feedforward}.py`.

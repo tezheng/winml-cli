@@ -1,5 +1,14 @@
 # GLM-MoE-DSA (GLM-4.5+ / GLM-5) — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** MLA + DSA Lightning Indexer (shape-only) + V3-style sigmoid+bias MoE with per-layer dense/sparse dispatch
+- **Active params:** ~37B active (GLM-5 approximate, real config pending)
+- **Layer mix:** 61 attn (3 dense + 58 MoE, sigmoid+bias top-8 + 1 shared; DSA on all attn layers)
+- **KV cache / token (bf16):** ~69 kB (61 layers × (512 + 64) × 2 B = 70272 B, MLA formula)
+
+---
+
 **Source-of-truth**: `transformers/models/glm_moe_dsa/{configuration,modeling}_glm_moe_dsa.py`
 (transformers 5.10.x).
 

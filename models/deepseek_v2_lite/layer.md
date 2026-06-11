@@ -1,5 +1,14 @@
 # DeepSeek-V2-Lite — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** MLA (q_lora_rank=None/direct, kv_lora_rank=512) + dense+MoE alternation (first_k_dense_replace=1) + YaRN RoPE scaling (factor=40)
+- **Active params:** ~2.4B active / ~16B total (15%)
+- **Layer mix:** 27 attn (1 dense + 26 MoE, softmax top-6 + 2 shared)
+- **KV cache / token (bf16):** ~30 kB (27 layers × (512 + 64) × 2 B = 31104 B)
+
+---
+
 **Source-of-truth**: `transformers/models/deepseek_v2/modeling_deepseek_v2.py`
 plus `deepseek-ai/DeepSeek-V2-Lite/config.json`.
 

@@ -1,5 +1,14 @@
 # Phi-3-small (microsoft/Phi-3-small-8k-instruct) — layer.md
 
+## 0. At-a-glance
+
+- **Signature:** GQA-32:8 + block-sparse attention (every other layer dense) + GeGELU FFN + LayerNorm + μP scalars; shape-only (numerical gate deferred)
+- **Active params:** 7B total
+- **Layer mix:** 32 attn (GQA-32:8), alternating block-sparse / dense (dense every 2nd layer)
+- **KV cache / token (bf16):** 32 L × 8 KV × 128 Dh × 2 × 2 = 128 kB
+
+---
+
 SHAPE-ONLY skeleton for B2b. The numerical gate is deferred — the
 BlockSparse mask construction is involved enough to warrant a separate
 milestone.
