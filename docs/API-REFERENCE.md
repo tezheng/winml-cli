@@ -1,6 +1,8 @@
-# llm-layers — API Reference v4 (post-rollout)
+# llm-layers — API Reference v5 (post-v7-cleanup)
 
-**Status:** Post-rollout reference, current as of B10 (2026-06-08).
+**Status:** Post-rollout reference, current as of v7-complete (2026-06-10) +
+doc cleanup wave (2026-06-11). Forward-ported from v4 (B10) through v5, v6,
+v7 + the v7 final-audit fixes.
 **Replaces:** `docs/superpowers/specs/2026-06-06-llm-layers-design.v3.md` (the pre-rollout design spec).
 **Scope:** every public symbol exported by `api/*.py`, every per-field intent
 discoverable in `models/<family>/config.py`, and the IR-drift history that
@@ -98,7 +100,7 @@ B9 landed Moshi 7B + Voxtral 3B (audio LMs). B10 was quantization
 
 ---
 
-## §1  The 16 Logical Ops (`api/ops.py`)
+## §1  The 26 Logical Ops (`api/ops.py`)
 
 The op floor synthesises the IHV-consensus minimum primitives (see
 `research/03-ihv-opsets.v2.md §3`). All ops are pure functions of tensors;
@@ -106,10 +108,12 @@ backends (ONNX / QNN / OpenVINO) re-implement these signatures. M1 landed the
 Qwen3 subset (`silu`, `add`, `mul`, `linear`, `rms_norm`, `embed`, `lm_head`,
 `rope_apply`, `sdpa`); the M1 fix-pass added the other 7 to close the 16-op
 floor. Subsequent batches added `rope_apply_partial` (B0.5),
-`gelu_pytorch_tanh` (B0.5), `rope_apply_mrope` (B8), and the
-`selective_scan` real implementation (B7). The current count is **19** —
-the 16-op floor plus `rope_apply_partial`, `rope_apply_mrope`, and
-`gelu_pytorch_tanh`. (Audit 2026-06-08 corrected from "18".)
+`gelu_pytorch_tanh` (B0.5), `rope_apply_mrope` (B8), the
+`selective_scan` real implementation (B7), and the v5/v6/v7 additions
+(`build_alibi_slopes`, `apply_alibi`, `relu2`, `gelu_exact`,
+`selective_scan_mamba1`, `l2norm`, `gated_delta_step`). The current count
+is **26** (verifiable via `grep -c '^def ' api/ops.py` − 4 private helpers).
+(Audit 2026-06-10 corrected from "19".)
 
 ### 1.1 `silu(x)` — `api/ops.py:17`
 
@@ -703,8 +707,11 @@ The current mechanism is a per-layer pointer carried on `AttentionSpec`:
 
 ## §3  Spec Dataclasses (`api/specs.py`)
 
-The 18 frozen dataclasses below are the parameter space of the IR. Anything
-that varies between families is here.
+The 22 frozen dataclasses below are the parameter space of the IR. Anything
+that varies between families is here. (Verifiable via
+`grep -c '^@dataclass' api/specs.py`. The v5/v6/v7 additions over the v4
+baseline of 18: `AliBiSpec` (v5), `CSASpec` + `HCASpec` (v7), and
+`GatedDeltaNetSpec` (v7).)
 
 ### 3.1 `NormSpec` (`specs.py:14`)
 
@@ -4042,10 +4049,11 @@ construction that no code path actually triggers.
 
 ## §18  The 41-Family Roster (one-paragraph each)
 
-These are the 41 families that have landed at some level (config + factory
-+ tests; some with numerical gates, some shape-only) plus the 9 deferred stubs. The descriptions
-are deliberately short — for deeper detail consult `models/<family>/layer.md`
-or §7 worked examples.
+These are the 41 architecturally-distinct families that have landed at some
+level (config + factory + tests; 39 with full `layer.py` + numerical or
+shape-only gates, 2 shape-only stubs `gpt_oss`, `hunyuan_large`) plus the
+8 deferred stubs. The descriptions are deliberately short — for deeper
+detail consult `models/<family>/layer.md` or §7 worked examples.
 
 ### 18.0 Common shape and config notes for the roster
 
@@ -4217,6 +4225,95 @@ GQA + FUSED gate/up MLP (Moshi's "GatingMLP" fc1). `rope_theta=10000`.
 
 Llama-shaped LM decoder with `rope_theta=1e8` (unusually large).
 
+### 18.31 MPT 7B (v5)
+
+MosaicML decoder with ALiBi position encoding (not RoPE), GELU-only FFN
+(no SwiGLU gate), LayerNorm with `bias=False`. The first family to
+exercise `AliBiSpec` + `build_alibi_slopes` + `apply_alibi`. Synthetic
+gate vs HF `MptBlock` at 2.38e-7. See `models/mpt/layer.md`.
+
+### 18.32 Falcon-7B (v5)
+
+Falcon decoder with parallel residual (attention + FFN run in parallel,
+sharing the input norm), MQA (single K/V head), GELU-only FFN,
+LayerNorm with `bias=True`, RoPE (not ALiBi). The first family to
+exercise the parallel residual `DecoderBlock` mode. Synthetic gate at
+2.38e-7. See `models/falcon7b/layer.md`.
+
+### 18.33 BitNet b1.58 (v5/v6)
+
+Microsoft's ternary-weight family. Adds sub-norms before `o_proj` and
+`down_proj` (`AttentionSpec.attn_sub_norm` + `FFNSpec.ffn_sub_norm`),
+ReLU² activation (not SwiGLU/GeGLU — `Activation.RELU2`), and
+ternary-quantizable weights (`QDType.TERNARY` landed in v6). The first
+family to exercise the BitNet quant scheme end-to-end. Synthetic gate
+at 2.38e-7. See `models/bitnet/layer.md`.
+
+### 18.34 Hunyuan-Large (v5, shape-only)
+
+Tencent's first landed CLA (cross-layer attention) family. Even-indexed
+layers carry K/V; odd-indexed layers borrow via
+`AttentionSpec.kv_source_layer_offset = -1`. Also the first Gemma-MoE-style
+top-1 router and `head_dim=80` (unusual). Shape-only — production
+weights are gated. See `models/hunyuan_large/layer.md`.
+
+### 18.35 GPT-OSS 20B (v5, shape-only stub)
+
+OpenAI's open release. Trained attention sinks (`MaskKind.SINK` +
+`AttentionSpec.n_sink_tokens=4` — the first family to exercise the SINK
+mask end-to-end), MoE with router bias, clamped-SwiGLU experts
+(`MoESpec.expert_kind = "gpt_oss_clamped_swiglu"`). Bit-exact gate on
+the synthetic sink-mask path. See `models/gpt_oss/layer.md`.
+
+### 18.36 Mamba-1 (v6)
+
+The OG Mamba selective-scan family. Token mixer is `Mamba1Mixer` (not
+Mamba-2's SSD) — per-channel `A_log`, learned `dt_proj`,
+`selective_scan_mamba1` op. Synthetic gate vs HF `MambaMixer.slow_forward`
+is bit-exact (0.0). See `models/mamba1/layer.md`.
+
+### 18.37 Jamba (v6)
+
+AI21's Mamba-1 + attention + MoE alternation. Per-layer dispatch by
+`attn_layer_period=8` — i.e. every 8th layer is attention, the rest are
+Mamba-1. Synthetic gate: Mamba layer 0.0 bit-exact, attention layer
+4.77e-7. The first family to exercise per-layer SSM/attention mixing
+under the `TokenMixerKind` dispatch. See `models/jamba/layer.md`.
+
+### 18.38 DeepSeek-V4 (v7)
+
+DeepSeek's frontier MoE refresh. Three first-of-kind axes:
+- **Hash routing** (`MoESpec.router_kind = "hash"`) — a frozen
+  `tid2eid` lookup table per layer (3 hash-routed layers per block).
+- **CSA + HCA dual sparse attention** (`AttentionKind.CSA_HCA` + new
+  `CSASpec` + `HCASpec`) — shape-only; forward raises `NotImplementedError`.
+- **Latent MoE wrapper** (`MoESpec.routing_in_latent`) — fc1/fc2
+  projection around expert dispatch (shared with Nemotron-H).
+Hash MoE numerical at <5e-4; CSA/HCA shape-only.
+See `models/deepseek_v4/layer.md`.
+
+### 18.39 Qwen3-Next 80B-A3B (v7)
+
+Alibaba's 3:1 Gated DeltaNet : standard-attention hybrid. The first
+family to exercise `TokenMixerKind.GATED_DELTANET` + `GatedDeltaNetSpec`
++ `gated_delta_step` op + `l2norm` op. Ultra-sparse MoE (top-10 of 512
+experts). Gated DeltaNet linear layer numerical at 7.5e-8;
+standard-attn shape-only. See `models/qwen3_next/layer.md`.
+
+### 18.40 GLM-MoE-DSA (GLM-5) (v7)
+
+Zhipu AI's frontier MoE + sparse attention. MLA backbone + DSA Lightning
+Indexer (shape-only) + sigmoid+bias MoE router with group routing.
+Sigmoid+bias MoE numerical at <5e-4; DSA shape-only.
+See `models/glm_moe_dsa/layer.md`.
+
+### 18.41 MiniMax-M2 (v7)
+
+MiniMax's STANDARD-attention frontier MoE (no MLA, no DSA, no linear
+attention — the "boring is good" datapoint). FULL_HDH QK-norm +
+sigmoid+bias MoE without group routing. Full DecoderLayer numerical at
+<5e-4. See `models/minimax_m2/layer.md`.
+
 ### 18.30b The B9 audio families in detail
 
 **Moshi 7B** ships an unusual fused gating MLP. The `GatingMLP.fc1`
@@ -4260,20 +4357,26 @@ and the VCF mask is not exercised by the numerical gate.
 
 ### Deferred families (stubs)
 
-- **Mamba-1** — needs `selective_scan_mamba1` op.
 - **Mamba-3** — complex-state + MIMO.
 - **RecurrentGemma** (Griffin/Hawk RG-LRU).
 - **RWKV-7 Goose** — outer-product WKV.
 - **Hymba** — parallel hybrid block.
 - **Phi-4-mini-flash** — Samba (Mamba-1 + attention sequential).
-- **Falcon-H1**, **Nemotron 3** — composition + scale.
-- **Jamba** — Mamba + attention + MoE.
+- **Falcon-H1** — composition + scale.
+- **Nemotron 3** — composition + scale.
 - **MiniMax Text 01** — Lightning Attention linear-attention.
+- **Jamba MoE-branch follow-up** — `models/jamba/` lands the Mamba +
+  attention alternation; the per-layer MoE dispatch is reserved for a
+  follow-up batch.
 
 Each has a stub `models/<family>/__init__.py` documenting the reason it
 was deferred. None blocks the existing IR; each requires a new op or new
 building block to land.
 
+(Mamba-1 and Jamba landed in v6 — see §18.36 and §18.37 above. They were
+in this deferred list in the v4 baseline.)
+
 ---
 
-*End of API Reference v4 — generated 2026-06-08 post-B10.*
+*End of API Reference v5 — generated 2026-06-08 post-B10, forward-ported
+2026-06-10 through v5/v6/v7, doc-cleanup wave 2026-06-11.*

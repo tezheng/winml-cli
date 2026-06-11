@@ -12,11 +12,11 @@ This document inventories every artifact produced during the llm-layers project 
 
 | Metric | Value | Verifiable from |
 |---|---|---|
-| Total commits | ~165 | `git log --oneline | wc -l` |
+| Total commits | ~170 | `git log --oneline | wc -l` |
 | Tags placed | 21 (latest `v7-complete`) | `git tag -l` |
 | Tests collected | 751 | `uv run pytest --collect-only -q` |
-| Working model families | 41 architecturally distinct (49 dirs incl. 8 size-variant wrappers) + 9 deferred stubs | `models/*/layer.py` exists |
-| `api/` lines of code | ~6,100 (5,368 raw incl. comments + docstrings; see §5) | `Get-ChildItem api -File` |
+| Working model families | 41 architecturally distinct (39 with `layer.py` + 2 shape-only stubs) + 8 deferred stubs | `models/*/layer.py` exists |
+| `api/` lines of code | ~6,100 (6,096 raw incl. comments + docstrings; see §5) | `Get-ChildItem api -File` |
 | Research artifacts | 3 versions × 5 reports + 1 evolution narrative + 2 v3 extensions | `research/*.md` |
 | Critique reports | 10 | `research/issues/*.md` |
 | Source-grounded drifts caught | ~70 (M2 + v5/v6/v7 batches) | per-batch agent reports |
@@ -81,23 +81,23 @@ This document inventories every artifact produced during the llm-layers project 
 
 ## 5. Implementation — `api/` (the IR)
 
-**Total: 3,626 lines across 13 files.**
+**Total: ~6,100 lines across 13 files** (`Get-ChildItem api -File` → 6,096 raw).
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `api/types.py` | 132 | 20+ enums |
-| `api/specs.py` | 390 | 18+ frozen dataclasses |
-| `api/ops.py` | 475 | 16+ functional primitives |
-| `api/norm.py` | 56 | RMSNorm + QKNorm |
-| `api/rope.py` | 381 | RoPE module with all variants |
-| `api/kvcache.py` | 189 | ContiguousKVCache, SharedLayerKVCache, SSMStateCache |
-| `api/quant.py` | 609 | AWQ + GGUF Q4_K_M + FP8 E4M3 + MXFP4 + LiteRT W4A8 + IQ2/AQLM stubs |
-| `api/attention.py` | 489 | Standard + MLA attention |
-| `api/feedforward.py` | 328 | SwiGLU + GeGLU + fused-gate-up + MoE |
-| `api/embedding.py` | 53 | PerLayerEmbedding (Gemma 4 PLE) |
-| `api/ssm.py` | 274 | Mamba2Mixer + selective scan reference |
-| `api/block.py` | 252 | DecoderBlock all norm-position / token-mixer / channel-mixer variants |
-| `api/__init__.py` | 8 | Public surface docstring |
+| `api/ops.py` | 866 | 26 functional primitives (incl. ALiBi, gated_delta_step, selective_scan, l2norm) |
+| `api/quant.py` | 838 | AWQ + GGUF Q4_K_M + FP8 E4M3 + MXFP4 + LiteRT W4A8 + BitNet ternary + IQ2/AQLM stubs |
+| `api/attention.py` | 811 | Standard + MLA + CSA/HCA (shape) + Gated DeltaNet wiring + trained attention sinks |
+| `api/feedforward.py` | 750 | SwiGLU + GeGLU + fused-gate-up + ReLU² + softmax/sigmoid+bias/hash MoE + latent-MoE wrapper |
+| `api/specs.py` | 733 | 22 frozen dataclasses (incl. AliBiSpec, CSASpec, HCASpec, GatedDeltaNetSpec) |
+| `api/ssm.py` | 723 | Mamba1Mixer + Mamba2Mixer + selective scan references |
+| `api/rope.py` | 406 | RoPE module with all variants (SPLIT_HALF, INTERLEAVED, partial-prefix/proportional, YARN, LongRoPE, LLAMA3, M-RoPE) |
+| `api/block.py` | 349 | DecoderBlock all norm-position / token-mixer / channel-mixer variants + parallel residual + PLE injection |
+| `api/kvcache.py` | 222 | ContiguousKVCache, SharedLayerKVCache, SSMStateCache |
+| `api/types.py` | 211 | 20+ enums |
+| `api/norm.py` | 115 | RMSNorm + QKNorm |
+| `api/embedding.py` | 63 | PerLayerEmbedding (Gemma 4 PLE) |
+| `api/__init__.py` | 9 | Public surface docstring |
 
 ---
 
@@ -158,17 +158,19 @@ Both classes are valid engineering proofs, but they're different guarantees. The
 **Summary of gate classes:** 16 families R (real HF weights), 11 families S (synthetic self-consistency), 3 families shape-only. The R gates are the strongest evidence of "the IR re-assembles production weights"; the S gates prove the math is faithful to HF's `torch_forward` reference path.
 
 ### Deferred stubs (B7+ follow-up)
-`models/jamba/`, `models/recurrent_gemma/`, `models/rwkv7/`, `models/mamba3/`, `models/hymba/`, `models/phi4_mini_flash/`, `models/falcon_h1/`, `models/nemotron3/`, `models/minimax_text_01/`
+`models/mamba3/`, `models/recurrent_gemma/`, `models/rwkv7/`, `models/hymba/`, `models/phi4_mini_flash/`, `models/falcon_h1/`, `models/nemotron3/`, `models/minimax_text_01/`
+
+(Jamba landed in v6 / commit `bccab3e` — see B6/v6 row above. Mamba-1 landed in v6 / commit `8e7cb00` — see v6 row above.)
 
 ---
 
-## 7. Test inventory — `tests/` (604 collected)
+## 7. Test inventory — `tests/` (751 collected)
 
-### API-level — `tests/api/` — 11 files
+### API-level — `tests/api/` — 11+ files
 Covers ops, specs, norm, rope, kvcache, quant, attention, feedforward, block, ssm, embedding.
 
 ### Per-family numerical-equivalence gates — `tests/models/<family>/`
-160 test files across 30 families. Each family typically has:
+Test files across 41 architecturally-distinct families. Each family typically has:
 - `test_config.py` — HF config adapter round-trip
 - `test_layer_shape.py` — shape + determinism
 - `test_weight_loader.py` — HF state-dict mapping
@@ -187,7 +189,7 @@ Covers ops, specs, norm, rope, kvcache, quant, attention, feedforward, block, ss
 
 ---
 
-## 9. Git timeline (139 commits, 14 tags)
+## 9. Git timeline (~170 commits, 21 tags)
 
 ```
 M1-complete           → 32 commits (Qwen3 kickoff + fix pass)
@@ -204,14 +206,19 @@ B7-complete           → 4 commits (Mamba-2 + Granite-4-H + deferred stubs)
 B8-complete           → 5 commits (OCR-LLM trio)
 B9-complete           → 2 commits (Moshi, Voxtral)
 B10-complete          → 7 commits (5 quant schemes + stubs)
-M2-complete           → tagged at HEAD (covers B0.5 → B10)
+M2-complete           → tagged at v6-era HEAD (covers B0.5 → B10)
+v5-complete           → 7 commits (MPT ALiBi, Falcon-7B parallel residual, BitNet, Hunyuan-Large CLA, GPT-OSS sinks)
+v6-complete           → 4 commits (Mamba-1 selective scan, Jamba Mamba/attn alternation, BitNet ternary QDType, GPT-OSS clamped SwiGLU)
+v7-phase-a-complete   → 4 commits (DeepSeek-V4 hash routing, CSA/HCA shape, Qwen3-Next Gated DeltaNet, Nemotron-H latent MoE)
+v7-phase-b-complete   → 4 commits (DeepSeek-V4 + Qwen3-Next + GLM-MoE-DSA + MiniMax-M2 family bootstrap)
+v7-complete           → doc cleanup wave 2026-06-10 → 2026-06-11
 ```
 
-Full timeline browsable via `git log --oneline` from `5068bf7` (project bootstrap) to `4010e74` (HEAD).
+Full timeline browsable via `git log --oneline` from `5068bf7` (project bootstrap) to `ee84053` (HEAD).
 
 ---
 
-## 10. Source-grounded drifts caught (~55 across batches)
+## 10. Source-grounded drifts caught (~70 across batches)
 
 **Why this matters:** B0.5 locked the Gemma 4 IR based on blog summaries; the numerical gate revealed 5 drifts. From that moment forward every batch ran source-first against `modeling_*.py` BEFORE writing the spec. Every drift caught here would have been a silent numerical bug.
 
@@ -242,16 +249,16 @@ Full timeline browsable via `git log --oneline` from `5068bf7` (project bootstra
 ## What this proves
 
 1. **Survey:** 148 SLM rows × 19 axes × 38 layer-axes × 18 RoPE × 18 cache × 48 quant schemes, source-grounded
-2. **Design:** v3 spec with 18+ dataclasses + 16+ ops + 4 new architectural axes (cross-layer KV, PLE, VLM fusion, vision-token budget)
-3. **Implementation:** 3.6k lines of api/ implementing the IR
+2. **Design:** post-rollout reference (`docs/API-REFERENCE.md`) with 22 dataclasses + 26 ops + the v5/v6/v7 axes (cross-layer KV pointers, PLE, VLM fusion, vision-token budget, ALiBi, trained attention sinks, BitNet ternary, hash-routing MoE, CSA/HCA shape, Gated DeltaNet)
+3. **Implementation:** ~6,100 lines of api/ implementing the IR
 4. **Validation:**
-   - **16 families** re-assembled from real HF weights and numerically equivalent at atol=5e-4 or tighter (one genuine bit-exact: **Gemma 2 2B**)
-   - **11 families** verified via synthetic-weight self-consistency vs HF `torch_forward` reference path (three bit-exact in this class: Mamba-2 mini, Granite-4-H mini, DeepSeek-V3 MoE submodule)
-   - **3 families** shape-only by design (Phi-3-small BlockSparse forward deferred, Llama 4 Scout weights gated, DeepSeek-V3.2 DSA forward deferred)
-5. **Quantization:** 5 distinct schemes (AWQ, GGUF Q4_K_M, FP8 E4M3, MXFP4, LiteRT W4A8) operational
-6. **Disciplined evidence:** ~55 source-grounded drifts caught via the `modeling_*.py`-first rule that crystallized after B0.5
+   - Real-HF-weights gates re-assemble production weights and numerically equivalent at atol=5e-4 or tighter (one genuine bit-exact-vs-real-weights: **Gemma 2 2B**)
+   - Synthetic-weight self-consistency gates vs HF `torch_forward` reference path (3-5 bit-exact in this class: Mamba-2 mini, Granite-4-H mini, DeepSeek-V3 MoE submodule, possibly Mamba-1 and GPT-OSS sink mask)
+   - Several families shape-only by design (Phi-3-small BlockSparse forward deferred, Llama 4 Scout weights gated, DeepSeek-V3.2 DSA + DeepSeek-V4 CSA/HCA + GLM-MoE-DSA forward deferred, GPT-OSS / Hunyuan-Large shape-only)
+5. **Quantization:** 6 distinct schemes (AWQ, GGUF Q4_K_M, FP8 E4M3, MXFP4, LiteRT W4A8, BitNet b1.58 ternary) operational
+6. **Disciplined evidence:** ~70 source-grounded drifts caught via the `modeling_*.py`-first rule that crystallized after B0.5
 
-The IR floor that survived all 30 families is what the project was looking for.
+The IR floor that survived all 41 architecturally-distinct families is what the project was looking for.
 
 ---
 

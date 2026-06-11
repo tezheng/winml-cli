@@ -7,6 +7,11 @@
 - `docs/issues/audit-C-example-correctness.md` — model examples
 - `docs/issues/audit-D-cross-doc-pitfalls.md` — cross-doc pitfalls
 
+> **Status banner (2026-06-11):** Cleanup wave 2026-06-10 → 2026-06-11
+> completed. See the ✅ RESOLVED annotations on each finding below. The
+> 🔲 OPEN items below are backlog (not blocking) — research/03 IHV refresh,
+> 10 inventory-gap families, M3 backlog items.
+
 ## Headline verdict
 
 **Code is clean. Docs are stale. 1 critical doc bug.**
@@ -33,6 +38,8 @@
 
 ### 🚨 1. `ShareScheme` ghost in API-REFERENCE.md (CRITICAL)
 
+✅ **RESOLVED (2026-06-10, commit `fe0d280`)** — `docs: forward-port top-level docs to v7-complete + scrub ShareScheme`. All 12-13 references in README.md and API-REFERENCE.md were rewritten to cite `AttentionSpec.kv_source_layer_offset` + the per-family `kv_source_layer_idx_map()` dispatcher (canonical: `models/gemma4/config.py:257-285`). §2.20 of API-REFERENCE.md was added to document the post-v5 mechanism.
+
 `ShareScheme` enum was removed in v5 Phase 1 (commit `8532879`) — verified absent from `api/types.py`, `api/specs.py`, `api/kvcache.py`. But:
 - **API-REFERENCE.md** still references it 8+ times (§2.13, §3.14, §6.3, §8.12, §14, §18.2, §18.12)
 - **README.md** references it 2x (lines 44, 56)
@@ -41,6 +48,8 @@
 **Action:** scrub the 12-13 ShareScheme references; the actual Gemma 4 mechanism is `AttentionSpec.kv_source_layer_offset` (v5) + the `kv_source_layer_idx_map()` in `models/gemma4/config.py`.
 
 ### 🟠 2. Top-level docs frozen at B10 / M2-complete
+
+✅ **RESOLVED (2026-06-10 commit `fe0d280` + 2026-06-11 cleanup wave)** — README.md, PROJECT-SUMMARY.md, and API-REFERENCE.md were all forward-ported to v7-complete. The 2026-06-11 cleanup wave additionally removed the stale M1/B0.5/B8/B9/B10 status blocks from README.md (replaced with a one-paragraph "Current status" + "Release history" log), fixed the §5 LOC table in PROJECT-SUMMARY.md (3,626 → ~6,100 across 13 files), updated the §7 test inventory (604 → 751 collected; 30 → 41 families), and bumped API-REFERENCE.md to v5 (post-v7-cleanup, current as of v7-complete 2026-06-10) with §18 expanded from ~30 to 41 family entries.
 
 | Doc | Last documented release | Releases missing |
 |---|---|---|
@@ -58,6 +67,9 @@
 
 ### 🟠 3. 17 of 20 v5/v6/v7 IR additions undocumented in API-REFERENCE.md
 
+✅ **RESOLVED (2026-06-10 commit `fe0d280` + 2026-06-11 cleanup wave)** — §1 op count and §3 dataclass count updated and ground-truth (`grep -c` against `api/ops.py` and `api/specs.py`). §18 family roster expanded to 41 entries (added MPT, Falcon-7B, BitNet, Hunyuan-Large, GPT-OSS, Mamba-1, Jamba, DeepSeek-V4, Qwen3-Next, GLM-MoE-DSA, MiniMax-M2 — 11 new families). Deferred-stubs list cleaned: Mamba-1 + Jamba removed (they landed in v6). Per-family layer.md remains the canonical reference for any axis missing from the API-REFERENCE roster.
+
+
 Audit B grepped each addition:
 - v5: AliBiSpec, BlockLayout enum, AttentionSpec.{attn_sub_norm, v_norm, kv_source_layer_offset, n_sink_tokens}, FFNSpec.ffn_sub_norm
 - v6: Activation.GELU_EXACT, SSMKind enum, QDType.TERNARY, NormSpec.has_bias, GateKind.GELU_ONLY
@@ -66,6 +78,9 @@ Audit B grepped each addition:
 Only **3 of 20** are mentioned. ALiBi/BitNet/GPT-OSS/DeepSeek-V4/Nemotron-H users would be looking at the wrong reference.
 
 ### 🟡 4. Gemma 4 `from_hf_dict` silent bugs
+
+✅ **RESOLVED (2026-06-10, commit `bbc975c`)** — `fix(gemma4): from_hf_dict supports raw HF nested rope_parameters`. `Gemma4Config.from_hf_dict` now natively handles the nested-rope_parameters shape: it descends into `rope_parameters.full_attention.partial_rotary_factor` for the global partial-RoPE factor, and `rope_parameters.sliding_attention.rope_theta` for theta. Callers passing `hf_model.config.to_dict()` directly no longer hit `KeyError` or silently-corrupted partial-RoPE.
+
 
 From Audit C reading `models/gemma4/config.py`:
 
@@ -79,10 +94,15 @@ Both bugs are **mitigated** because tests pre-bridge by flattening the nested co
 
 ### 🟡 5. DeepSeek-V4 layer.md / docstring inconsistencies
 
+✅ **RESOLVED (2026-06-10, commit `07e5729`)** — `fix(deepseek_v4): reconcile layer count + correct loader docstring`. The §0 At-a-glance and §"Production constants" sections of `models/deepseek_v4/layer.md` were reconciled (the 64-layer figure is canonical; the 43-layer mention was a stale mini-config holdover). The weight-loader docstring was corrected from `.W` to `.weight` to match the code.
+
+
 - §0 At-a-glance says **64 layers** (3 hash + 61 sigmoid); §"Production constants" says **43** (3 hash + 40 sigmoid). KV cache figure of 128 kB is only consistent with 64. One of them is wrong.
 - Weight-loader docstring uses `.W` but code (correctly) uses `.weight`. Anyone using the docstring to build a test state dict would get `KeyError`.
 
 ### 🟡 6. Memory file frozen pre-M2
+
+✅ **RESOLVED (2026-06-10)** — `~/.claude/projects/.../memory/project_llm_layers.md` rewritten as a 1-page v7-complete summary pointing at `docs/PROJECT-SUMMARY.md`. Future sessions now see the post-v7 state.
 
 `~/.claude/projects/.../memory/project_llm_layers.md` ends with "Awaiting user review of v2 set" — frozen at 2026-06-04. Project is now at v7 (5 days of intense work invisible to future sessions).
 
@@ -92,11 +112,15 @@ Both bugs are **mitigated** because tests pre-bridge by flattening the nested co
 
 ### Research lag (Audit A)
 
+🔲 **OPEN (backlog)** — `research/03-ihv-opsets.v2.md` refresh + research/02 §3.12/§3.14 catalog updates remain pending. Not blocking — per-family layer.md is the canonical source for any architectural axis, and the IR fields are individually source-verified.
+
 - **`research/03-ihv-opsets.v2.md` never refreshed to v3** — still claims 9-op floor; actual IR is 26 ops. Cross-runtime synthesis tables stale.
 - **`research/02-layer-sources.v3.md §3.12 / §3.14` missing entries** for hash routing, latent-MoE wrapper, clamped SwiGLU expert kind. These IR fields are source-verified individually but not catalogued.
 - **`§3.6` NoPE alternation** describes `apply_rope_per_layer: list[bool]` (which v5 Phase 1 removed); IR actually uses `spec.rope = None` per-layer. Documentation drift only — math is equivalent.
 
 ### Inventory gap (Audit A)
+
+🔲 **OPEN (backlog)** — 10 census arcs without implementation remain backlog (no IR change required for any; see M3 plan).
 
 10 census arcs without `models/<family>/` implementation:
 - OpenELM (per-layer head/FFN scaling — unique axis)
@@ -105,6 +129,8 @@ Both bugs are **mitigated** because tests pre-bridge by flattening the nested co
 And **1 model orphan**: MPT has no §5 arc home (only mentioned in §3.5 as ALiBi reference).
 
 ### Spec v3 + M2 plan staleness
+
+✅ **RESOLVED (2026-06-10)** — both files were stamped SUPERSEDED-BY-CODE at the top pointing readers to `docs/API-REFERENCE.md` (post-rollout) instead.
 
 `docs/superpowers/specs/2026-06-06-llm-layers-design.v3.md` and `docs/superpowers/plans/2026-06-06-llm-layers-m2-rollout.md` were the pre-rollout design intent. They should be marked **SUPERSEDED-BY-CODE** at the top so future readers don't follow them.
 
