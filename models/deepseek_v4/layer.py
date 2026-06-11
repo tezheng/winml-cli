@@ -52,9 +52,9 @@ def load_hf_deepseek_v4_hash_moe(
         model.layers.{L}.mlp.gate.tid2eid                -> blk.feedforward.gate.tid2eid
         model.layers.{L}.mlp.experts.gate_up_proj        -> blk.feedforward.experts_gate_up
         model.layers.{L}.mlp.experts.down_proj           -> blk.feedforward.experts_down
-        model.layers.{L}.mlp.shared_experts.gate_proj.W  -> blk.feedforward.shared_experts.gate_proj.weight
-        model.layers.{L}.mlp.shared_experts.up_proj.W    -> blk.feedforward.shared_experts.up_proj.weight
-        model.layers.{L}.mlp.shared_experts.down_proj.W  -> blk.feedforward.shared_experts.down_proj.weight
+        model.layers.{L}.mlp.shared_experts.gate_proj.weight  -> blk.feedforward.shared_experts.gate_proj.weight
+        model.layers.{L}.mlp.shared_experts.up_proj.weight    -> blk.feedforward.shared_experts.up_proj.weight
+        model.layers.{L}.mlp.shared_experts.down_proj.weight  -> blk.feedforward.shared_experts.down_proj.weight
 
     The V4 TopKRouter ("moe" layer) additionally carries
     `gate.e_score_correction_bias`. We don't load that here; the

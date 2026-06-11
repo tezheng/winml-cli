@@ -1,5 +1,15 @@
 # DeepSeek-V4 — decoder layer composition
 
+## 0. At-a-glance
+
+- **Signature:** Hash MoE routing (first 3 layers) + sigmoid+bias MoE + CSA+HCA dual sparse attention (shape-only forward for CSA/HCA)
+- **Active params:** ~49B active / ~685B total (7%) (approximate, real config)
+- **Layer mix:** 43 layers (3 hash-router + 40 sigmoid+bias; CSA/HCA/SWA per-layer attn dispatch)
+  *(Synthetic test config uses 6 layers; production default from `configuration_deepseek_v4.py:142` is 43)*
+- **KV cache / token (bf16):** 86 kB (43 layers × 1 kv head (MQA) × 512 head_dim × 4 B)
+
+---
+
 **Source-of-truth**: `transformers/models/deepseek_v4/{configuration_deepseek_v4,
 modeling_deepseek_v4}.py` (transformers 5.10.x).
 
