@@ -10,6 +10,8 @@ __pycache__/
 *.pt
 *.pth
 hf_cache/
+ov_models/
+ov_cache/
 dist/
 build/
 .coverage
