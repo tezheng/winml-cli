@@ -44,7 +44,9 @@ def build_rope_cos_sin(
 
     pos_f = opset.convert(position_ids, Type.f32)                       # [B, S]
     pos_u = opset.unsqueeze(pos_f, opset.constant([-1], Type.i32))       # [B, S, 1]
-    inv_u = opset.unsqueeze(inv_freq, opset.constant([0, 0], Type.i32))  # [1, 1, Dh/2]
+    # Reviewer-found: axes must be unique per ONNX/OV Unsqueeze spec. [0, 0] was
+    # silently accepted but is undefined behavior; [0, 1] is the correct two-axis insertion.
+    inv_u = opset.unsqueeze(inv_freq, opset.constant([0, 1], Type.i32))  # [1, 1, Dh/2]
 
     freqs = opset.multiply(pos_u, inv_u)                                # [B, S, Dh/2]
     emb = opset.concat([freqs, freqs], axis=-1)                          # [B, S, Dh]

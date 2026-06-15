@@ -338,7 +338,10 @@ _GQA_SINKS_WEIGHTS: tuple[ApiField, ...] = (
              shape="[H_kv*Dh, D_model]", lora_attach=True, role_tag="attn.v"),
     ApiField("W_o", "tensor<f16>", "Output projection.",
              shape="[D_model, H_q*Dh]", lora_attach=True, role_tag="attn.o"),
-    ApiField("sink_logits", "tensor<f16>",
+    # Reviewer-found: name unified with the input slot. The IR convention is
+    # that when an input and weight share a name, the weight IS the source of
+    # the runtime input (no projection between them).
+    ApiField("sinks", "tensor<f16>",
              "Per-head trainable sink logit added into softmax denominator.",
              shape="[H_q]", lora_attach=False, role_tag="attn.sinks"),
 )

@@ -84,12 +84,12 @@ def _make_feed(setup, params):
     return feed
 
 
-def _run_cpu(setup) -> np.ndarray:
+def _run_cpu(setup, params) -> np.ndarray:
     _emit_and_save(setup)
     sess = ort.InferenceSession(
         str(_MODEL_PATH), providers=["CPUExecutionProvider"],
     )
-    return sess.run(["r1"], _make_feed(setup, setup.params))[0]
+    return sess.run(["r1"], _make_feed(setup, params))[0]
 
 
 @pytest.mark.gate
@@ -98,7 +98,9 @@ def test_onnx_cpu_matches_torch_m0(setup_and_golden):
     setup, payload = setup_and_golden
     expected = payload["output"].numpy()
 
-    out = _run_cpu(setup)
+    # Use the golden's params explicitly so a future golden regen with a
+    # different seed surfaces as a parity failure, not a silent pass.
+    out = _run_cpu(setup, payload["params"])
 
     abs_diff = np.abs(out - expected)
     out_scale = float(np.abs(expected).max())
@@ -138,7 +140,7 @@ def test_onnx_dml_stretch(setup_and_golden):
     sess = ort.InferenceSession(
         str(_MODEL_PATH), providers=["DmlExecutionProvider"],
     )
-    feed = _make_feed(setup, setup.params)
+    feed = _make_feed(setup, payload["params"])
     out = sess.run(["r1"], feed)[0]
 
     if np.isnan(out).any():
