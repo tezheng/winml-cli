@@ -59,6 +59,8 @@ Recommended doc order for new readers:
 5. `research/01-model-census.v3.md` — 148 SLMs × 19 axes
 6. `models/qwen3/layer.md` — anchor family worked example
 7. `models/gemma4/layer.md` — most architecturally divergent landed family
+8. `docs/runtimes/openvino-gpu.md` — Intel GPU (Arc 140V) vertical slice with
+   op-coverage audit and family classification (GREEN/YELLOW/RED)
 
 ## Release history
 
@@ -80,6 +82,9 @@ Recommended doc order for new readers:
   BitNet ternary `QDType`.
 - **v7** — frontier-MoE wave: DeepSeek-V4 (hash routing + CSA/HCA shape),
   Qwen3-Next (Gated DeltaNet), GLM-MoE-DSA, MiniMax-M2.
+- **OpenVINO GPU vertical slice (2026-06-15)** — Qwen3-0.6B verified
+  end-to-end on Intel Arc 140V iGPU; argmax + top-5 bit-exact vs torch
+  fp32 reference. 49.7 tok/s fp16. See `docs/runtimes/openvino-gpu.md`.
 
 Full timeline browsable via `git log --oneline` (`5068bf7` bootstrap →
 `ee84053` HEAD). Detailed milestone-by-milestone state is in
