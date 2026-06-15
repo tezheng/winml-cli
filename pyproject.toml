@@ -21,6 +21,11 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+openvino = [
+    "openvino>=2026.1",
+    "openvino-genai>=2026.1",
+    "optimum-intel[openvino]>=1.20",
+]
 
 [tool.ruff]
 line-length = 100
