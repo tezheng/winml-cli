@@ -38,6 +38,7 @@ if sys.platform != "win32":
 # Device discovery lives in sysinfo; import here for use by
 # build_adapter_query / build_npu_query / PdhPoller.
 from ...sysinfo.pdh_adapters import (  # noqa: E402
+    discover_gpu_luids,
     discover_npu_luid,
     enumerate_adapters,
 )
@@ -311,6 +312,75 @@ def build_npu_query(npu_luid: str, pid: int | None = None) -> PdhQuery:
     return build_adapter_query(npu_luid, engine_type="Compute", pid=pid)
 
 
+def aggregate_gpu_utilization(values: list[float | None]) -> float | None:
+    """Aggregate per-engine GPU utilization into a single "GPU %".
+
+    Mirrors Windows Task Manager, which reports the utilization of the
+    busiest single engine (a max across engines), not a sum or average.
+    See the DirectX team's "GPUs in the Task Manager" post for rationale:
+    summing parallel engines routinely exceeds 100%, and averaging hides a
+    fully-saturated engine among many idle ones.
+
+    Args:
+        values: Per-engine utilization percentages; ``None`` entries (counters
+            that returned no data this interval) are ignored.
+
+    Returns:
+        The capped max utilization in ``[0, 100]``, or ``None`` if every
+        value was ``None``.
+    """
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+    return min(100.0, max(valid))
+
+
+def add_gpu_engine_counters(
+    query: PdhQuery,
+    gpu_luids: list[str],
+    *,
+    pid: int | None = None,
+) -> list[str]:
+    """Register per-engine utilization counters for the given GPU adapters.
+
+    A GPU exposes multiple engine types (3D, Compute, Copy, Video...) — unlike
+    an NPU (Compute-only). DirectML inference work is not pinned to a fixed
+    engine type (it lands on the 3D engine on most consumer GPUs), so we
+    register a utilization counter for *every* engine type on each adapter
+    rather than hardcoding one. The poller takes the max across them (see
+    :func:`aggregate_gpu_utilization`) to reproduce Task Manager's number.
+
+    Args:
+        query: An opened :class:`PdhQuery` to add counters to.
+        gpu_luids: GPU adapter LUIDs (from ``discover_gpu_luids``).
+        pid: Process ID to monitor. Defaults to the current process.
+
+    Returns:
+        The logical names of the GPU utilization counters that registered
+        successfully (suitable for aggregation in the poll loop).
+    """
+    if pid is None:
+        pid = os.getpid()
+
+    adapters = enumerate_adapters()
+    registered: list[str] = []
+    for luid in gpu_luids:
+        adapter_info = adapters.get(luid)
+        if adapter_info is None:
+            continue
+        for engtype, (eng_num, matched_engine) in adapter_info.engine_map.items():
+            name = f"gpu_util_{luid}_{engtype}"
+            ok = query.add_counter(
+                name,
+                rf"\GPU Engine(pid_{pid}_luid_{luid}"
+                rf"_phys_0_eng_{eng_num}_engtype_{matched_engine})\Utilization Percentage",
+                fmt="double",
+            )
+            if ok:
+                registered.append(name)
+    return registered
+
+
 # ---------------------------------------------------------------------------
 # PdhPoller — reusable background polling component
 # ---------------------------------------------------------------------------
@@ -348,6 +418,9 @@ class PdhPoller:
         self._ram_used_bytes: list[int] = []
         self._running_time_start_ns: int | None = None
         self._running_time_end_ns: int | None = None
+        self._gpu_luids: list[str] = []
+        self._gpu_counter_names: list[str] = []
+        self._gpu_samples: list[float] = []
 
     def start(self) -> None:
         """Discover NPU, register all PDH counters, start background thread.
@@ -376,6 +449,14 @@ class PdhPoller:
                 r"\Memory\Committed Bytes",
                 fmt="large",
             )
+
+            # GPU adapters (multi-engine; max-aggregated). Independent of the
+            # NPU — both can be present and monitored simultaneously.
+            self._gpu_luids = discover_gpu_luids()
+            if self._gpu_luids:
+                self._gpu_counter_names = add_gpu_engine_counters(self._query, self._gpu_luids)
+            else:
+                logger.info("No GPU found via PDH; monitoring CPU/RAM/NPU only")
 
             self._query.prime()
 
@@ -434,6 +515,9 @@ class PdhPoller:
                 mem_shared = values.get("memory_shared_bytes")
                 cpu = values.get("cpu_pct")
                 ram = values.get("ram_committed_bytes")
+                gpu = aggregate_gpu_utilization(
+                    [values.get(name) for name in self._gpu_counter_names]
+                )
                 with self._lock:
                     if util is not None:
                         self._util_samples.append(util)
@@ -445,6 +529,8 @@ class PdhPoller:
                         self._cpu_samples.append(cpu)
                     if ram is not None:
                         self._ram_used_bytes.append(ram)
+                    if gpu is not None:
+                        self._gpu_samples.append(gpu)
             except Exception:
                 logger.debug("PdhPoller poll error", exc_info=True)
             self._stop_event.wait(self._poll_interval_s)
@@ -579,7 +665,49 @@ class PdhPoller:
             return 0
         return max(0, self._running_time_end_ns - self._running_time_start_ns)
 
+    # --- GPU metrics ---
+
+    @property
+    def gpu_luids(self) -> list[str]:
+        """LUIDs of GPU adapters being monitored."""
+        return list(self._gpu_luids)
+
+    @property
+    def gpu_samples(self) -> list[float]:
+        """All GPU utilization % samples (time series copy)."""
+        with self._lock:
+            return self._gpu_samples.copy()
+
+    @property
+    def mean_gpu_pct(self) -> float:
+        """Mean GPU utilization % during polling period."""
+        with self._lock:
+            valid = [s for s in self._gpu_samples if s is not None]
+        if not valid:
+            return 0.0
+        return statistics.mean(valid)
+
+    @property
+    def peak_gpu_pct(self) -> float:
+        """Peak GPU utilization % during polling period."""
+        with self._lock:
+            valid = [s for s in self._gpu_samples if s is not None]
+        if not valid:
+            return 0.0
+        return max(valid)
+
+    @property
+    def gpu_sample_count(self) -> int:
+        """Number of GPU samples collected."""
+        with self._lock:
+            return len(self._gpu_samples)
+
     @staticmethod
     def is_npu_available() -> bool:
         """Whether PDH can discover an NPU on this system."""
         return discover_npu_luid() is not None
+
+    @staticmethod
+    def is_gpu_available() -> bool:
+        """Whether PDH can discover a GPU on this system."""
+        return len(discover_gpu_luids()) > 0

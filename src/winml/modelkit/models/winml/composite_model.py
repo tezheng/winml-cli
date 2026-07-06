@@ -53,6 +53,8 @@ if TYPE_CHECKING:
 
     from transformers import PretrainedConfig
 
+    from ...session import WinMLEPDevice
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +117,7 @@ class WinMLCompositeModel(PreTrainedModel):
         task: str,
         *,
         device: str = "cpu",
+        ep_device: WinMLEPDevice | None = None,
         use_cache: bool = True,
         force_rebuild: bool = False,
         sub_model_kwargs: dict[str, dict[str, Any]] | None = None,
@@ -133,7 +136,13 @@ class WinMLCompositeModel(PreTrainedModel):
             task: Pipeline task name (e.g., ``"translation"``,
                 ``"text-generation"``). Required when calling on the base
                 class; ignored when calling on a registered subclass.
-            device: Target device.
+            device: Target device short name (e.g. ``"npu"``, ``"cpu"``).
+                Forwarded to ``__init__`` so ``self._device`` reflects the
+                caller's intent.
+            ep_device: Optional pre-resolved ``WinMLEPDevice`` handle. When
+                ``None``, derived from ``device`` via
+                ``resolve_device`` + ``WinMLEPRegistry.auto_device`` so the
+                sub-model call always receives one.
             use_cache: Use persistent cache.
             force_rebuild: Force rebuild even if cached.
             sub_model_kwargs: Per-component kwargs forwarded to
@@ -165,6 +174,7 @@ class WinMLCompositeModel(PreTrainedModel):
                 model_id,
                 task,
                 device=device,
+                ep_device=ep_device,
                 use_cache=use_cache,
                 force_rebuild=force_rebuild,
                 sub_model_kwargs=sub_model_kwargs,
@@ -173,6 +183,14 @@ class WinMLCompositeModel(PreTrainedModel):
             )
         from ..auto import WinMLAutoModel
 
+        # Sub-model API requires a WinMLEPDevice — derive one from the
+        # device short name when the caller didn't hand one in.
+        if ep_device is None:
+            from ...session import EPDeviceTarget, WinMLEPRegistry, resolve_device
+
+            target = resolve_device(EPDeviceTarget(ep="auto", device=device))
+            ep_device = WinMLEPRegistry.instance().auto_device(target)
+
         per_component = sub_model_kwargs or {}
         sub_models: dict[str, Any] = {}
         for name, component_task in cls._SUB_MODEL_CONFIG.items():
@@ -180,15 +198,15 @@ class WinMLCompositeModel(PreTrainedModel):
             merged = {**kwargs, **per_component.get(name, {})}
             sub_models[name] = WinMLAutoModel.from_pretrained(
                 model_id,
+                ep_device=ep_device,
                 task=component_task,
-                device=device,
                 use_cache=use_cache,
                 force_rebuild=force_rebuild,
                 trust_remote_code=trust_remote_code,
                 **merged,
             )
 
-        return cls(sub_models=sub_models, config=hf_config)
+        return cls(sub_models=sub_models, config=hf_config, device=device)
 
     @classmethod
     def from_onnx(

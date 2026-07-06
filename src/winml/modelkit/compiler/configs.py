@@ -19,7 +19,27 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from ..session import EPDeviceTarget  # noqa: TC004
+
+
+# Per-EP defaults driving :meth:`WinMLCompileConfig.for_provider`. The only
+# non-default field today is ``enable_ep_context`` (True for EPs that consume
+# the pre-compiled EPContext graph, False for the rest). Unknown / custom
+# providers fall through to ``enable_ep_context=False``.
+_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "qnn": {"enable_ep_context": True},
+    "cpu": {"enable_ep_context": False},
+    "cuda": {"enable_ep_context": False},
+    "dml": {"enable_ep_context": False},
+    "nv_tensorrt_rtx": {"enable_ep_context": False},
+    "openvino": {"enable_ep_context": True},
+    "vitisai": {"enable_ep_context": False},
+    "migraphx": {"enable_ep_context": False},
+}
 
 
 @dataclass
@@ -64,19 +84,23 @@ class WinMLCompileConfig:
         verbose: Enable verbose logging
 
     Examples:
-        # Default: QNN compilation
-        config = WinMLCompileConfig.for_qnn()
+        # Resolve hardware target, then build the compile config.
+        ep_device = resolve_device(EPDeviceTarget(ep="qnn", device="npu"))
+        config = WinMLCompileConfig.for_ep_device(ep_device)
 
-        # CPU (no EPContext)
-        config = WinMLCompileConfig.for_cpu()
+        # Or construct from a short EP name directly.
+        config = WinMLCompileConfig.for_provider("qnn")
 
-        # Custom provider options
-        config = WinMLCompileConfig.for_qnn()
+        # Custom provider options after construction.
         config.ep_config.provider_options["htp_performance_mode"] = "default"
     """
 
     # Target EP settings
     ep_config: EPConfig = field(default_factory=EPConfig)
+
+    # Resolved EP+device pair (set by CLI or API callers; None means compile
+    # stage will infer from ep_config.provider via resolve_device()).
+    ep_device: EPDeviceTarget | None = None
 
     # Behavior
     validate: bool = True
@@ -88,150 +112,60 @@ class WinMLCompileConfig:
         return self.ep_config.provider
 
     @classmethod
-    def for_provider(cls, provider: str | None) -> WinMLCompileConfig | None:
-        """Factory that dispatches to a known for_* method or creates a generic config.
+    def for_ep_device(cls, ep_device: EPDeviceTarget) -> WinMLCompileConfig:
+        """Factory that creates a config from a fully-resolved EPDeviceTarget.
+
+        The ep_device is stored on the config and threaded to the compile
+        stage so that resolve_device() is only called once at the CLI boundary.
 
         Args:
-            provider: Provider name (e.g., "qnn", "dml", "openvino") or None.
+            ep_device: Fully-resolved (EP, device) binding.
 
         Returns:
-            WinMLCompileConfig for the provider, or None if provider is None.
+            WinMLCompileConfig bound to the given EPDeviceTarget.
         """
+        from ..session import short_ep_name
+
+        provider = short_ep_name(ep_device.ep)
+        base = cls.for_provider(provider)
+        assert base is not None  # provider is non-None — for_provider only returns None on None input
+        base.ep_device = ep_device
+        return base
+
+    @classmethod
+    def for_provider(
+        cls,
+        provider: str | None,
+        quantize: bool | None = None,
+    ) -> WinMLCompileConfig | None:
+        """Factory driven by :data:`_PROVIDER_DEFAULTS`.
+
+        Args:
+            provider: Provider short name (e.g., ``"qnn"``, ``"dml"``,
+                ``"openvino"``) or ``None``. Unknown / custom names fall back
+                to ``enable_ep_context=False``.
+            quantize: Deprecated. Quantization is now handled by
+                :class:`WinMLQuantizationConfig` — passing any non-``None``
+                value emits a :class:`DeprecationWarning` and is otherwise
+                ignored. Retained as a transitional surface so callers that
+                still thread ``quantize=`` continue to receive the warning
+                in one place.
+
+        Returns:
+            ``WinMLCompileConfig`` for the provider, or ``None`` if
+            ``provider`` is ``None``.
+        """
+        if quantize is not None:
+            warnings.warn(
+                "The 'quantize' parameter is deprecated and ignored. "
+                "Use WinMLQuantizationConfig for quantization settings.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if provider is None:
             return None
-        factories: dict[str, Any] = {
-            "qnn": cls.for_qnn,
-            "dml": cls.for_dml,
-            "cuda": cls.for_cuda,
-            "nv_tensorrt_rtx": cls.for_nv_tensorrt_rtx,
-            "openvino": cls.for_openvino,
-            "vitisai": cls.for_vitisai,
-            "migraphx": cls.for_migraphx,
-            "cpu": cls.for_cpu,
-        }
-        factory = factories.get(provider)
-        if factory:
-            return factory()
-        # Generic fallback for unknown/custom providers
-        return cls(ep_config=EPConfig(provider=provider, enable_ep_context=False))
-
-    @classmethod
-    def for_qnn(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for QNN compilation.
-
-        Args:
-            quantize: Deprecated. Quantization is now handled by
-                WinMLQuantizationConfig. This parameter is ignored.
-
-        Returns:
-            WinMLCompileConfig configured for QNN EP.
-        """
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(ep_config=EPConfig(provider="qnn"))
-
-    @classmethod
-    def for_cpu(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for CPU compilation (no EPContext)."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="cpu", enable_ep_context=False),
-        )
-
-    @classmethod
-    def for_cuda(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for CUDA compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="cuda", enable_ep_context=False),
-        )
-
-    @classmethod
-    def for_dml(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for DirectML compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="dml", enable_ep_context=False),
-        )
-
-    @classmethod
-    def for_nv_tensorrt_rtx(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for NvTensorRTRTX compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="nv_tensorrt_rtx", enable_ep_context=False),
-        )
-
-    @classmethod
-    def for_openvino(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for OpenVINO compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="openvino", enable_ep_context=True),
-        )
-
-    @classmethod
-    def for_vitisai(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for Vitis AI (AMD/Xilinx NPU) compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="vitisai", enable_ep_context=False),
-        )
-
-    @classmethod
-    def for_migraphx(cls, quantize: bool | None = None) -> WinMLCompileConfig:
-        """Factory for MIGraphX (AMD ROCm GPU) compilation."""
-        if quantize is not None:
-            warnings.warn(
-                "The 'quantize' parameter is deprecated and ignored. "
-                "Use WinMLQuantizationConfig for quantization settings.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return cls(
-            ep_config=EPConfig(provider="migraphx", enable_ep_context=False),
-        )
+        defaults = _PROVIDER_DEFAULTS.get(provider, {"enable_ep_context": False})
+        return cls(ep_config=EPConfig(provider=provider, **defaults))
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary for internal use.
@@ -239,7 +173,7 @@ class WinMLCompileConfig:
         Returns only EP-related fields. Quantization settings are
         serialized separately by WinMLQuantizationConfig.
         """
-        return {
+        d: dict[str, Any] = {
             "execution_provider": self.ep_config.provider,
             "provider_options": self.ep_config.provider_options,
             "enable_ep_context": self.ep_config.enable_ep_context,
@@ -250,6 +184,9 @@ class WinMLCompileConfig:
             ),
             "validate": self.validate,
         }
+        if self.ep_device is not None:
+            d["ep_device"] = self.ep_device.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WinMLCompileConfig:
@@ -265,6 +202,8 @@ class WinMLCompileConfig:
         Returns:
             WinMLCompileConfig instance.
         """
+        from ..session import EPDeviceTarget as _EPDeviceTarget
+
         ep_config = EPConfig(
             provider=data.get("execution_provider", "qnn"),
             provider_options=data.get("provider_options", {}),
@@ -274,8 +213,13 @@ class WinMLCompileConfig:
             qnn_sdk_root=(Path(data["qnn_sdk_root"]) if data.get("qnn_sdk_root") else None),
         )
 
+        ep_device = None
+        if "ep_device" in data and data["ep_device"] is not None:
+            ep_device = _EPDeviceTarget.from_dict(data["ep_device"])
+
         return cls(
             ep_config=ep_config,
+            ep_device=ep_device,
             validate=data.get("validate", True),
             verbose=data.get("verbose", False),
         )

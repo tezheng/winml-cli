@@ -1785,13 +1785,15 @@ class TestDevicePrecisionIntegration:
             ("npu", "auto", True, "uint8", "uint16", "qnn"),
             ("npu", "fp16", False, None, None, "qnn"),
             ("npu", "int8", True, "uint8", "uint8", "qnn"),
-            ("gpu", "auto", False, None, None, "dml"),
-            ("gpu", "int8", True, "uint8", "uint8", "dml"),
-            ("gpu", "fp16", False, None, None, "dml"),
-            ("cpu", "auto", False, None, None, None),
-            ("cpu", "int8", True, "uint8", "uint8", None),
-            ("cpu", "int16", True, "int16", "uint16", None),
-            ("cpu", "fp16", False, None, None, None),
+            # After the built-ins-as-fallback catalog reorder: gpu/cpu deduce
+            # to first-plugin (openvino) rather than the DML/CPU built-in.
+            ("gpu", "auto", False, None, None, "openvino"),
+            ("gpu", "int8", True, "uint8", "uint8", "openvino"),
+            ("gpu", "fp16", False, None, None, "openvino"),
+            ("cpu", "auto", False, None, None, "openvino"),
+            ("cpu", "int8", True, "uint8", "uint8", "openvino"),
+            ("cpu", "int16", True, "int16", "uint16", "openvino"),
+            ("cpu", "fp16", False, None, None, "openvino"),
             # auto device + explicit precision → picks NPU (mock returns npu first)
             ("auto", "fp16", False, None, None, "qnn"),
             ("auto", "int8", True, "uint8", "uint8", "qnn"),
@@ -1823,11 +1825,12 @@ class TestDevicePrecisionIntegration:
             ),
             patch("winml.modelkit.models.hf.MODEL_BUILD_CONFIGS", {}),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=(
-                    "npu" if device == "auto" else device,
-                    ["npu", "gpu", "cpu"],
-                ),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu" if device == "auto" else device,
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
             ),
         ):
             result = generate_build_config(
@@ -1912,9 +1915,13 @@ class TestDevicePrecisionIntegration:
             ),
             patch("winml.modelkit.models.hf.MODEL_BUILD_CONFIGS", {}),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
             ) as mock_rd,
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
+            ),
         ):
             generate_build_config(
                 "bert-base-uncased",
@@ -1922,7 +1929,7 @@ class TestDevicePrecisionIntegration:
                 precision="auto",
             )
 
-        mock_rd.assert_called_once_with(device="auto")
+        mock_rd.assert_called_once_with()
 
     def test_explicit_precision_triggers_resolve_device(self) -> None:
         """device='auto' + precision='int8' DOES call resolve_device."""
@@ -1941,9 +1948,13 @@ class TestDevicePrecisionIntegration:
             ),
             patch("winml.modelkit.models.hf.MODEL_BUILD_CONFIGS", {}),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
             ) as mock_rd,
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
+            ),
         ):
             generate_build_config(
                 "bert-base-uncased",
@@ -1985,9 +1996,13 @@ class TestDevicePrecisionCli:
                 return_value=mock_export_config,
             ),
             "registry": patch("winml.modelkit.models.hf.MODEL_BUILD_CONFIGS", {}),
-            "device": patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "gpu", "cpu"]),
+            "auto_detect": patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            "available": patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
             ),
         }
 
@@ -2002,7 +2017,8 @@ class TestDevicePrecisionCli:
             self._patches["loader"],
             self._patches["export"],
             self._patches["registry"],
-            self._patches["device"],
+            self._patches["auto_detect"],
+            self._patches["available"],
         ):
             runner = CliRunner()
             result = runner.invoke(config_command, args)
@@ -2023,9 +2039,13 @@ class TestDevicePrecisionCli:
 
     def test_device_gpu_precision_fp16(self, tmp_path) -> None:
         """--device gpu --precision fp16 → no quant, compile.provider=dml."""
-        self._patches["device"] = patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("gpu", ["gpu", "cpu"]),
+        self._patches["auto_detect"] = patch(
+            "winml.modelkit.session.auto_detect_device",
+            return_value="gpu",
+        )
+        self._patches["available"] = patch(
+            "winml.modelkit.sysinfo.hardware.get_available_devices",
+            return_value=["gpu", "cpu"],
         )
         result, output_file = self._invoke(
             tmp_path,
@@ -2036,13 +2056,17 @@ class TestDevicePrecisionCli:
         data = json.loads(output_file.read_text())
         assert data["quant"] is None
         assert data["compile"] is not None
-        assert data["compile"]["execution_provider"] == "dml"
+        assert data["compile"]["execution_provider"] == "openvino"
 
     def test_device_cpu_precision_fp32(self, tmp_path) -> None:
-        """--device cpu --precision fp32 → no quant, no compile."""
-        self._patches["device"] = patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("cpu", ["cpu"]),
+        """--device cpu --precision fp32 → no quant, compile=openvino (first plugin CPU EP)."""
+        self._patches["auto_detect"] = patch(
+            "winml.modelkit.session.auto_detect_device",
+            return_value="cpu",
+        )
+        self._patches["available"] = patch(
+            "winml.modelkit.sysinfo.hardware.get_available_devices",
+            return_value=["cpu"],
         )
         result, output_file = self._invoke(
             tmp_path,
@@ -2052,7 +2076,8 @@ class TestDevicePrecisionCli:
         assert result.exit_code == 0, f"CLI failed: {result.output}"
         data = json.loads(output_file.read_text())
         assert data["quant"] is None
-        assert data["compile"] is None
+        assert data["compile"] is not None
+        assert data["compile"]["execution_provider"] == "openvino"
 
     def test_default_no_flags_preserves_defaults(self, tmp_path) -> None:
         """No --device/--precision flags preserves default config."""
@@ -2120,8 +2145,12 @@ class TestConfigOnnxAutoDetect:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
             ),
         ):
             runner = CliRunner()
@@ -2198,8 +2227,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file), device="npu")
@@ -2212,7 +2245,7 @@ class TestGenerateBuildConfigOnnxPath:
         assert config.compile.ep_config.provider == "qnn"
 
     def test_raw_onnx_cpu(self, tmp_path) -> None:
-        """Raw ONNX + device=cpu resolves quant=None and compile=None."""
+        """Raw ONNX + device=cpu resolves quant=None, compile=openvino (first plugin CPU EP)."""
         onnx_file = tmp_path / "model.onnx"
         onnx_file.write_bytes(b"fake")
 
@@ -2220,15 +2253,20 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file), device="cpu")
 
         assert config.export is None
         assert config.quant is None
-        assert config.compile is None
+        assert config.compile is not None
+        assert config.compile.ep_config.provider == "openvino"
 
     def test_quantized_onnx_skips_quant(self, tmp_path) -> None:
         """Quantized ONNX + device=npu sets quant=None, compile=qnn."""
@@ -2239,8 +2277,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=True),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file), device="npu")
@@ -2250,7 +2292,7 @@ class TestGenerateBuildConfigOnnxPath:
         assert config.compile.ep_config.provider == "qnn"
 
     def test_quantized_onnx_cpu(self, tmp_path) -> None:
-        """Quantized ONNX + device=cpu sets quant=None, compile=None."""
+        """Quantized ONNX + device=cpu sets quant=None, compile=openvino."""
         onnx_file = tmp_path / "quantized.onnx"
         onnx_file.write_bytes(b"fake")
 
@@ -2258,14 +2300,19 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=True),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file), device="cpu")
 
         assert config.quant is None
-        assert config.compile is None
+        assert config.compile is not None
+        assert config.compile.ep_config.provider == "openvino"
 
     def test_compiled_onnx_skips_all(self, tmp_path) -> None:
         """Compiled ONNX (EPContext) sets quant=None and compile=None."""
@@ -2318,8 +2365,12 @@ class TestGenerateBuildConfigOnnxPath:
                 patch("winml.modelkit.onnx.is_compiled_onnx", return_value=is_compiled),
                 patch("winml.modelkit.onnx.is_quantized_onnx", return_value=is_quantized),
                 patch(
-                    "winml.modelkit.sysinfo.resolve_device",
-                    return_value=("cpu", ["cpu"]),
+                    "winml.modelkit.session.auto_detect_device",
+                    return_value="cpu",
+                ),
+                patch(
+                    "winml.modelkit.sysinfo.hardware.get_available_devices",
+                    return_value=["cpu"],
                 ),
             ):
                 config = generate_onnx_build_config(str(onnx_file))
@@ -2341,8 +2392,12 @@ class TestGenerateBuildConfigOnnxPath:
                 patch("winml.modelkit.onnx.is_compiled_onnx", return_value=is_compiled),
                 patch("winml.modelkit.onnx.is_quantized_onnx", return_value=is_quantized),
                 patch(
-                    "winml.modelkit.sysinfo.resolve_device",
-                    return_value=("cpu", ["cpu"]),
+                    "winml.modelkit.session.auto_detect_device",
+                    return_value="cpu",
+                ),
+                patch(
+                    "winml.modelkit.sysinfo.hardware.get_available_devices",
+                    return_value=["cpu"],
                 ),
             ):
                 config = generate_onnx_build_config(str(onnx_file))
@@ -2360,8 +2415,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(
@@ -2380,8 +2439,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file))
@@ -2408,8 +2471,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(
@@ -2437,8 +2504,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
             ),
             patch(
                 "winml.modelkit.config.build.merge_config",
@@ -2499,8 +2570,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("npu", ["npu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(
@@ -2526,8 +2601,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file))
@@ -2545,8 +2624,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("cpu", ["cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
             ),
         ):
             config = generate_onnx_build_config(Path(onnx_file))
@@ -2566,8 +2649,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("auto", ["npu", "gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="auto",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file))
@@ -2593,7 +2680,7 @@ class TestGenerateBuildConfigOnnxPath:
         mock_resolve.assert_not_called()
 
     def test_raw_onnx_with_gpu(self, tmp_path) -> None:
-        """Raw ONNX + device=gpu resolves quant=None, compile=dml."""
+        """Raw ONNX + device=gpu resolves quant=None, compile=openvino (first plugin GPU EP)."""
         onnx_file = tmp_path / "model.onnx"
         onnx_file.write_bytes(b"fake")
 
@@ -2601,16 +2688,21 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("gpu", ["gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(str(onnx_file), device="gpu")
 
-        # GPU auto-precision is fp16 -> no quantization, compile=dml
+        # GPU auto-precision is fp16 -> no quantization; compile=openvino
+        # (first plugin EP for gpu after built-ins-as-fallback catalog reorder).
         assert config.quant is None
         assert config.compile is not None
-        assert config.compile.ep_config.provider == "dml"
+        assert config.compile.ep_config.provider == "openvino"
 
     def test_ep_override_forwarded(self, tmp_path) -> None:
         """Explicit ep parameter is forwarded to resolve_quant_compile_config."""
@@ -2621,8 +2713,12 @@ class TestGenerateBuildConfigOnnxPath:
             patch("winml.modelkit.onnx.is_compiled_onnx", return_value=False),
             patch("winml.modelkit.onnx.is_quantized_onnx", return_value=False),
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("gpu", ["gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
             ),
         ):
             config = generate_onnx_build_config(
@@ -2649,9 +2745,15 @@ class TestResolveQuantCompileConfig:
 
     def test_auto_auto_returns_none_none(self) -> None:
         """device=auto + precision=auto returns (None, None)."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("auto", ["npu", "gpu", "cpu"]),
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="auto",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "gpu", "cpu"],
+            ),
         ):
             quant, compile_cfg = resolve_quant_compile_config()
 
@@ -2660,9 +2762,15 @@ class TestResolveQuantCompileConfig:
 
     def test_npu_returns_quant_and_compile(self) -> None:
         """device=npu returns (WinMLQuantizationConfig, WinMLCompileConfig)."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("npu", ["npu", "cpu"]),
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
+            ),
         ):
             quant, compile_cfg = resolve_quant_compile_config(device="npu")
 
@@ -2672,42 +2780,61 @@ class TestResolveQuantCompileConfig:
         assert isinstance(compile_cfg, WinMLCompileConfig)
         assert compile_cfg.ep_config.provider == "qnn"
 
-    def test_gpu_returns_none_quant_and_dml_compile(self) -> None:
-        """device=gpu returns (None, WinMLCompileConfig(dml))."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("gpu", ["gpu", "cpu"]),
+    def test_gpu_returns_none_quant_and_openvino_compile(self) -> None:
+        """device=gpu returns (None, WinMLCompileConfig(openvino)) — first plugin GPU EP."""
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
+            ),
         ):
             quant, compile_cfg = resolve_quant_compile_config(device="gpu")
 
         assert quant is None
         assert isinstance(compile_cfg, WinMLCompileConfig)
-        assert compile_cfg.ep_config.provider == "dml"
+        assert compile_cfg.ep_config.provider == "openvino"
 
-    def test_cpu_returns_none_none(self) -> None:
-        """device=cpu returns (None, None) since CPU has no compile provider."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("cpu", ["cpu"]),
+    def test_cpu_returns_none_quant_and_openvino_compile(self) -> None:
+        """device=cpu returns (None, WinMLCompileConfig(openvino)) — first plugin CPU EP."""
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="cpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["cpu"],
+            ),
         ):
             quant, compile_cfg = resolve_quant_compile_config(device="cpu")
 
         assert quant is None
-        assert compile_cfg is None
+        assert isinstance(compile_cfg, WinMLCompileConfig)
+        assert compile_cfg.ep_config.provider == "openvino"
 
     def test_ep_override_changes_provider(self) -> None:
         """Explicit ep overrides the default device-to-provider mapping."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("gpu", ["gpu", "cpu"]),
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
+            ),
         ):
             _quant, compile_cfg = resolve_quant_compile_config(
                 device="gpu",
-                ep="nv_tensorrt_rtx",
+                ep="nvtensorrtrtx",
             )
 
         assert compile_cfg is not None
-        assert compile_cfg.ep_config.provider == "nv_tensorrt_rtx"
+        assert compile_cfg.ep_config.provider == "nvtensorrtrtx"
 
     def test_task_forwarded_to_resolve_precision(self) -> None:
         """task parameter is forwarded to resolve_precision.
@@ -2717,8 +2844,12 @@ class TestResolveQuantCompileConfig:
         """
         with (
             patch(
-                "winml.modelkit.sysinfo.resolve_device",
-                return_value=("gpu", ["gpu", "cpu"]),
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
             ),
             patch(
                 "winml.modelkit.config.precision.resolve_precision",
@@ -2734,9 +2865,15 @@ class TestResolveQuantCompileConfig:
 
     def test_explicit_int8_precision_on_npu(self) -> None:
         """Explicit precision=int8 on npu produces uint8 quant."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("npu", ["npu", "cpu"]),
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="npu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["npu", "cpu"],
+            ),
         ):
             quant, _compile_cfg = resolve_quant_compile_config(
                 device="npu",
@@ -2749,9 +2886,15 @@ class TestResolveQuantCompileConfig:
 
     def test_explicit_fp32_precision_no_quant(self) -> None:
         """Explicit precision=fp32 produces no quantization."""
-        with patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("gpu", ["gpu", "cpu"]),
+        with (
+            patch(
+                "winml.modelkit.session.auto_detect_device",
+                return_value="gpu",
+            ),
+            patch(
+                "winml.modelkit.sysinfo.hardware.get_available_devices",
+                return_value=["gpu", "cpu"],
+            ),
         ):
             quant, _compile_cfg = resolve_quant_compile_config(
                 device="gpu",

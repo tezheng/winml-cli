@@ -18,22 +18,21 @@ Usage:
 from pathlib import Path
 from typing import Any
 
-import onnxruntime as ort
-
-from ... import winml
 from ...onnx import ONNXDomain
 from ...pattern.base import (
     PatternInputGenerator,
     get_pattern_input_generator,
     get_registered_pattern_input_generators,
 )
+from ...session import DEVICE_TYPE_TO_DEVICE
 from ...sysinfo import SysInfo
-from ...utils import constants
+from ..runtime_checker.check_ops import (
+    OpenVINONPUChecker,
+    QNNNPUChecker,
+    get_ep_checker,
+)
 from ..runtime_checker.ep_checker import EPChecker
 from ..utils import CheckResultWriter
-
-
-winml.register_execution_providers(ort=True)
 
 
 def check_patterns(
@@ -126,7 +125,7 @@ def check_patterns(
             opset_suffix = f"_{first_domain.value}_opset{first_version}"
 
         # Prepare output file
-        device = constants.DEVICE_TYPE_TO_DEVICE[ep_checker.device_type]
+        device = DEVICE_TYPE_TO_DEVICE[ep_checker.device_type].upper()
         output_filename = f"{pattern_name}_{ep_checker.ep_name}_{device}{opset_suffix}.json"
         output_path = output_dir / output_filename
 
@@ -198,50 +197,14 @@ def check_patterns(
     return all_results
 
 
-# don't use EPChecker directly as there is a bug with pytest in subprocess
-class OpenVINONPUChecker(EPChecker):
-    """OpenVINO NPU execution provider checker wrapper for pytest compatibility."""
-
-    def __init__(self, device_type: ort.OrtHardwareDeviceType) -> None:
-        """Initialize OpenVINO NPU checker."""
-        super().__init__(ep_name="OpenVINOExecutionProvider", device_type=device_type)
-
-
-# don't use EPChecker directly as there is a bug with pytest in subprocess
-class QNNNPUChecker(EPChecker):
-    """QNN NPU execution provider checker wrapper for pytest compatibility."""
-
-    def __init__(self, device_type: ort.OrtHardwareDeviceType) -> None:
-        """Initialize QNN NPU checker."""
-        super().__init__(ep_name="QNNExecutionProvider", device_type=device_type)
-
-
-def get_ep_checker(ep_name: str, device: str) -> EPChecker:
-    """Get EPChecker for given execution provider name.
-
-    Args:
-        ep_name: Execution provider name (e.g., "QNNExecutionProvider")
-        device: Target device type (CPU, GPU, NPU)
-
-    Returns:
-        EPChecker corresponding to the execution provider.
-
-    Raises:
-        ValueError: If the execution provider name is not supported.
-    """
-    device_type = constants.DEVICE_TO_DEVICE_TYPE[device]
-    ep_name_to_checker: dict[str, Any] = {
-        "QNNExecutionProvider": QNNNPUChecker,
-        "OpenVINOExecutionProvider": OpenVINONPUChecker,
-        # Add other EPChecker subclasses here as needed
-    }
-    if ep_name not in ep_name_to_checker:
-        raise ValueError(
-            f"Unsupported execution provider: {ep_name}. "
-            f"Available: QNNExecutionProvider, "
-            f"OpenVINOExecutionProvider"
-        )
-    return ep_name_to_checker[ep_name](device_type=device_type)
+# NPU EPCheckers and get_ep_checker are re-exported from
+# ..runtime_checker.check_ops to keep a single source of truth.
+__all__ = [
+    "OpenVINONPUChecker",
+    "QNNNPUChecker",
+    "check_patterns",
+    "get_ep_checker",
+]
 
 
 def build_parser():
@@ -274,6 +237,10 @@ def build_parser():
         "--ep",
         type=str,
         required=True,
+        # CARVE-OUT: This subprocess tool intentionally supports only a curated subset of
+        # NPU EPs. VitisAI and future NPU EPs are excluded because this pattern-checking
+        # tool has not been validated against them. Do NOT derive from eps_for_device("npu")
+        # or EP_DEVICE_SPECS — this is an explicit opt-in allowlist, not catalog drift.
         choices=["QNNExecutionProvider", "OpenVINOExecutionProvider"],
         help=(
             "Execution Provider names to test. "
@@ -293,10 +260,7 @@ def build_parser():
         "--opset_mapping",
         type=str,
         nargs="+",
-        help=(
-            "Domain:version pairs for ONNX opset versions, "
-            "e.g., ai.onnx:17 com.microsoft:1"
-        ),
+        help=("Domain:version pairs for ONNX opset versions, e.g., ai.onnx:17 com.microsoft:1"),
     )
     opset_group.add_argument(
         "--opset_version",
@@ -311,8 +275,7 @@ def build_parser():
         type=str,
         default=ONNXDomain.AI_ONNX.value,
         help=(
-            "ONNX opset domain to use with --opset_version "
-            f"(default: {ONNXDomain.AI_ONNX.value})"
+            f"ONNX opset domain to use with --opset_version (default: {ONNXDomain.AI_ONNX.value})"
         ),
     )
     parser.add_argument(
@@ -392,8 +355,7 @@ def _parse_opset_mapping(args: Any) -> dict[str, int]:
         for pair in args.opset_mapping:
             if ":" not in pair:
                 raise ValueError(
-                    "Invalid --opset_mapping value "
-                    f"'{pair}'. Expected format: domain:version"
+                    f"Invalid --opset_mapping value '{pair}'. Expected format: domain:version"
                 )
             domain, version_text = pair.split(":", 1)
             if not domain:
@@ -402,8 +364,7 @@ def _parse_opset_mapping(args: Any) -> dict[str, int]:
                 opset_mapping[domain] = int(version_text)
             except ValueError as exc:
                 raise ValueError(
-                    "Invalid --opset_mapping value "
-                    f"'{pair}'. Version must be an integer"
+                    f"Invalid --opset_mapping value '{pair}'. Version must be an integer"
                 ) from exc
         return opset_mapping
 

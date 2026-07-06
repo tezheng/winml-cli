@@ -25,7 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ..utils import cli as cli_utils
-from ..utils.constants import normalize_ep_name
+from ..utils.cli import normalize_ep_name
 from ..utils.logging import configure_logging
 
 
@@ -405,7 +405,7 @@ def _render_analysis_summary(
     required=False, optional_message="If not specified, analyzes all supported EPs"
 )
 @cli_utils.device_option(
-    required=False, optional_message="If not specified, uses NPU as default", default="NPU"
+    required=False, optional_message="If not specified, uses npu as default", default="npu"
 )
 @cli_utils.verbosity_options
 @cli_utils.build_config_option
@@ -476,7 +476,7 @@ def analyze(
     Examples:
     \b
         winml analyze --model model.onnx --ep qnn
-        winml analyze --model model.onnx --ep ov --device GPU
+        winml analyze --model model.onnx --ep openvino --device gpu
         winml analyze --model model.onnx --output results.json
     """
     # Apply build config defaults (CLI explicit options take precedence)

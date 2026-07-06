@@ -29,6 +29,7 @@ from typing import Any
 
 import click
 
+from ..session import VALID_DEVICES
 from ..utils.console import (
     get_console,
     print_command_header,
@@ -38,6 +39,7 @@ from ..utils.console import (
     print_kv,
     print_success,
 )
+from ._ep_arg import EpAtSourceParamType
 
 
 logger = logging.getLogger(__name__)
@@ -114,19 +116,21 @@ def _is_onnx_file(model_input: str) -> bool:
     "-d",
     "--device",
     "device",
-    type=click.Choice(["auto", "npu", "gpu", "cpu"], case_sensitive=False),
+    type=click.Choice(["auto", *sorted(VALID_DEVICES)], case_sensitive=False),
     default="auto",
     help="Target device (affects quant/compile config). Default: auto (no changes to config).",
 )
 @click.option(
     "--ep",
     "ep",
-    type=str,
+    type=EpAtSourceParamType(),
     default=None,
     help="Force specific execution provider "
     "(qnn, dml, migraphx, nv_tensorrt_rtx, vitisai, openvino, cpu). "
     "Overrides device-to-provider mapping. "
-    "When used without --device, device is inferred from EP.",
+    "When used without --device, device is inferred from EP. "
+    "(Source-pinning ``@<source-tag>`` is rejected: config's pipeline "
+    "takes a bare EP short-name.)",
 )
 @click.option(
     "-p",
@@ -184,7 +188,7 @@ def config(
     config_file: str | None,
     shape_config_file: str | None,
     device: str,
-    ep: str | None,
+    ep: tuple[str, str | None] | None,
     precision: str,
     output: str | None,
     library_name: str,
@@ -250,6 +254,14 @@ def config(
         raise click.UsageError(
             "At least one of -m/--model, --model-type, or --model-class is required."
         )
+
+    # --ep arrives pre-split as (ep, source) or None thanks to the
+    # EpAtSourceParamType. config.py doesn't yet honor source pinning
+    # (its pipeline takes a bare EP short-name); _reject_ep_source raises
+    # at the CLI boundary if @<source> was given, else returns the bare
+    # ep short name (or None when --ep was not supplied).
+    from ._ep_arg import _reject_ep_source
+    ep = _reject_ep_source(ep, "winml config")
 
     try:
         from ..config import (
@@ -454,15 +466,16 @@ def config(
 
             console.print("   \u2699\ufe0f  [bold]Resolution:[/bold]")
 
-            # Fix #4: Device from resolve_device (existing API)
-            from ..sysinfo import resolve_device as _rd
+            # Fix #4: Device from auto_detect_device (resolves "auto"
+            # to a concrete category without registering EPs).
+            from ..session import auto_detect_device
 
-            _resolved_dev, _ = _rd(device)
+            _resolved_dev = auto_detect_device() if device.lower() == "auto" else device.lower()
             console.print(f"      Device:     [cyan]{_resolved_dev.upper()}[/cyan]")
 
             # EP — only shown when user explicitly passed --ep
             if ep:
-                from ..utils.constants import normalize_ep_name
+                from ..utils.cli import normalize_ep_name
 
                 _ep_full = normalize_ep_name(ep) or ep
                 console.print(f"      EP:         [cyan]{_ep_full}[/cyan]")

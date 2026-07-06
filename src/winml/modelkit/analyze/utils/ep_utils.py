@@ -70,7 +70,7 @@ def get_devices_with_rule_data(ep_name: str) -> list[str]:
 
     First probes rule zip search directories for files matching
     ``{ep_name}_{device}_*.zip``.  If no rule data is found, falls
-    back to the EP→device mapping from :func:`sysinfo.get_ep_device_map`.
+    back to the EP→device mapping in :data:`session.EP_DEVICE_SPECS`.
 
     Args:
         ep_name: Full execution provider name (e.g., ``"QNNExecutionProvider"``).
@@ -79,10 +79,10 @@ def get_devices_with_rule_data(ep_name: str) -> list[str]:
         List of device strings (e.g., ``["NPU", "GPU"]``), empty if
         the EP is completely unknown.
     """
-    from ...sysinfo.device import get_ep_device_map
+    from ...session import EP_DEVICE_SPECS
 
     # Priority order: NPU > GPU > CPU (first match used as default device)
-    known_devices = {d.upper() for v in get_ep_device_map().values() for d in v.split("/") if d}
+    known_devices = {spec.device.upper() for spec in EP_DEVICE_SPECS}
     priority = ["NPU", "GPU", "CPU"]
     probe_order = [d for d in priority if d in known_devices]
     # Append any devices not in the priority list
@@ -91,9 +91,9 @@ def get_devices_with_rule_data(ep_name: str) -> list[str]:
     devices = [d for d in probe_order if has_rule_data_for_ep(ep_name, d)]
     if devices:
         return devices
-    # Fallback: derive from the authoritative EP→device mapping
-    device_str = get_ep_device_map().get(ep_name, "")
-    return [d.upper() for d in device_str.split("/") if d]
+    # Fallback: derive from the authoritative EP→device catalog. Preserve
+    # catalog order (NPU rows precede GPU/CPU rows for each vendor EP).
+    return [spec.device.upper() for spec in EP_DEVICE_SPECS if spec.ep == ep_name]
 
 
 def has_rule_data_for_ep(ep_name: str, device: str) -> bool:

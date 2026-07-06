@@ -25,11 +25,12 @@ from pathlib import Path
 import click
 from rich.console import Console
 
-from ..config import VALID_EPS
-from ..config.precision import _DEVICE_TO_PROVIDER, _EP_TO_DEVICE
 from ..onnx import is_compiled_onnx
+from ..session import VALID_DEVICES, EPDeviceTarget, resolve_device
+from ..session.ep_device import DeviceNotFound, WinMLEPNotDiscovered, WinMLEPRegistrationFailed
 from ..utils import cli as cli_utils
 from ..utils.logging import configure_logging
+from ._ep_arg import EpAtSourceParamType
 
 
 logger = logging.getLogger(__name__)
@@ -53,16 +54,16 @@ console = Console()
 @click.option(
     "--device",
     "-d",
-    type=click.Choice(["auto", "npu", "gpu", "cpu"], case_sensitive=False),
-    default="npu",
-    show_default=True,
-    help="Target device",
+    type=click.Choice(["auto", *sorted(VALID_DEVICES)], case_sensitive=False),
+    default=None,
+    help="Target device (default: deduced from --ep, or 'npu' if neither given)",
 )
 @click.option(
     "--ep",
-    type=click.Choice(sorted(VALID_EPS), case_sensitive=False),
+    type=EpAtSourceParamType(),
     default=None,
-    help="Force specific EP. Overrides device-to-provider mapping.",
+    help="Force specific EP, optionally pinned to a source (e.g. 'openvino@pypi'). "
+    "Overrides device-to-provider mapping.",
 )
 @click.option(
     "--quantize/--no-quantize",
@@ -112,8 +113,8 @@ def compile(
     ctx: click.Context,
     model: Path | None,
     output_dir: Path | None,
-    device: str,
-    ep: str | None,
+    device: str | None,
+    ep: tuple[str, str | None] | None,
     quantize: bool,
     validate: bool,
     verbose: bool,
@@ -150,6 +151,15 @@ def compile(
     if ctx.obj and ctx.obj.get("debug"):
         verbose = True
 
+    # --ep is parsed by EpAtSourceParamType at click parse time and
+    # arrives as (ep, source) or None — feeds the EPDeviceTarget's
+    # `source` axis (Scenarios A.5/A.6 per 2_coreloop.md §6.2). Unpack
+    # at entry so the local ``ep`` is a bare ``str | None`` for the rest
+    # of the function — this keeps the Rich pre-run block from leaking
+    # the raw tuple into user-visible output (T-01 regression pin).
+    ep_part, source_part = ep if ep else (None, None)
+    ep = ep_part
+
     # Apply build config defaults (CLI explicit options take precedence)
     if config_file is not None:
         build_cfg = cli_utils.load_build_config(config_file)
@@ -168,12 +178,34 @@ def compile(
 
     configure_logging(verbose=verbose)
 
+    # Resolve EP+device at the CLI boundary (plan §C / Decision B).
+    # device=None or "auto" both signal auto-detect via the resolver.
+    _device_arg = "auto" if (device is None or device.lower() == "auto") else device.lower()
+    try:
+        ep_device_resolved = resolve_device(
+            EPDeviceTarget(
+                ep=ep or "auto",
+                device=_device_arg,
+                source=source_part,
+            )
+        )
+    except DeviceNotFound as e:
+        raise click.ClickException(str(e)) from e
+    except WinMLEPNotDiscovered as e:
+        raise click.ClickException(
+            f"EP plugin not found: {e}. Install the required EP package (e.g. onnxruntime-qnn)."
+        ) from e
+    except WinMLEPRegistrationFailed as e:
+        raise click.ClickException(f"EP registration failed: {e}") from e
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
+    logger.info("Resolved to: %s", ep_device_resolved)
+
     # Handle --list
     if list_compilers_flag:
         from ..compiler import list_compilers
 
-        provider = _resolve_compile_provider(device, ep)
-        click.echo(list_compilers(provider))
+        click.echo(list_compilers(ep_device_resolved.device))
         return
 
     # Validate model is provided when not listing
@@ -189,9 +221,8 @@ def compile(
     # Import compiler (late import to speed up CLI)
     from ..compiler import WinMLCompileConfig, compile_onnx
 
-    # Resolve EP from device + ep flags
-    provider = _resolve_compile_provider(device, ep)
-    config = WinMLCompileConfig.for_provider(provider)
+    # Build config from the already-resolved EPDeviceTarget (ep_device is never None here).
+    config = WinMLCompileConfig.for_ep_device(ep_device_resolved)
 
     config.validate = validate
     config.verbose = verbose
@@ -209,12 +240,12 @@ def compile(
             "Use 'winml quantize' before 'winml compile' to control quantization."
         )
 
-    # Show info
+    # Show info — device and provider come directly from the resolved EPDeviceTarget.
     console.print(f"[bold blue]Input:[/bold blue] {model}")
-    console.print(f"[bold blue]Device:[/bold blue] {_EP_TO_DEVICE.get(provider, device)}")
+    console.print(f"[bold blue]Device:[/bold blue] {ep_device_resolved.device}")
     if ep:
         console.print(f"[bold blue]EP:[/bold blue] {ep}")
-    console.print(f"[bold blue]Provider:[/bold blue] {provider}")
+    console.print(f"[bold blue]Provider:[/bold blue] {ep_device_resolved.ep}")
     console.print(f"[bold blue]Compiler:[/bold blue] {compiler}")
     if qnn_sdk_root:
         console.print(f"[bold blue]SDK root:[/bold blue] {qnn_sdk_root}")
@@ -254,19 +285,3 @@ def compile(
         console.print(f"\n[bold red]Compilation failed:[/bold red] {e}")
         logger.exception("Compilation failed")
         raise click.ClickException(f"Compilation failed: {e}") from e
-
-
-def _resolve_compile_provider(device: str, ep: str | None) -> str:
-    """Resolve the compile provider from device + ep flags.
-
-    Uses the canonical ``_DEVICE_TO_PROVIDER`` from ``config/precision.py``
-    as single source of truth. ``ep`` overrides the device mapping.
-    """
-    if ep:
-        return ep.lower()
-
-    provider = _DEVICE_TO_PROVIDER.get(device.lower())
-    if provider is None:
-        # cpu maps to None in _DEVICE_TO_PROVIDER; use "cpu" for compile
-        return "cpu" if device.lower() == "cpu" else "qnn"
-    return provider

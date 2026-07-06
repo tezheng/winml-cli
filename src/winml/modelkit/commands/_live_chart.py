@@ -17,10 +17,26 @@ from rich.panel import Panel
 
 
 # Moving window size for the x-axis (seconds)
-_CHART_WINDOW_SECONDS = 10.0
+_CHART_WINDOW_SECONDS = 15.0
 
 # Display refresh rate (frames per second)
 _REFRESH_FPS = 5
+
+
+def _avg_now(
+    samples: list[float] | None,
+    fallback_now: float = 0.0,
+) -> tuple[float, float]:
+    """Return ``(avg, now)`` for a samples list.
+
+    ``fallback_now`` is used for the ``now`` value when ``samples`` is empty
+    or ``None`` (e.g. when a caller has a scalar current reading but no
+    time-series to compute an average from — in that case ``avg`` mirrors
+    the scalar so the display stays honest rather than reading 0.0).
+    """
+    if not samples:
+        return (fallback_now, fallback_now)
+    return (sum(samples) / len(samples), samples[-1])
 
 
 class LiveMonitorDisplay:
@@ -35,7 +51,7 @@ class LiveMonitorDisplay:
         warmup: int,
         model_id: str,
         device: str,
-        chart_width: int = 80,
+        chart_width: int = 120,
         chart_height: int = 15,
         poll_interval_ms: int = 100,
     ) -> None:
@@ -75,13 +91,15 @@ class LiveMonitorDisplay:
         cpu_pct: float = 0.0,
         ram_mb: float = 0.0,
         cpu_samples: list[float] | None = None,
+        gpu_samples: list[float] | None = None,
+        gpu_pct: float = 0.0,
     ) -> None:
         """Update the live display with current metrics."""
         if self._live is None:
             return
 
         try:
-            chart_renderable = self._render_chart(util_samples, cpu_samples)
+            chart_renderable = self._render_chart(util_samples, cpu_samples, gpu_samples)
             status_line = self._render_status(
                 iteration,
                 latency_ms,
@@ -90,6 +108,9 @@ class LiveMonitorDisplay:
                 memory_shared_mb,
                 cpu_pct,
                 ram_mb,
+                gpu_pct=gpu_pct,
+                cpu_samples=cpu_samples,
+                gpu_samples=gpu_samples,
             )
 
             from rich.console import Group
@@ -106,12 +127,15 @@ class LiveMonitorDisplay:
             pass  # Don't let display errors interrupt the benchmark
 
     def _render_chart(
-        self, util_samples: list[float], cpu_samples: list[float] | None = None
+        self,
+        util_samples: list[float],
+        cpu_samples: list[float] | None = None,
+        gpu_samples: list[float] | None = None,
     ) -> Any:
         """Render utilization chart as a Rich renderable.
 
         Uses plotext with AnsiDecoder for flicker-free Rich Live integration.
-        Plots NPU (green) and CPU (cyan) with distinct colors.
+        Plots NPU (green), CPU (cyan), and GPU (yellow) with distinct colors.
         X-axis is a moving window of the last N seconds.
         Y-axis has fixed ticks: 0, 20, 40, 60, 80, 100.
         """
@@ -155,6 +179,22 @@ class LiveMonitorDisplay:
             ]
             plt.plot(cpu_times, cpu_window, marker="braille", color="cyan")
 
+        # Plot GPU in yellow (distinct from NPU green and CPU cyan)
+        has_gpu = False
+        if gpu_samples:
+            has_gpu = True
+            total_gpu = len(gpu_samples)
+            gpu_window = gpu_samples[-window_samples:]
+            gpu_start_idx = max(0, total_gpu - len(gpu_window))
+            gpu_times = [
+                (gpu_start_idx + i) * self._poll_interval_s for i in range(len(gpu_window))
+            ]
+            # plotext's palette exposes 'orange+' (ANSI bright yellow, code 11)
+            # but has no 'yellow' key — `color="yellow"` silently falls through
+            # to default (white). `orange+` matches Rich's `[bright_yellow]`
+            # legend swatch below.
+            plt.plot(gpu_times, gpu_window, marker="braille", color="orange+")
+
         # No plotext title -- we render our own Rich-colored title with legend
         plt.ylabel("Usage %")
 
@@ -175,12 +215,12 @@ class LiveMonitorDisplay:
         from rich.text import Text
 
         # Rich-colored title line with legend swatches
+        legend_parts = ["[green]\u2588\u2588[/green] NPU %"]
         if has_cpu:
-            title = Text.from_markup(
-                "  Utilization ([green]\u2588\u2588[/green] NPU %  [cyan]\u2588\u2588[/cyan] CPU %)"
-            )
-        else:
-            title = Text.from_markup("  Utilization ([green]\u2588\u2588[/green] NPU %)")
+            legend_parts.append("[cyan]\u2588\u2588[/cyan] CPU %")
+        if has_gpu:
+            legend_parts.append("[bright_yellow]\u2588\u2588[/bright_yellow] GPU %")
+        title = Text.from_markup(f"  Utilization ({'  '.join(legend_parts)})")
 
         ansi_output = plt.build()
         chart_lines = [Text.from_ansi(line) for line in ansi_output.splitlines()]
@@ -195,14 +235,24 @@ class LiveMonitorDisplay:
         memory_shared_mb: float = 0.0,
         cpu_pct: float = 0.0,
         ram_mb: float = 0.0,
+        gpu_pct: float = 0.0,
+        cpu_samples: list[float] | None = None,
+        gpu_samples: list[float] | None = None,
     ) -> str:
-        """Render 3-row status below the chart."""
+        """Render 4-row status below the chart.
+
+        Row 1: progress bar + phase counter + device label.
+        Row 2: compute utilization (NPU / CPU / GPU) — unified ``now%/avg%``.
+        Row 3: memory (Sys Mem + Device Mem local/shared).
+        Row 4: inference latency + throughput.
+
+        CPU and GPU accept a samples list to compute ``avg`` — the ``cpu_pct``
+        and ``gpu_pct`` scalars remain as the ``now`` value (and as fallbacks
+        for ``avg`` when no samples were supplied).
+        """
         phase = "warmup" if iteration <= self._warmup else "benchmark"
         effective_iter = iteration - self._warmup if phase == "benchmark" else iteration
         total_bench = self._total - self._warmup
-
-        current_util = util_samples[-1] if util_samples else 0.0
-        mean_util = sum(util_samples) / len(util_samples) if util_samples else 0.0
 
         pct = iteration / self._total if self._total > 0 else 0
         bar_len = int(pct * 20)
@@ -215,23 +265,31 @@ class LiveMonitorDisplay:
 
         throughput = 1000.0 / latency_ms if latency_ms > 0 else 0.0
 
+        npu_avg, npu_now = _avg_now(util_samples)
+        cpu_avg, cpu_now = _avg_now(cpu_samples, fallback_now=cpu_pct)
+        gpu_avg, gpu_now = _avg_now(gpu_samples, fallback_now=gpu_pct)
+
         # Row 1: Progress
         pct_cell = f"{bar} {pct:.0%}"
         row1 = f"  {pct_cell:<30}|  {progress}  |  Device: {self._device}"
 
-        # Row 2: Hardware (pad each cell to fixed width, spaces before divider)
-        npu_cell = f"NPU: {mean_util:.1f}% avg ({current_util:.1f}% now)"
-        cpu_cell = f"CPU: {cpu_pct:.1f}%"
+        # Row 2: Compute (unified now/avg format across all three)
+        npu_cell = f"NPU: {npu_now:.1f}%/{npu_avg:.1f}%"
+        cpu_cell = f"CPU: {cpu_now:.1f}%/{cpu_avg:.1f}%"
+        gpu_cell = f"GPU: {gpu_now:.1f}%/{gpu_avg:.1f}%"
+        row2 = f"  {npu_cell:<20}| {cpu_cell:<20}| {gpu_cell:<20}"
+
+        # Row 3: Memory
         ram_cell = f"Sys Mem: {ram_mb:.0f} MB"
         mem_cell = f"Device Mem: {memory_local_mb:.0f}/{memory_shared_mb:.0f} MB (local/shared)"
-        row2 = f"  {npu_cell:<30}| {cpu_cell:<12}|  {ram_cell}  |  {mem_cell}"
+        row3 = f"  {ram_cell:<24}|  {mem_cell}"
 
-        # Row 3: Inference (pad each cell to fixed width, spaces before divider)
+        # Row 4: Inference
         lat_cell = f"Latency: {latency_ms:.2f} ms"
         thr_cell = f"Throughput: ~{throughput:.0f} smp/s"
-        row3 = f"  {lat_cell:<24}|  {thr_cell}"
+        row4 = f"  {lat_cell:<24}|  {thr_cell}"
 
-        return f"{row1}\n{row2}\n{row3}"
+        return f"{row1}\n{row2}\n{row3}\n{row4}"
 
     def print_final_snapshot(
         self,

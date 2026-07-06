@@ -6,7 +6,7 @@
 
 Monitors CPU utilization, system RAM, and NPU/GPU utilization and memory
 for any adapter that registers as a Windows GPU Engine device.
-Works independently of the EPMonitor hierarchy.
+Works independently of the WinMLEPMonitor hierarchy.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from ._pdh import PdhPoller
 
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
+    from typing import Self
 
 
 class HWMonitor:
@@ -28,7 +28,7 @@ class HWMonitor:
     that registers as a Windows GPU Engine adapter with Compute-only
     engine types (Qualcomm, AMD, Intel).
 
-    Independent of the EPMonitor hierarchy — provides system-wide
+    Independent of the WinMLEPMonitor hierarchy — provides system-wide
     resource visibility rather than EP-specific proof-of-execution.
 
     Example::
@@ -91,6 +91,18 @@ class HWMonitor:
         """Peak shared system memory used by device in MB."""
         return self._pdh.peak_memory_shared_mb
 
+    # --- GPU metrics ---
+
+    @property
+    def mean_gpu_pct(self) -> float:
+        """Mean GPU utilization % during monitoring period."""
+        return self._pdh.mean_gpu_pct
+
+    @property
+    def peak_gpu_pct(self) -> float:
+        """Peak GPU utilization % during monitoring period."""
+        return self._pdh.peak_gpu_pct
+
     # --- CPU metrics ---
 
     @property
@@ -145,6 +157,12 @@ class HWMonitor:
                 "peak_pct": round(self._pdh.peak_utilization_pct, 2),
                 "sample_count": self._pdh.utilization_sample_count,
             },
+            "gpu": {
+                "mean_pct": round(self._pdh.mean_gpu_pct, 2),
+                "peak_pct": round(self._pdh.peak_gpu_pct, 2),
+                "sample_count": self._pdh.gpu_sample_count,
+                "luids": self._pdh.gpu_luids,
+            },
             "device_memory": {
                 "local_peak_mb": round(self._pdh.peak_memory_local_mb, 2),
                 "shared_peak_mb": round(self._pdh.peak_memory_shared_mb, 2),
@@ -163,6 +181,11 @@ class HWMonitor:
     def cpu_samples(self) -> list[float]:
         """CPU utilization % samples (time series)."""
         return self._pdh.cpu_samples
+
+    @property
+    def gpu_samples(self) -> list[float]:
+        """GPU utilization % samples (time series)."""
+        return self._pdh.gpu_samples
 
     @property
     def memory_samples_mb(self) -> list[float]:

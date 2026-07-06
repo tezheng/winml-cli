@@ -34,7 +34,14 @@ from importlib.metadata import PackageNotFoundError, version
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
-from . import _warnings  # Configure warning filters before importing subpackages
+# _warnings configures filters before any subpackage imports.
+# transformers_compat arms a sys.meta_path hook — the shim fires lazily
+# the first time anything imports optimum.*; lightweight commands
+# (``winml sys``, ``winml --help``) never pay the transformers cost.
+from . import _warnings  # noqa: I001
+from . import transformers_compat  # noqa: I001
+
+transformers_compat.arm()
 
 
 try:

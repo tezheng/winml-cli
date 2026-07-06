@@ -36,6 +36,7 @@ from ..utils.console import (
     print_stage_skip,
     print_stages_header,
 )
+from ._ep_arg import EpAtSourceParamType
 
 
 if TYPE_CHECKING:
@@ -267,9 +268,12 @@ def _build_modules(
 )
 @click.option(
     "--ep",
+    type=EpAtSourceParamType(),
     default=None,
     help="Target execution provider for analyzer (e.g., 'qnn'). "
-    "Falls back to compile config EP if not set.",
+    "Falls back to compile config EP if not set. (Source-pinning "
+    "``@<source-tag>`` is rejected: build's analyzer pipeline takes a "
+    "bare EP short-name.)",
 )
 @click.option(
     "--device",
@@ -319,7 +323,7 @@ def build(
     no_quant: bool,
     no_compile: bool,
     no_optimize: bool,
-    ep: str | None,
+    ep: tuple[str, str | None] | None,
     device: str | None,
     no_analyze: bool,
     max_optim_iterations: int | None,
@@ -368,25 +372,35 @@ def build(
     if not output_dir and not use_cache:
         raise click.UsageError("One of --output-dir or --use-cache is required.")
 
-    # If ep unspecified, attempt to auto-select a suitable EP from the registry
-    if ep is None:
-        from ..session import WinMLEPRegistry
+    # --ep arrives pre-split as (ep, source) or None thanks to the
+    # EpAtSourceParamType. build.py doesn't yet honor source pinning
+    # (its analyzer pipeline takes a bare EP short-name); _reject_ep_source
+    # raises at the CLI boundary if @<source> was given, else returns the
+    # bare ep short name (or None when --ep was not supplied).
+    from ._ep_arg import _reject_ep_source
+    ep = _reject_ep_source(ep, "winml build")
 
-        registry = WinMLEPRegistry.get_instance()
-        candidate_eps = [
-            "QNNExecutionProvider",
-            "OpenVINOExecutionProvider",
-            "VitisAIExecutionProvider",
-        ]
-        for candidate_ep in candidate_eps:
-            if registry.is_ep_available(candidate_ep):
-                ep = candidate_ep
-                logger.info("EP unspecified for build, auto-selecting: %s", ep)
-                break
+    # If ep unspecified, defer to the unified resolver — auto-detects the best
+    # available (EP, device) pair via the catalog + host inventory.  No
+    # hardcoded device priorities here; the dispatcher does the dispatching.
     if ep is None:
-        logger.warning(
-            "EP unspecified for build, and auto-selection failed. Proceeding without EP hints."
-        )
+        from ..session import EPDeviceTarget, resolve_device, short_ep_name
+
+        try:
+            _auto_ep_device = resolve_device(EPDeviceTarget(ep="auto", device="auto"))
+        except Exception as exc:
+            logger.warning(
+                "EP unspecified for build, and auto-selection failed: %s. "
+                "Proceeding without EP hints.",
+                exc,
+            )
+        else:
+            ep = short_ep_name(_auto_ep_device.ep)
+            logger.info(
+                "EP unspecified for build, auto-selecting: %s (device: %s)",
+                ep,
+                _auto_ep_device.device,
+            )
 
     try:
         # Load config first (needed for both output modes)

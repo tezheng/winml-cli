@@ -21,7 +21,6 @@ from typing import Any
 import onnxruntime as ort
 from onnx.defs import SchemaError
 
-from ... import winml
 from ...onnx import ONNXDomain
 from ...pattern.op_input_gen import (
     OpInputGenerator,
@@ -29,16 +28,11 @@ from ...pattern.op_input_gen import (
     get_runtime_checker_op,
 )
 from ...pattern.op_input_gen.qdq_gen import QDQGenerator
+from ...session import DEVICE_TO_DEVICE_TYPE, DEVICE_TYPE_TO_DEVICE
 from ...sysinfo import SysInfo
-from ...utils import constants
 from ..utils import CheckResultWriter
 from ..utils.model_utils import get_op_since_version
 from .ep_checker import EPChecker
-
-
-# Register WinML EPs at module level before any ORT session is created.
-# This must stay at the top of the file so EPs are available for all downstream usage.
-winml.register_execution_providers(ort=True)
 
 
 def check_ops(
@@ -131,7 +125,7 @@ def check_ops(
 
             # Prepare output file
             since_version = get_op_since_version(op_name, current_opset_version, opset_domain)
-            device = constants.DEVICE_TYPE_TO_DEVICE[ep_checker.device_type]
+            device = DEVICE_TYPE_TO_DEVICE[ep_checker.device_type].upper()
             qdq_suffix = "_qdq" if use_qdq else ""
             output_filename = (
                 f"{op_name}_{ep_checker.ep_name}_{device}"
@@ -261,10 +255,10 @@ class RTXChecker(EPChecker):
 
     def __init__(self, device_type: ort.OrtHardwareDeviceType) -> None:
         if device_type != ort.OrtHardwareDeviceType.GPU:
-            raise ValueError("NvTensorRTRTXExecutionProvider only supports GPU device type")
+            raise ValueError("NvTensorRtRtxExecutionProvider only supports GPU device type")
         """Initialize RTX checker."""
         super().__init__(
-            ep_name="NvTensorRTRTXExecutionProvider", device_type=ort.OrtHardwareDeviceType.GPU
+            ep_name="NvTensorRtRtxExecutionProvider", device_type=ort.OrtHardwareDeviceType.GPU
         )
 
 
@@ -280,13 +274,13 @@ def get_ep_checker(ep_name: str, device: str) -> EPChecker:
     Raises:
         ValueError: If the execution provider name is not supported.
     """
-    device_type = constants.DEVICE_TO_DEVICE_TYPE[device]
+    device_type = DEVICE_TO_DEVICE_TYPE[device.lower()]
     ep_name_to_checker = {
         "QNNExecutionProvider": QNNNPUChecker,
         "OpenVINOExecutionProvider": OpenVINONPUChecker,
         "VitisAIExecutionProvider": VitisAIChecker,
         "MIGraphXExecutionProvider": MIGraphXChecker,
-        "NvTensorRTRTXExecutionProvider": RTXChecker,
+        "NvTensorRtRtxExecutionProvider": RTXChecker,
         # Add other EPChecker subclasses here as needed
     }
     if ep_name not in ep_name_to_checker:
@@ -332,7 +326,7 @@ def build_parser():
             "OpenVINOExecutionProvider",
             "VitisAIExecutionProvider",
             "MIGraphXExecutionProvider",
-            "NvTensorRTRTXExecutionProvider",
+            "NvTensorRtRtxExecutionProvider",
         ],
         help=(
             "Execution Provider names to test. "
@@ -340,7 +334,7 @@ def build_parser():
             "OpenVINOExecutionProvider, "
             "VitisAIExecutionProvider, "
             "MIGraphXExecutionProvider, "
-            "NvTensorRTRTXExecutionProvider"
+            "NvTensorRtRtxExecutionProvider"
         ),
     )
     parser.add_argument(

@@ -89,7 +89,6 @@ class ModelValidatorManager:
         self.model_proto = model.get_model()
         self.op_runtime_results = op_runtime_results or []
         self.device = device or "NPU"
-        self.device = device
         self.enabled_validators = enabled_validators or list(self.VALIDATORS.keys())
 
         # Instantiate enabled validators
@@ -142,7 +141,7 @@ class ModelValidatorManager:
                 if info:
                     logger.info(f"{validator.validator_name} found issue: {info.pattern_id}")
                     information_list.append(info)
-            except Exception as e:  # noqa: PERF203
+            except Exception as e:
                 logger.exception(
                     f"Validator {validator.validator_name} failed with exception: "
                     f"{type(e).__name__}",
