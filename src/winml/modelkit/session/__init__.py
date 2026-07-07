@@ -6,11 +6,13 @@
 
 from ..ep_path import DirectorySource, EPEntry
 from .ep_device import (
+    _SHORT_TO_FULL,
     DEVICE_TO_DEVICE_TYPE,
     DEVICE_TYPE_TO_DEVICE,
     EP_DEVICE_SPECS,
     VALID_DEVICES,
     VALID_EPS,
+    VALID_SOURCE_TAGS,
     DeviceNotFound,
     EPDeviceSpec,
     EPDeviceTarget,
@@ -20,6 +22,7 @@ from .ep_device import (
     WinMLEPNotDiscovered,
     WinMLEPRegistrationFailed,
     _ep_short_or_none,
+    _format_bytes,
     auto_detect_device,
     default_device_for_ep,
     default_ep_for_device,
@@ -48,6 +51,7 @@ __all__ = [
     "EP_DEVICE_SPECS",
     "VALID_DEVICES",
     "VALID_EPS",
+    "VALID_SOURCE_TAGS",
     "DeviceNotFound",
     "DirectorySource",
     "EPDeviceSpec",

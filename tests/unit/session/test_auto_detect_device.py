@@ -24,7 +24,8 @@ class TestAutoDetectDevice:
                 return_value=["npu", "gpu", "cpu"],
             ),
             patch.object(
-                WinMLEPRegistry, "available_eps",
+                WinMLEPRegistry,
+                "available_eps",
                 return_value=frozenset(
                     {
                         "QNNExecutionProvider",
@@ -46,7 +47,8 @@ class TestAutoDetectDevice:
                 return_value=["npu", "gpu", "cpu"],
             ),
             patch.object(
-                WinMLEPRegistry, "available_eps",
+                WinMLEPRegistry,
+                "available_eps",
                 return_value=frozenset(
                     {
                         "DmlExecutionProvider",
@@ -67,7 +69,8 @@ class TestAutoDetectDevice:
                 return_value=["gpu", "cpu"],
             ),
             patch.object(
-                WinMLEPRegistry, "available_eps",
+                WinMLEPRegistry,
+                "available_eps",
                 return_value=frozenset({"CPUExecutionProvider"}),
             ),
         ):
@@ -83,7 +86,8 @@ class TestAutoDetectDevice:
                 return_value=["npu", "gpu", "cpu"],
             ),
             patch.object(
-                WinMLEPRegistry, "available_eps",
+                WinMLEPRegistry,
+                "available_eps",
                 return_value=frozenset(),
             ),
         ):
@@ -99,7 +103,8 @@ class TestAutoDetectDevice:
                 return_value=["cpu"],
             ),
             patch.object(
-                WinMLEPRegistry, "available_eps",
+                WinMLEPRegistry,
+                "available_eps",
                 return_value=frozenset(),
             ),
             caplog.at_level(logging.WARNING, logger="winml.modelkit.session.ep_device"),
@@ -134,13 +139,13 @@ def test_auto_detect_device_falls_back_to_cpu_on_vendor_detection_failure(
             return_value=["npu", "gpu", "cpu"],
         ),
         patch.object(
-            WinMLEPRegistry, "available_eps",
-            return_value=frozenset(
-                {"QNNExecutionProvider", "CPUExecutionProvider"}
-            ),
+            WinMLEPRegistry,
+            "available_eps",
+            return_value=frozenset({"QNNExecutionProvider", "CPUExecutionProvider"}),
         ),
         patch.object(
-            EPCatalog, "is_compatible",
+            EPCatalog,
+            "is_compatible",
             side_effect=RuntimeError("WMI unavailable"),
         ),
         caplog.at_level(logging.WARNING, logger="winml.modelkit.session.ep_device"),
@@ -164,15 +169,17 @@ def test_default_ep_for_device_returns_none_on_vendor_detection_failure() -> Non
     equivalent and must not propagate as an exception.
     """
     from winml.modelkit.ep_path import EPCatalog
-    from winml.modelkit.session.ep_device import default_ep_for_device
+    from winml.modelkit.session import default_ep_for_device
 
     with (
         patch.object(
-            WinMLEPRegistry, "available_eps",
+            WinMLEPRegistry,
+            "available_eps",
             return_value=frozenset({"QNNExecutionProvider"}),
         ),
         patch.object(
-            EPCatalog, "is_compatible",
+            EPCatalog,
+            "is_compatible",
             side_effect=RuntimeError("WMI unavailable"),
         ),
     ):

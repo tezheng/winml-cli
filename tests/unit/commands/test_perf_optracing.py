@@ -257,15 +257,19 @@ class TestResolveEpMonitor:
 
     # ---- OpenVINO dispatch ----
 
-    def test_op_tracing_openvino_available_returns_ov_monitor(self, tmp_path: Path):
-        """--ep openvino --op-tracing basic returns OpenVINOMonitor when available."""
-        from winml.modelkit.session.monitor.openvino_monitor import OpenVINOMonitor
+    def test_op_tracing_openvino_always_raises(self, tmp_path: Path):
+        """OpenVINO op-tracing is intentionally, unconditionally refused.
 
-        with patch.object(OpenVINOMonitor, "is_available", return_value=True):
-            monitor = _resolve_ep_monitor(
-                ep="openvino", op_tracing="basic", output_dir=tmp_path,
-            )
-        assert isinstance(monitor, OpenVINOMonitor)
+        The shipping Intel OpenVINO EP wheel (openvino-plugin-ep) does not
+        implement the CSV-dump mechanism OpenVINOMonitor was written
+        against, so ``_resolve_ep_monitor`` refuses rather than silently
+        emit empty/no-data JSON. See ``perf.py``'s ``_resolve_ep_monitor``
+        docstring/comment for the full rationale.
+        """
+        with pytest.raises(
+            RuntimeError, match="Op-tracing --ep openvino is not currently supported"
+        ):
+            _resolve_ep_monitor(ep="openvino", op_tracing="basic", output_dir=tmp_path)
 
     def test_op_tracing_openvino_detail_raises(self, tmp_path: Path):
         """--ep openvino --op-tracing detail must reject — OV surface is basic-only."""
@@ -276,68 +280,44 @@ class TestResolveEpMonitor:
             pytest.raises(RuntimeError, match="detail is not supported for OpenVINO"),
         ):
             _resolve_ep_monitor(
-                ep="openvino", op_tracing="detail", output_dir=tmp_path,
+                ep="openvino",
+                op_tracing="detail",
+                output_dir=tmp_path,
             )
 
-    def test_op_tracing_openvino_unavailable_raises(self, tmp_path: Path):
-        """--ep openvino --op-tracing basic must clearly explain when OV is unavailable."""
-        from winml.modelkit.session.monitor.openvino_monitor import OpenVINOMonitor
+    def test_npu_op_tracing_without_qnn_raises_no_openvino_fallback(self, tmp_path: Path):
+        """No NPU auto-fallback to OpenVINO exists — QNN unavailable on NPU
+        raises a generic 'not available' error, not a silent OpenVINO pickup.
 
-        with (
-            patch.object(OpenVINOMonitor, "is_available", return_value=False),
-            pytest.raises(RuntimeError, match="OpenVINO is not"),
-        ):
-            _resolve_ep_monitor(
-                ep="openvino", op_tracing="basic", output_dir=tmp_path,
-            )
-
-    def test_auto_infers_openvino_when_qnn_unavailable_on_npu(self, tmp_path: Path):
-        """--device npu --op-tracing basic falls back to OpenVINO on non-QNN NPU boxes (Intel NPU)."""
-        from winml.modelkit.session.monitor.openvino_monitor import OpenVINOMonitor
+        This deliberately pins the CURRENT shipped behavior, which differs
+        from PR #1019's own Summary text ("NPU/auto -> try monitor A, fall
+        back to B"): no such fallback branch exists in _resolve_ep_monitor.
+        A working implementation of that fallback was built on a sibling
+        branch (commit e6be7659) but never merged into this branch.
+        """
         from winml.modelkit.session.monitor.qnn_monitor import QNNMonitor
 
         with (
             patch.object(QNNMonitor, "is_available", return_value=False),
-            patch.object(OpenVINOMonitor, "is_available", return_value=True),
+            pytest.raises(RuntimeError, match="Op-tracing not available for EP"),
         ):
-            monitor = _resolve_ep_monitor(
-                ep=None, op_tracing="basic", output_dir=tmp_path, device="npu",
-            )
-        assert isinstance(monitor, OpenVINOMonitor)
+            _resolve_ep_monitor(ep=None, op_tracing="basic", output_dir=tmp_path, device="npu")
 
-    def test_auto_infers_openvino_from_gpu_device(self, tmp_path: Path):
-        """--device gpu --op-tracing basic auto-infers OpenVINO."""
-        from winml.modelkit.session.monitor.openvino_monitor import OpenVINOMonitor
+    def test_gpu_op_tracing_raises_no_openvino_fallback(self, tmp_path: Path):
+        """No GPU auto-fallback to OpenVINO exists for op-tracing.
 
-        with patch.object(OpenVINOMonitor, "is_available", return_value=True):
-            monitor = _resolve_ep_monitor(
-                ep=None, op_tracing="basic", output_dir=tmp_path, device="gpu",
-            )
-        assert isinstance(monitor, OpenVINOMonitor)
-
-    def test_openvino_device_mapping(self, tmp_path: Path):
-        """CLI --device values map to correct OpenVINO device strings."""
-        from winml.modelkit.session.monitor.openvino_monitor import OpenVINOMonitor
-
-        cases = [("npu", "NPU"), ("gpu", "GPU"), ("cpu", "CPU"), ("auto", "AUTO")]
-        for cli_device, ov_device in cases:
-            with patch.object(OpenVINOMonitor, "is_available", return_value=True):
-                monitor = _resolve_ep_monitor(
-                    ep="openvino",
-                    op_tracing="basic",
-                    output_dir=tmp_path,
-                    device=cli_device,
-                )
-            assert monitor._device == ov_device, (
-                f"--device {cli_device} should map to OpenVINO device {ov_device}, "
-                f"got {monitor._device}"
-            )
+        Same rationale as test_npu_op_tracing_without_qnn_raises_no_openvino_fallback.
+        """
+        with pytest.raises(RuntimeError, match="Op-tracing not available for EP"):
+            _resolve_ep_monitor(ep=None, op_tracing="basic", output_dir=tmp_path, device="gpu")
 
     def test_unsupported_ep_error_mentions_both_supported_eps(self, tmp_path: Path):
         """When neither QNN nor OpenVINO fits, the error names both supported paths."""
         with pytest.raises(RuntimeError) as excinfo:
             _resolve_ep_monitor(
-                ep="dml", op_tracing="basic", output_dir=tmp_path,
+                ep="dml",
+                op_tracing="basic",
+                output_dir=tmp_path,
             )
         msg = str(excinfo.value)
         assert "qnn" in msg.lower()
@@ -405,26 +385,6 @@ class _ConfigStub:
 
 class TestCliOpTracingDispatch:
     """CLI-level integration tests for --op-tracing dispatch (mocked benchmark)."""
-
-    def test_onnx_input_with_op_tracing_fails_at_parse_time(self, tmp_path: Path):
-        """--op-tracing on a .onnx input must fail BEFORE running the benchmark."""
-        runner = CliRunner()
-        onnx_file = tmp_path / "fake.onnx"
-        onnx_file.write_bytes(b"")
-
-        # Patch _run_onnx_benchmark to detect if it was called (it must NOT be).
-        with patch(
-            "winml.modelkit.commands.perf._run_onnx_benchmark",
-        ) as mock_run:
-            result = runner.invoke(
-                perf,
-                ["-m", str(onnx_file), "--op-tracing", "basic"],
-                obj={},
-            )
-
-        assert result.exit_code != 0
-        assert "not yet supported for direct ONNX" in result.output
-        mock_run.assert_not_called()
 
     def test_no_data_status_exits_4(self, tmp_path: Path):
         """When op-tracing returns status='no_data', CLI exits 4 — not exit 0 with warning."""

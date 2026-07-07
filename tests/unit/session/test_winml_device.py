@@ -14,8 +14,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from winml.modelkit.session import WinMLDevice
-from winml.modelkit.session.ep_device import _format_bytes
+from winml.modelkit.session import WinMLDevice, _format_bytes
 
 
 def make_fake_ort_ep_device(
@@ -47,16 +46,12 @@ class TestWrapOrtDeviceFactory:
     """WinMLDevice(handle) constructs a WinMLDevice."""
 
     def test_wrap_returns_winml_device(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         wd = WinMLDevice(handle)
         assert isinstance(wd, WinMLDevice)
 
     def test_wrap_preserves_handle_identity(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         wd = WinMLDevice(handle)
         # _ort is the implementation-internal handle reference — verified
         # indirectly via the public properties below.
@@ -67,16 +62,12 @@ class TestCommonProperties:
     """ep_name / device_type / hardware_name / vendor / ep_vendor / library_path."""
 
     def test_ep_name_passes_through(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).ep_name == "OpenVINOExecutionProvider"
 
     def test_device_type_is_upper(self) -> None:
         """device_type is forced uppercase — ORT may return mixed case in future."""
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="npu"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="npu")
         assert WinMLDevice(handle).device_type == "NPU"
 
     def test_hardware_name_prefers_ep_metadata(self) -> None:
@@ -97,9 +88,7 @@ class TestCommonProperties:
         assert WinMLDevice(handle).hardware_name == "Intel Arc"
 
     def test_hardware_name_unknown_fallback(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).hardware_name == "<unknown>"
 
     def test_vendor_passes_through(self) -> None:
@@ -127,9 +116,7 @@ class TestCommonProperties:
         assert WinMLDevice(handle).library_path == "C:/plugins/openvino_ep.dll"
 
     def test_library_path_missing_returns_none(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).library_path is None
 
 
@@ -236,9 +223,7 @@ class TestArchitecture:
         assert WinMLDevice(handle).architecture == "intel64"
 
     def test_openvino_missing_returns_none(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).architecture is None
 
     def test_unknown_ep_returns_none(self) -> None:
@@ -257,9 +242,7 @@ class TestCapabilities:
         handle = make_fake_ort_ep_device(
             ep_name="OpenVINOExecutionProvider",
             device_type="GPU",
-            ep_metadata={
-                "OPTIMIZATION_CAPABILITIES": "FP32 FP16 GPU_HW_MATMUL GPU_USM_MEMORY"
-            },
+            ep_metadata={"OPTIMIZATION_CAPABILITIES": "FP32 FP16 GPU_HW_MATMUL GPU_USM_MEMORY"},
         )
         caps = WinMLDevice(handle).capabilities
         # Order preserved, rewrites applied
@@ -275,9 +258,7 @@ class TestCapabilities:
         assert WinMLDevice(handle).capabilities == ("FP16",)
 
     def test_openvino_missing_returns_empty(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="GPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="GPU")
         assert WinMLDevice(handle).capabilities == ()
 
     def test_unknown_ep_returns_empty(self) -> None:
@@ -409,9 +390,7 @@ class TestDeviceFacts:
 
     def test_device_facts_empty_when_no_metadata(self) -> None:
         """A WinMLDevice with no architecture/driver returns empty tuple."""
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).device_facts() == ()
 
     def test_device_facts_returns_tuple_of_strings(self) -> None:
@@ -426,9 +405,7 @@ class TestDeviceFacts:
 
     def test_unknown_ep_device_facts_is_empty(self) -> None:
         """An EP with no per-EP dispatch contributes no device_facts."""
-        handle = make_fake_ort_ep_device(
-            ep_name="UnknownEP", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="UnknownEP", device_type="NPU")
         assert WinMLDevice(handle).device_facts() == ()
 
 
@@ -488,15 +465,11 @@ class TestEpFacts:
 
     def test_ep_facts_empty_when_no_metadata(self) -> None:
         """A WinMLDevice with no memory/capabilities returns empty tuple."""
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         assert WinMLDevice(handle).ep_facts() == ()
 
     def test_ep_facts_returns_tuple_of_strings(self) -> None:
-        handle = make_fake_ort_ep_device(
-            ep_name="OpenVINOExecutionProvider", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="OpenVINOExecutionProvider", device_type="NPU")
         facts = WinMLDevice(handle).ep_facts()
         assert isinstance(facts, tuple)
         assert all(isinstance(f, str) for f in facts)
@@ -513,9 +486,7 @@ class TestEpFacts:
 
     def test_unknown_ep_ep_facts_is_empty(self) -> None:
         """An EP with no per-EP dispatch contributes no ep_facts."""
-        handle = make_fake_ort_ep_device(
-            ep_name="UnknownEP", device_type="NPU"
-        )
+        handle = make_fake_ort_ep_device(ep_name="UnknownEP", device_type="NPU")
         assert WinMLDevice(handle).ep_facts() == ()
 
 

@@ -26,8 +26,14 @@ import click
 from rich.console import Console
 
 from ..onnx import is_compiled_onnx
-from ..session import VALID_DEVICES, EPDeviceTarget, resolve_device
-from ..session.ep_device import DeviceNotFound, WinMLEPNotDiscovered, WinMLEPRegistrationFailed
+from ..session import (
+    VALID_DEVICES,
+    DeviceNotFound,
+    EPDeviceTarget,
+    WinMLEPNotDiscovered,
+    WinMLEPRegistrationFailed,
+    resolve_device,
+)
 from ..utils import cli as cli_utils
 from ..utils.logging import configure_logging
 from ._ep_arg import EpAtSourceParamType

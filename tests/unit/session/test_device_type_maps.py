@@ -21,7 +21,7 @@ def test_device_to_device_type_lives_in_ep_device_with_lowercase_keys() -> None:
     """
     import onnxruntime as ort
 
-    from winml.modelkit.session.ep_device import DEVICE_TO_DEVICE_TYPE
+    from winml.modelkit.session import DEVICE_TO_DEVICE_TYPE
 
     assert set(DEVICE_TO_DEVICE_TYPE.keys()) == {"cpu", "gpu", "npu"}
     assert DEVICE_TO_DEVICE_TYPE["cpu"] is ort.OrtHardwareDeviceType.CPU
@@ -33,7 +33,7 @@ def test_device_type_to_device_lives_in_ep_device_with_lowercase_values() -> Non
     """``DEVICE_TYPE_TO_DEVICE`` returns lowercase device short names."""
     import onnxruntime as ort
 
-    from winml.modelkit.session.ep_device import DEVICE_TYPE_TO_DEVICE
+    from winml.modelkit.session import DEVICE_TYPE_TO_DEVICE
 
     assert DEVICE_TYPE_TO_DEVICE[ort.OrtHardwareDeviceType.CPU] == "cpu"
     assert DEVICE_TYPE_TO_DEVICE[ort.OrtHardwareDeviceType.GPU] == "gpu"
@@ -42,7 +42,7 @@ def test_device_type_to_device_lives_in_ep_device_with_lowercase_values() -> Non
 
 def test_maps_are_inverses() -> None:
     """Round-trip: ``DEVICE_TYPE_TO_DEVICE[DEVICE_TO_DEVICE_TYPE[k]] == k``."""
-    from winml.modelkit.session.ep_device import (
+    from winml.modelkit.session import (
         DEVICE_TO_DEVICE_TYPE,
         DEVICE_TYPE_TO_DEVICE,
     )

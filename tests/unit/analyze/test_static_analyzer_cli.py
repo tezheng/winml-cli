@@ -133,9 +133,7 @@ class TestAnalyzeCommandArguments:
         model_file.write_bytes(b"dummy")
 
         # Command without --device should not fail due to missing argument
-        result = runner.invoke(
-            analyze, ["--model", str(model_file), "--ep", "QNNExecutionProvider"]
-        )
+        result = runner.invoke(analyze, ["--model", str(model_file), "--ep", "qnn"])
         # Should not complain about missing --device argument
         assert "device" not in result.output.lower() or "missing" not in result.output.lower()
 
@@ -168,7 +166,7 @@ class TestAnalyzeCommandArguments:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "INVALID",
             ],
@@ -184,7 +182,7 @@ class TestAnalyzeCommandArguments:
                 "--model",
                 "nonexistent.onnx",
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
             ],
@@ -219,7 +217,7 @@ class TestAnalyzeCommandExecution:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
             ],
@@ -251,7 +249,7 @@ class TestAnalyzeCommandExecution:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
             ],
@@ -278,7 +276,7 @@ class TestAnalyzeCommandExecution:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
             ],
@@ -312,7 +310,7 @@ class TestAnalyzeCommandOptions:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--information",
@@ -345,7 +343,7 @@ class TestAnalyzeCommandOptions:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--no-information",
@@ -378,7 +376,7 @@ class TestAnalyzeCommandOptions:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--verbose",
@@ -410,7 +408,7 @@ class TestAnalyzeCommandOptions:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--quiet",
@@ -445,7 +443,7 @@ class TestAnalyzeCommandOutput:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
             ],
@@ -479,7 +477,7 @@ class TestAnalyzeCommandOutput:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--output",
@@ -513,7 +511,7 @@ class TestAnalyzeCommandOutput:
                 "--model",
                 str(model_file),
                 "--ep",
-                "QNNExecutionProvider",
+                "qnn",
                 "--device",
                 "NPU",
                 "--output",
@@ -544,7 +542,7 @@ class TestAnalyzeCommandIntegration:
         mock_instance.analyze.return_value = mock_analyzer_result
         mock_analyzer_class.return_value = mock_instance
 
-        eps = ["QNNExecutionProvider", "OpenVINOExecutionProvider", "VitisAIExecutionProvider"]
+        eps = ["qnn", "openvino", "vitisai"]
 
         for ep in eps:
             result = runner.invoke(
@@ -590,7 +588,7 @@ class TestAnalyzeCommandIntegration:
                     "--model",
                     str(model_file),
                     "--ep",
-                    "QNNExecutionProvider",
+                    "qnn",
                     "--device",
                     device,
                 ],
@@ -619,7 +617,7 @@ class TestAnalyzeCommandIntegration:
                 "--model",
                 str(model_file),
                 "--ep",
-                "OpenVINOExecutionProvider",
+                "openvino",
                 "--device",
                 "GPU",
                 "--information",
@@ -631,7 +629,7 @@ class TestAnalyzeCommandIntegration:
         call_kwargs = mock_instance.analyze.call_args[1]
         assert call_kwargs["model_path"] == str(model_file)
         assert call_kwargs["ep"] == "OpenVINOExecutionProvider"
-        assert call_kwargs["device"] == "GPU"
+        assert call_kwargs["device"] == "gpu"
         assert call_kwargs["enable_information"] is True
 
 

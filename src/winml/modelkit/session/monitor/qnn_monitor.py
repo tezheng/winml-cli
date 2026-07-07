@@ -68,10 +68,10 @@ class QNNMonitor(WinMLEPMonitor):
        Contributes no ``get_session_options()`` override (uses the
        :class:`WinMLEPMonitor` default: empty dict). ``ep.context_enable=1``
        used to be set here to opt into EPContext caching, but the profiling
-       session is always built from ``self._onnx_path`` — which ``winml
-       build`` has *already* compiled to an EPContext model (a placeholder
-       node referencing an external ``.bin``, original ops stripped) before
-       benchmarking ever starts. Asking QNN to *generate* a new EPContext
+       session is always built from the model handed to benchmarking —
+       which ``winml build`` has *already* compiled to an EPContext model
+       (a placeholder node referencing an external ``.bin``, original ops
+       stripped) before benchmarking ever starts. Asking QNN to *generate* a new EPContext
        output from a graph that's already just an EPContext node gives it
        nothing to compile, and ``OrtEp::Compile()`` returns a NULL
        EPContext node — a hard session-creation failure. Do not re-add this

@@ -45,9 +45,7 @@ def mock_resolve_device():
             "winml.modelkit.session.resolve_device",
             return_value=fake_cpu_ep_device,
         ),
-        patch(
-            "winml.modelkit.session.WinMLEPRegistry"
-        ) as mock_reg,
+        patch("winml.modelkit.session.WinMLEPRegistry") as mock_reg,
     ):
         mock_reg.instance.return_value.auto_device.return_value = fake_winml_ep_device
         yield
@@ -300,7 +298,7 @@ class TestPerfUnifiedPipeline:
         with (
             patch(
                 "winml.modelkit.commands.perf._run_onnx_benchmark",
-                return_value=MagicMock(),
+                return_value=(MagicMock(), MagicMock()),
             ) as mock_run,
             patch(
                 "winml.modelkit.commands.perf.display_console_report",

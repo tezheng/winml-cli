@@ -24,8 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
-from winml.modelkit.session import EP_DEVICE_SPECS
-from winml.modelkit.session.ep_device import default_ep_for_device
+from winml.modelkit.session import EP_DEVICE_SPECS, default_ep_for_device
 
 
 # ---------------------------------------------------------------------------

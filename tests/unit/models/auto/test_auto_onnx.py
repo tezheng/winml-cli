@@ -19,19 +19,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from winml.modelkit.models.auto import WinMLAutoModel
-from winml.modelkit.session import EPDeviceTarget
 
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from winml.modelkit.session import EPDeviceTarget
+
 
 @pytest.fixture()
 def cpu_ep_device():
     """Minimal stub WinMLEPDevice for CPU used across from_onnx/from_pretrained tests."""
-    from unittest.mock import MagicMock as _MM
-
-    ep_device = _MM()
+    ep_device = MagicMock()
     ep_device.device.ep_name = "CPUExecutionProvider"
     ep_device.device.device_type = "CPU"
     return ep_device
@@ -128,7 +127,7 @@ class TestFromOnnx:
         assert call_kwargs["config"].optim.get("gelu_fusion") is True  # from override
 
     def test_passes_ep_and_device_to_build(self, fake_onnx: Path, tmp_path: Path):
-        """from_onnx() extracts ep and device from WinMLEPDevice and forwards to build_onnx_model."""
+        """from_onnx() extracts ep and device from WinMLEPDevice, forwards to build_onnx_model."""
         npu_ep_device = MagicMock()
         npu_ep_device.device.ep_name = "QNNExecutionProvider"
         npu_ep_device.device.device_type = "NPU"
@@ -209,7 +208,9 @@ class TestFromPretrainedDelegatesToFromOnnx:
         assert call_kwargs["ep_device"] is cpu_ep_device
         assert call_kwargs["precision"] == "fp32"
 
-    def test_passes_ep_from_kwargs(self, fake_onnx: Path, tmp_path: Path, cpu_ep_device: EPDeviceTarget):
+    def test_passes_ep_from_kwargs(
+        self, fake_onnx: Path, tmp_path: Path, cpu_ep_device: EPDeviceTarget
+    ):
         """from_pretrained passes ep_device through to from_onnx."""
         with patch.object(WinMLAutoModel, "from_onnx") as mock_from_onnx:
             mock_from_onnx.return_value = MagicMock()
@@ -234,7 +235,7 @@ class TestFromPretrainedDelegatesToFromOnnx:
 class TestFromOnnxDictDispatch:
     """from_onnx with dict onnx_path delegates to WinMLCompositeModel.from_onnx."""
 
-    def test_dict_dispatches_to_composite(self, tmp_path: Path):
+    def test_dict_dispatches_to_composite(self, tmp_path: Path, cpu_ep_device: EPDeviceTarget):
         """Dict onnx_path calls WinMLCompositeModel.from_onnx."""
         with patch(
             "winml.modelkit.models.winml.composite_model.WinMLCompositeModel.from_onnx"
@@ -244,6 +245,7 @@ class TestFromOnnxDictDispatch:
             WinMLAutoModel.from_onnx(
                 {"encoder": str(tmp_path / "enc.onnx"), "decoder": str(tmp_path / "dec.onnx")},
                 task="translation",
+                ep_device=cpu_ep_device,
                 skip_build=True,
             )
 
@@ -252,7 +254,9 @@ class TestFromOnnxDictDispatch:
             assert call_kwargs["task"] == "translation"
             assert call_kwargs["skip_build"] is True
 
-    def test_hf_config_dispatches_composite_via_registry(self, tmp_path: Path):
+    def test_hf_config_dispatches_composite_via_registry(
+        self, tmp_path: Path, cpu_ep_device: EPDeviceTarget
+    ):
         """hf_config kwarg threads through so model_type registry lookup works.
 
         Exercises the real WinMLCompositeModel.from_onnx body via a fake
@@ -306,6 +310,7 @@ class TestFromOnnxDictDispatch:
                     {"encoder": str(enc_path), "decoder": str(dec_path)},
                     task="_test_task_",
                     hf_config=_FakeHFConfig(),
+                    ep_device=cpu_ep_device,
                     skip_build=True,
                 )
 
@@ -316,7 +321,9 @@ class TestFromOnnxDictDispatch:
         finally:
             COMPOSITE_MODEL_REGISTRY.pop(test_key, None)
 
-    def test_from_onnx_dict_without_hf_config_raises(self, tmp_path: Path):
+    def test_from_onnx_dict_without_hf_config_raises(
+        self, tmp_path: Path, cpu_ep_device: EPDeviceTarget
+    ):
         """Dict dispatch without hf_config surfaces a clear registry-miss error.
 
         Guards against silent fallback: unregistered ``(model_type, task)`` must
@@ -331,5 +338,6 @@ class TestFromOnnxDictDispatch:
             WinMLAutoModel.from_onnx(
                 {"encoder": str(enc_path), "decoder": str(dec_path)},
                 task="_unregistered_task_",
+                ep_device=cpu_ep_device,
                 skip_build=True,
             )

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import click
 
-from ..session.ep_device import VALID_SOURCE_TAGS
+from ..session import VALID_SOURCE_TAGS
 
 
 def split_ep_at_source(value: str) -> tuple[str, str | None]:
@@ -34,14 +34,10 @@ def split_ep_at_source(value: str) -> tuple[str, str | None]:
             substring, or unknown source tag.
     """
     if any(c.isspace() for c in value):
-        raise ValueError(
-            f"Invalid --ep value {value!r}: whitespace is not allowed"
-        )
+        raise ValueError(f"Invalid --ep value {value!r}: whitespace is not allowed")
 
     if value.count("@") > 1:
-        raise ValueError(
-            f"Invalid --ep value {value!r}: expected at most one '@'"
-        )
+        raise ValueError(f"Invalid --ep value {value!r}: expected at most one '@'")
 
     if "@" not in value:
         return value, None
@@ -56,8 +52,7 @@ def split_ep_at_source(value: str) -> tuple[str, str | None]:
     source = source.lower()
     if source not in VALID_SOURCE_TAGS:
         raise ValueError(
-            f"Unknown source tag {source!r}; "
-            f"expected one of {sorted(VALID_SOURCE_TAGS)}"
+            f"Unknown source tag {source!r}; expected one of {sorted(VALID_SOURCE_TAGS)}"
         )
 
     return ep, source
@@ -83,7 +78,10 @@ class EpAtSourceParamType(click.ParamType):
     name = "ep_at_source"
 
     def convert(  # type: ignore[override]
-        self, value, param, ctx,
+        self,
+        value,
+        param,
+        ctx,
     ) -> tuple[str, str | None] | None:
         if value is None or value == "":
             return None

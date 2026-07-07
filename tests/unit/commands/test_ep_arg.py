@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 
-from winml.modelkit.session.ep_device import VALID_SOURCE_TAGS
+from winml.modelkit.session import VALID_SOURCE_TAGS
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +141,10 @@ def test_split_ep_with_empty_ep_before_at_raises() -> None:
 @pytest.mark.parametrize(
     "raw",
     [
-        "openvino @pypi",   # space before @
-        " openvino@pypi",   # leading space
-        "openvino@pypi ",   # trailing space
-        "openvino@ pypi",   # space after @
+        "openvino @pypi",  # space before @
+        " openvino@pypi",  # leading space
+        "openvino@pypi ",  # trailing space
+        "openvino@ pypi",  # space after @
     ],
 )
 def test_split_ep_rejects_whitespace(raw: str) -> None:

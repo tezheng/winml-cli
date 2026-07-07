@@ -140,7 +140,7 @@ def test_expand_ep_name_passthrough() -> None:
 
 def _short_to_full_items() -> list[tuple[str, str]]:
     """Read _SHORT_TO_FULL directly so this test catches every entry."""
-    from winml.modelkit.session.ep_device import _SHORT_TO_FULL
+    from winml.modelkit.session import _SHORT_TO_FULL
 
     return list(_SHORT_TO_FULL.items())
 
@@ -360,7 +360,8 @@ def test_default_ep_for_device_gpu_falls_back_to_dml(monkeypatch) -> None:
     from winml.modelkit.session.ep_registry import WinMLEPRegistry
 
     monkeypatch.setattr(
-        WinMLEPRegistry, "available_eps",
+        WinMLEPRegistry,
+        "available_eps",
         lambda self: frozenset({"DmlExecutionProvider", "CPUExecutionProvider"}),
     )
     assert default_ep_for_device("gpu") == "DmlExecutionProvider"
@@ -382,7 +383,8 @@ def test_default_ep_for_device_cpu_falls_back_to_cpu_ep(monkeypatch) -> None:
     from winml.modelkit.session.ep_registry import WinMLEPRegistry
 
     monkeypatch.setattr(
-        WinMLEPRegistry, "available_eps",
+        WinMLEPRegistry,
+        "available_eps",
         lambda self: frozenset({"DmlExecutionProvider", "CPUExecutionProvider"}),
     )
     assert default_ep_for_device("cpu") == "CPUExecutionProvider"
@@ -430,11 +432,13 @@ def test_ep_device_specs_builtins_come_last() -> None:
     """
     from winml.modelkit.session import EP_DEVICE_SPECS
 
-    builtin_names = frozenset({
-        "DmlExecutionProvider",
-        "CPUExecutionProvider",
-        "AzureExecutionProvider",
-    })
+    builtin_names = frozenset(
+        {
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+            "AzureExecutionProvider",
+        }
+    )
     seen_builtin = False
     for spec in EP_DEVICE_SPECS:
         is_builtin = spec.ep in builtin_names
@@ -624,6 +628,7 @@ def _patch_ep_catalog_compat(compatible_map: dict[str, bool]) -> tuple:
     class slot. Unknown EPs default to True (forward-compat — matches the
     catalog's behavior for EPs without vendor_requirements).
     """
+
     def fake_is_compatible(self, ep_name: str) -> bool:
         return compatible_map.get(ep_name, True)
 
@@ -647,14 +652,16 @@ def test_default_ep_for_device_skips_l2_incompatible_for_npu() -> None:
 
     from winml.modelkit.session import default_ep_for_device
 
-    available = frozenset({
-        "QNNExecutionProvider",       # L1 ok (registered)
-        "OpenVINOExecutionProvider",  # L1 ok
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "QNNExecutionProvider",  # L1 ok (registered)
+            "OpenVINOExecutionProvider",  # L1 ok
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
-        "QNNExecutionProvider": False,       # L2 fail — wrong vendor
-        "OpenVINOExecutionProvider": True,   # L2 ok
+        "QNNExecutionProvider": False,  # L2 fail — wrong vendor
+        "OpenVINOExecutionProvider": True,  # L2 ok
         "CPUExecutionProvider": True,
     }
 
@@ -684,12 +691,14 @@ def test_default_ep_for_device_skips_l2_incompatible_for_gpu() -> None:
 
     from winml.modelkit.session import default_ep_for_device
 
-    available = frozenset({
-        "DmlExecutionProvider",
-        "QNNExecutionProvider",
-        "OpenVINOExecutionProvider",
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "DmlExecutionProvider",
+            "QNNExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
         "DmlExecutionProvider": False,
         "QNNExecutionProvider": False,
@@ -705,8 +714,7 @@ def test_default_ep_for_device_skips_l2_incompatible_for_gpu() -> None:
         result = default_ep_for_device("gpu")
 
     assert result == "OpenVINOExecutionProvider", (
-        f"Expected OpenVINOExecutionProvider (next L2-compatible GPU EP), "
-        f"but got {result!r}."
+        f"Expected OpenVINOExecutionProvider (next L2-compatible GPU EP), but got {result!r}."
     )
 
 
@@ -722,12 +730,14 @@ def test_default_ep_for_device_returns_none_when_all_npu_eps_l2_incompatible() -
 
     from winml.modelkit.session import default_ep_for_device
 
-    available = frozenset({
-        "QNNExecutionProvider",
-        "OpenVINOExecutionProvider",
-        "VitisAIExecutionProvider",
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "QNNExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "VitisAIExecutionProvider",
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
         "QNNExecutionProvider": False,
         "OpenVINOExecutionProvider": False,
@@ -759,11 +769,13 @@ def test_default_ep_for_device_unchanged_when_all_l2_compatible() -> None:
 
     from winml.modelkit.session import default_ep_for_device
 
-    available = frozenset({
-        "QNNExecutionProvider",
-        "OpenVINOExecutionProvider",
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "QNNExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
         "QNNExecutionProvider": True,
         "OpenVINOExecutionProvider": True,
@@ -802,11 +814,13 @@ def test_resolve_device_both_auto_skips_l2_incompatible_full_chain() -> None:
     """
     import contextlib
 
-    available = frozenset({
-        "QNNExecutionProvider",
-        "OpenVINOExecutionProvider",
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "QNNExecutionProvider",
+            "OpenVINOExecutionProvider",
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
         "QNNExecutionProvider": False,
         "OpenVINOExecutionProvider": True,
@@ -851,14 +865,16 @@ def test_default_ep_for_device_composes_l1_and_l2_filters() -> None:
     from winml.modelkit.session import default_ep_for_device
 
     # QNN: L1 fail (not registered). OpenVINO: L1 ok, L2 fail. VitisAI: both ok.
-    available = frozenset({
-        "OpenVINOExecutionProvider",
-        "VitisAIExecutionProvider",
-        "CPUExecutionProvider",
-    })
+    available = frozenset(
+        {
+            "OpenVINOExecutionProvider",
+            "VitisAIExecutionProvider",
+            "CPUExecutionProvider",
+        }
+    )
     compatibility = {
         "OpenVINOExecutionProvider": False,  # L2 fail
-        "VitisAIExecutionProvider": True,    # L2 ok
+        "VitisAIExecutionProvider": True,  # L2 ok
         "CPUExecutionProvider": True,
     }
 
@@ -897,7 +913,7 @@ def test_valid_eps_matches_known_short_names() -> None:
     """
     from winml.modelkit.session import VALID_EPS, known_ep_short_names
 
-    assert VALID_EPS == known_ep_short_names()
+    assert known_ep_short_names() == VALID_EPS
 
 
 class TestEpShortOrNone:
