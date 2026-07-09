@@ -17,6 +17,7 @@ Covers:
 
 from __future__ import annotations
 
+import importlib.metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,30 @@ from winml.modelkit.ep_path import (
     discover_all_eps,
 )
 from winml.modelkit.sysinfo import CPU
+
+
+def _distribution_installed(name: str) -> bool:
+    """True when a PyPI distribution is importable in this environment."""
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+# The two PyPISource "resolves an installed distribution" tests below need the
+# optional onnxruntime-ep-openvino wheel (the ``[openvino]`` extra). CI installs
+# it via ``uv sync --all-extras`` (.github/workflows/modelkit-ci.yml); a base
+# local ``uv sync`` does not. Gate them so a base install SKIPS cleanly rather
+# than failing on a missing optional EP package — consistent with the
+# EP-availability skip allowance in CLAUDE.md and the existing precedent in
+# tests/unit/commands/test_cli.py.
+_OPENVINO_EP_INSTALLED = _distribution_installed("onnxruntime-ep-openvino")
+
+_requires_openvino_ep = pytest.mark.skipif(
+    not _OPENVINO_EP_INSTALLED,
+    reason="onnxruntime-ep-openvino not installed; run `uv sync --all-extras`",
+)
 
 
 def _winners(entries: list[EPEntry]) -> dict[str, tuple[Path, EPSource]]:
@@ -282,6 +307,7 @@ class TestQnnArchFolderMapProductionData:
 class TestPyPISource:
     """PyPISource resolves via importlib.metadata against the live env."""
 
+    @_requires_openvino_ep
     def test_resolves_installed_distribution(self) -> None:
         # ``onnxruntime-ep-openvino`` is in pyproject.toml deps and
         # installed in the venv used to run the test suite.
@@ -345,6 +371,7 @@ class TestPyPISource:
         )
         assert list(source.resolve()) == []
 
+    @_requires_openvino_ep
     def test_none_arch_folder_map_uses_relative_dll_as_is(self) -> None:
         # Default (arch_folder_map=None) behavior — e.g. OpenVINO's real
         # entry today — must be completely unaffected by this mechanism.

@@ -10,9 +10,9 @@ target call arguments and exception messages only.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,7 +88,7 @@ class TestSuccess:
 
 
 class TestNonZeroExit:
-    """Child registration raised → subprocess exits 1 → we translate to WinMLEPRegistrationFailed."""
+    """Child registration raised → subprocess exits 1 → WinMLEPRegistrationFailed."""
 
     def test_nonzero_exit_carries_stderr_tail(self) -> None:
         stderr = "some ORT native error\n<traceback>\nOSError: something bad"
@@ -125,6 +125,60 @@ class TestNonZeroExit:
 
         # Only the tail is kept; the message should not be arbitrarily long.
         assert len(str(ei.value)) < 1000
+
+    def test_nonzero_exit_reason_is_clean_exception_line(self) -> None:
+        # A worker that fails without a Win32 loader code prints a multi-line
+        # Python traceback. The user-facing ``.reason`` (rendered in the
+        # ``[failed]`` row) must be the real exception line — not the wrapper
+        # prefix or a mid-traceback fragment. Regression guard: the observed
+        # "isolated register of ... exited 1: d." mangling, where the parser's
+        # first-line-of-wrapper fallback surfaced a broken traceback fragment.
+        stderr = (
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 9, in _worker\n'
+            "    winml_ep = WinMLEPRegistry.instance().register_ep(entry)\n"
+            "RuntimeError: EP factory returned no OrtEpDevices\n"
+        )
+        proc = _fake_completed_process(stderr=stderr, returncode=1)
+        with (
+            patch(
+                "subprocess.run",
+                return_value=proc,
+            ),
+            pytest.raises(WinMLEPRegistrationFailed) as ei,
+            isolated_ep_register(_EP, _DLL),
+        ):
+            pass
+
+        exc = ei.value
+        assert exc.code is None
+        assert exc.reason == "RuntimeError: EP factory returned no OrtEpDevices"
+        assert "isolated register of" not in exc.reason
+        # Full wrapper message is still preserved for logs / str().
+        assert "exited 1" in str(exc)
+
+    def test_nonzero_exit_win32_code_in_stderr_tail_maps_to_reason(self) -> None:
+        # A coded DLL-load failure whose Win32 code lands in the last stderr
+        # line still maps to the friendly reason via the clean tail.
+        stderr = (
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 9, in _worker\n'
+            "RuntimeError: Failed to load library "
+            "(Error 1114: A dynamic link library initialization routine failed.)"
+        )
+        proc = _fake_completed_process(stderr=stderr, returncode=1)
+        with (
+            patch(
+                "subprocess.run",
+                return_value=proc,
+            ),
+            pytest.raises(WinMLEPRegistrationFailed) as ei,
+            isolated_ep_register(_EP, _DLL),
+        ):
+            pass
+
+        assert ei.value.code == 1114
+        assert ei.value.reason == "DllMain returned failure (Win32 1114)"
 
 
 # ---------------------------------------------------------------------------
@@ -256,3 +310,26 @@ def test_custom_timeout_passed_to_subprocess_run() -> None:
         pass
 
     assert mock_run.call_args.kwargs["timeout"] == 90.0
+
+
+# ---------------------------------------------------------------------------
+# Caller-side errors must pass through — the context manager only translates
+# the *subprocess's own* invalid-JSON output, never an exception raised inside
+# the ``with`` body.
+# ---------------------------------------------------------------------------
+
+
+class TestCallerErrorPassthrough:
+    def test_caller_json_decode_error_is_not_trapped(self) -> None:
+        # The child produced valid JSON (exit 0), so the dict is yielded.
+        # A JSONDecodeError raised inside the ``with`` body must propagate
+        # as-is, NOT be misattributed as "subprocess produced invalid JSON".
+        proc = _fake_completed_process(
+            stdout='{"plugin_version": "1.0", "devices": []}', returncode=0,
+        )
+        with (
+            patch("subprocess.run", return_value=proc),
+            pytest.raises(json.JSONDecodeError),
+            isolated_ep_register(_EP, _DLL),
+        ):
+            raise json.JSONDecodeError("caller boom", "doc", 0)

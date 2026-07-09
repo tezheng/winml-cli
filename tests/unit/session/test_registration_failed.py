@@ -136,6 +136,52 @@ class TestNoCodeFallback:
 
 
 # ---------------------------------------------------------------------------
+# ``raw_error`` — when the caller wraps the real error in a longer message
+# (e.g. isolated_ep_register's "isolated register of <dll> exited N: <tail>"),
+# it passes the clean error line as ``raw_error`` so ``reason``/``code`` are
+# parsed from that — not from the wrapper — while ``str()`` keeps the wrapper.
+# ---------------------------------------------------------------------------
+
+
+class TestRawErrorParseSource:
+    def test_raw_error_drives_reason_not_wrapper_message(self) -> None:
+        wrapper = r"isolated register of C:\ep\p.dll exited 1: <multi-line tail>"
+        e = WinMLEPRegistrationFailed(
+            wrapper, raw_error="RuntimeError: EP factory returned no OrtEpDevices",
+        )
+        assert e.code is None
+        assert e.reason == "RuntimeError: EP factory returned no OrtEpDevices"
+        assert str(e) == wrapper  # full wrapper preserved for logs
+
+    def test_raw_error_win32_code_maps_to_friendly_reason(self) -> None:
+        e = WinMLEPRegistrationFailed(
+            r"isolated register of C:\ep\p.dll exited 1: <tail>",
+            raw_error=(
+                "(Error 1114: A dynamic link library initialization "
+                "routine failed.)"
+            ),
+        )
+        assert e.code == 1114
+        assert e.reason == "DllMain returned failure (Win32 1114)"
+
+    def test_win32_code_found_in_full_message_when_last_line_is_noise(self) -> None:
+        # The Win32 code is mid-message (in the traceback); the child then
+        # emits post-traceback noise as the LAST stderr line. Code detection
+        # must scan the full message, not only the clean raw_error line, so
+        # the code (and its friendly reason) is never lost to tail noise.
+        message = (
+            r"isolated register of C:\ep\p.dll exited 1: "
+            "RuntimeError: Failed to load (Error 1114: init routine failed)\n"
+            "[plugin] C++ runtime cleanup complete"
+        )
+        e = WinMLEPRegistrationFailed(
+            message, raw_error="[plugin] C++ runtime cleanup complete"
+        )
+        assert e.code == 1114
+        assert e.reason == "DllMain returned failure (Win32 1114)"
+
+
+# ---------------------------------------------------------------------------
 # Positional bias — first Win32 code in the message wins.
 # ---------------------------------------------------------------------------
 

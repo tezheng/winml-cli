@@ -134,9 +134,24 @@ class WinMLEPRegistrationFailed(Exception):  # noqa: N818
     ``[failed]`` rows without re-parsing the ORT message.
     """
 
-    def __init__(self, message: str, *, dll_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        dll_path: Path | None = None,
+        raw_error: str | None = None,
+    ) -> None:
         super().__init__(message)
+        # ``message`` may be a wrapper that embeds a multi-line subprocess
+        # stderr tail (see ``isolated_ep_register``). Search the FULL message
+        # for a Win32 loader code so it is never lost to post-traceback tail
+        # noise; only when no code is present do we fall back to the caller's
+        # clean ``raw_error`` line for the reason (parsing the wrapper would
+        # otherwise surface its own first line). ``str(self)`` keeps the full
+        # wrapper for logs.
         lf = _parse_ort_load_failure(message)
+        if lf.code is None and raw_error is not None:
+            lf = _parse_ort_load_failure(raw_error)
         self.code: int | None = lf.code
         self.reason: str = lf.reason
         self.dll_path: Path | None = dll_path

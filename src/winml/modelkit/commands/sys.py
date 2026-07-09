@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 import click
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -536,12 +537,13 @@ def _output_device_text(devices: list[dict[str, Any]]) -> None:
     """
     console.print("\n[bold blue]Available Devices (priority order)[/bold blue]")
     for dev in devices:
+        name = escape(dev["name"])
         console.print(
-            f"  [bold]#{dev['priority']}[/bold]  [cyan]{dev['type']:5s}[/cyan] {dev['name']}"
+            f"  [bold]#{dev['priority']}[/bold]  [cyan]{dev['type']:5s}[/cyan] {name}"
         )
         details = dev.get("details", {})
         if "error" in details:
-            console.print(f"             [red]Error: {details['error']}[/red]")
+            console.print(f"             [red]Error: {escape(details['error'])}[/red]")
         elif dev["type"] in ("NPU", "GPU"):
             parts = [
                 f"Driver: {details.get('driver', 'N/A')}",
@@ -682,19 +684,30 @@ def isolated_ep_register(
         ) from exc
 
     if proc.returncode != 0:
+        stderr_tail = proc.stderr.strip()
+        # The child's real error is its last non-empty stderr line (the
+        # exception message). Pass it as ``raw_error`` so the ``[failed]``
+        # row shows a clean reason instead of the wrapper prefix or a
+        # mid-traceback fragment left by the ``[-500:]`` slice.
+        last_line = next(
+            (ln for ln in reversed(stderr_tail.splitlines()) if ln.strip()),
+            "",
+        )
         raise WinMLEPRegistrationFailed(
             f"isolated register of {dll_path} exited {proc.returncode}: "
-            f"{proc.stderr.strip()[-500:]}",
+            f"{stderr_tail[-500:]}",
             dll_path=dll_path,
+            raw_error=last_line,
         )
     try:
-        yield json.loads(proc.stdout)
+        ep_dict = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise WinMLEPRegistrationFailed(
             f"isolated register of {dll_path} produced invalid JSON: {exc}; "
             f"stdout tail={proc.stdout[-200:]!r}",
             dll_path=dll_path,
         ) from exc
+    yield ep_dict
 
 
 def _gather_ep_info() -> dict[str, dict[str, Any]]:
@@ -869,7 +882,7 @@ def _format_devices_from_handles(devices: list[dict[str, Any]]) -> list[str]:
     for d in devices:
         dev_type = d.get("device_type", "?")
         facts = d.get("facts") or []
-        body = "  |  ".join(facts) if facts else "[dim](no metadata published)[/dim]"
+        body = escape("  |  ".join(facts)) if facts else "[dim](no metadata published)[/dim]"
         # Fixed 4-char abbrev column so "NPU:" / "GPU:" / "CPU:" align.
         type_label = f"[bold cyan]{dev_type:3s}[/bold cyan]:"
         lines.append(f"{_INDENT_L4}{type_label} {body}")
@@ -951,7 +964,7 @@ def _output_ep_text(eps: dict[str, dict[str, Any]]) -> None:
                 # the raw ``error`` text is still emitted through
                 # ``--format json`` for callers that want the ORT payload.
                 short_err = entry.get("error_reason") or entry["error"]
-                console.print(f"{_INDENT_L3}[red]Error:[/red] {short_err}")
+                console.print(f"{_INDENT_L3}[red]Error:[/red] {escape(short_err)}")
             for line in _format_devices_from_handles(entry.get("devices") or []):
                 console.print(line)
 

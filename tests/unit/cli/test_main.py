@@ -152,7 +152,18 @@ class TestSysCommand:
     def _mock_hw_detection(self):
         """Mock slow hardware detection to prevent CI timeouts."""
         mock_devices = [{"priority": 1, "type": "CPU", "name": "Mock CPU", "details": {}}]
-        mock_eps = [{"name": "CPUExecutionProvider", "device": "CPU", "path": None}]
+        mock_eps = {
+            "CPUExecutionProvider": {
+                "entries": [
+                    {
+                        "source_kind": "BuiltinSource",
+                        "source_tag": "bundled",
+                        "status": "primary",
+                        "dll_path": None,
+                    }
+                ]
+            }
+        }
         with (
             patch("winml.modelkit.commands.sys._gather_device_info", return_value=mock_devices),
             patch("winml.modelkit.commands.sys._gather_ep_info", return_value=mock_eps),
@@ -205,7 +216,9 @@ class TestSysCommand:
         assert "devices" in data
         assert "executionProviders" in data
         assert isinstance(data["devices"], list)
-        assert isinstance(data["executionProviders"], list)
+        # executionProviders is keyed by EP name (dict), not a flat array —
+        # each value is a {"entries": [...]} record (see _gather_ep_info).
+        assert isinstance(data["executionProviders"], dict)
 
     def test_sys_list_device_compact(self, runner: CliRunner) -> None:
         """--list-device --format compact must produce compact output, not text table."""
