@@ -30,10 +30,10 @@ import pytest
 from winml.modelkit.compiler import EPConfig
 from winml.modelkit.session import (
     EPDeviceTarget,
-    SessionState,
-    WinMLEPMonitorMismatch,
     WinMLSession,
 )
+from winml.modelkit.session.ep_device import WinMLEPMonitorMismatch
+from winml.modelkit.session.session import SessionState
 
 
 class TestWinMLSessionInstantiation:
@@ -65,9 +65,7 @@ class TestWinMLSessionInstantiation:
         assert session.device == "cpu"
         assert session.state == SessionState.INITIALIZED
 
-    def test_session_init_file_not_found(
-        self, tmp_path: Path, cpu_ep_device: EPDeviceTarget
-    ):
+    def test_session_init_file_not_found(self, tmp_path: Path, cpu_ep_device: EPDeviceTarget):
         """Test that WinMLSession raises an ORT error for a non-existent ONNX file."""
         from onnxruntime.capi.onnxruntime_pybind11_state import NoSuchFile
 
@@ -382,7 +380,7 @@ class TestWinMLSessionReBatching:
         ORT with static batch models requires exact batch size match.
         Sending batch=1 to a batch=2 model raises INVALID_ARGUMENT.
         """
-        from winml.modelkit.session import InferenceError
+        from winml.modelkit.session.session import InferenceError
 
         session = WinMLSession(
             onnx_path=static_batch2_onnx,
@@ -401,7 +399,7 @@ class TestWinMLSessionErrorState:
 
     def test_run_in_error_state_raises(self, cpu_winml_session: WinMLSession):
         """Test that run() raises InferenceError when session is in error state."""
-        from winml.modelkit.session import InferenceError
+        from winml.modelkit.session.session import InferenceError
 
         session = cpu_winml_session
 

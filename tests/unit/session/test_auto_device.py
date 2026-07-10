@@ -30,13 +30,13 @@ from winml.modelkit.ep_path import EPEntry, MSIXPackageSource, PyPISource
 from winml.modelkit.session import (
     DeviceNotFound,
     EPDeviceTarget,
-    UnknownListingPick,
     WinMLDevice,
     WinMLEP,
     WinMLEPDevice,
     WinMLEPRegistrationFailed,
     WinMLEPRegistry,
 )
+from winml.modelkit.session.ep_device import UnknownListingPick
 
 
 # ---------- helpers --------------------------------------------------------
@@ -81,9 +81,7 @@ def _msix_workload_entry(ep_name: str, dll: str = "C:/fake/qnn.dll") -> EPEntry:
     )
 
 
-def _msix_ms_channel_entry(
-    ep_name: str, dll: str = "C:/fake/msix-ms.dll"
-) -> EPEntry:
+def _msix_ms_channel_entry(ep_name: str, dll: str = "C:/fake/msix-ms.dll") -> EPEntry:
     """MSIX entry from the MicrosoftCorporationII channel."""
     return EPEntry(
         ep_name=ep_name,
@@ -112,17 +110,13 @@ def _winml_ep_with_device(entry: EPEntry, device_type: str) -> WinMLEP:
 class TestAutoDevice:
     """One test per scenario from the Batch E plan."""
 
-    def test_a_single_pypi_source_no_source_pin(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_a_single_pypi_source_no_source_pin(self, fresh_registry: WinMLEPRegistry) -> None:
         """Scenario a: single PyPI source discovered, source=None on target."""
         entry = _pypi_entry("OpenVINOExecutionProvider")
         winml_ep = _winml_ep_with_device(entry, "NPU")
         fresh_registry._discovered = [entry]
 
-        with patch.object(
-            fresh_registry, "register_ep", return_value=winml_ep
-        ) as mock_register:
+        with patch.object(fresh_registry, "register_ep", return_value=winml_ep) as mock_register:
             target = EPDeviceTarget(ep="openvino", device="npu")
             result = fresh_registry.auto_device(target)
 
@@ -137,9 +131,7 @@ class TestAutoDevice:
         winml_ep = _winml_ep_with_device(entry, "NPU")
         fresh_registry._discovered = [entry]
 
-        with patch.object(
-            fresh_registry, "register_ep", return_value=winml_ep
-        ) as mock_register:
+        with patch.object(fresh_registry, "register_ep", return_value=winml_ep) as mock_register:
             target = EPDeviceTarget(ep="openvino", device="npu", source="pypi")
             result = fresh_registry.auto_device(target)
 
@@ -157,9 +149,7 @@ class TestAutoDevice:
         succeeds — proven indirectly by the success of the shadowed one).
         """
         primary = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/primary.dll")
-        shadowed = _pypi_entry(
-            "OpenVINOExecutionProvider", dll="C:/fake/shadow.dll"
-        )
+        shadowed = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/shadow.dll")
         shadowed_ep = _winml_ep_with_device(shadowed, "NPU")
 
         primary_error = WinMLEPRegistrationFailed("primary DLL boom")
@@ -179,14 +169,10 @@ class TestAutoDevice:
         # Shadowed candidate won — but the primary was actually tried first.
         assert result.ep is shadowed_ep
         assert mock_register.call_count == 2
-        called_paths = [
-            call.args[0].dll_path for call in mock_register.call_args_list
-        ]
+        called_paths = [call.args[0].dll_path for call in mock_register.call_args_list]
         assert called_paths == [primary.dll_path, shadowed.dll_path]
 
-    def test_d_source_loads_but_no_matching_device(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_d_source_loads_but_no_matching_device(self, fresh_registry: WinMLEPRegistry) -> None:
         """Scenario d: registration succeeds but WinMLEP has no matching device class."""
         entry = _pypi_entry("OpenVINOExecutionProvider")
         # Source exposes a GPU device, but target requests NPU.
@@ -213,9 +199,7 @@ class TestAutoDevice:
         after the successful registration).
         """
         primary = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/primary.dll")
-        shadowed = _pypi_entry(
-            "OpenVINOExecutionProvider", dll="C:/fake/shadow.dll"
-        )
+        shadowed = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/shadow.dll")
         # Shadowed candidate registers cleanly but its only device is GPU
         # while target asks for NPU — no match → fall through to next.
         shadowed_ep = _winml_ep_with_device(shadowed, "GPU")
@@ -228,16 +212,12 @@ class TestAutoDevice:
             return shadowed_ep
 
         fresh_registry._discovered = [primary, shadowed]
-        with patch.object(
-            fresh_registry, "register_ep", side_effect=selective_register
-        ):
+        with patch.object(fresh_registry, "register_ep", side_effect=selective_register):
             target = EPDeviceTarget(ep="openvino", device="npu")
             with pytest.raises(DeviceNotFound):
                 fresh_registry.auto_device(target)
 
-    def test_e_all_candidates_fail_registration(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_e_all_candidates_fail_registration(self, fresh_registry: WinMLEPRegistry) -> None:
         """Scenario e: every candidate raises WinMLEPRegistrationFailed."""
         entry1 = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/a.dll")
         entry2 = _pypi_entry("OpenVINOExecutionProvider", dll="C:/fake/b.dll")
@@ -255,25 +235,19 @@ class TestAutoDevice:
         assert ei.value.__cause__ is not None
         assert "dll boom" in str(ei.value.__cause__)
 
-    def test_f_auto_target_raises_value_error(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_f_auto_target_raises_value_error(self, fresh_registry: WinMLEPRegistry) -> None:
         """Scenario f: EPDeviceTarget('auto', 'auto') must NOT be re-resolved here."""
         target = EPDeviceTarget(ep="auto", device="auto")
         with pytest.raises(ValueError, match="auto"):
             fresh_registry.auto_device(target)
 
-    def test_f_auto_ep_only_raises_value_error(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_f_auto_ep_only_raises_value_error(self, fresh_registry: WinMLEPRegistry) -> None:
         """Companion: ep='auto' with concrete device must also raise."""
         target = EPDeviceTarget(ep="auto", device="npu")
         with pytest.raises(ValueError, match="auto"):
             fresh_registry.auto_device(target)
 
-    def test_f_auto_device_only_raises_value_error(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_f_auto_device_only_raises_value_error(self, fresh_registry: WinMLEPRegistry) -> None:
         """Companion: device='auto' with concrete EP must also raise."""
         target = EPDeviceTarget(ep="openvino", device="auto")
         with pytest.raises(ValueError, match="auto"):
@@ -301,32 +275,25 @@ class TestAutoDevice:
         assert ei.value.ep_name == "openvino"
         assert ei.value.source_tag == "msix"
 
-    def test_g_msix_pin_narrows_candidate_set(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_g_msix_pin_narrows_candidate_set(self, fresh_registry: WinMLEPRegistry) -> None:
         """Companion to g: when both PyPI and MSIX exist, ``source='msix'`` filters.
 
         Verifies the source-tag filter narrows the candidate set rather than
         breaking ``auto_device`` outright.
         """
         pypi_entry = _pypi_entry("QNNExecutionProvider", dll="C:/fake/pypi-qnn.dll")
-        msix_entry = _msix_workload_entry(
-            "QNNExecutionProvider", dll="C:/fake/msix-qnn.dll"
-        )
+        msix_entry = _msix_workload_entry("QNNExecutionProvider", dll="C:/fake/msix-qnn.dll")
         msix_ep = _winml_ep_with_device(msix_entry, "NPU")
 
         def selective_register(entry: EPEntry) -> WinMLEP:
             if entry.dll_path == msix_entry.dll_path:
                 return msix_ep
             raise AssertionError(
-                f"PyPI entry should have been filtered out by source tag, "
-                f"got {entry.dll_path}"
+                f"PyPI entry should have been filtered out by source tag, got {entry.dll_path}"
             )
 
         fresh_registry._discovered = [pypi_entry, msix_entry]
-        with patch.object(
-            fresh_registry, "register_ep", side_effect=selective_register
-        ):
+        with patch.object(fresh_registry, "register_ep", side_effect=selective_register):
             target = EPDeviceTarget(ep="qnn", device="npu", source="msix")
             result = fresh_registry.auto_device(target)
 
@@ -339,43 +306,33 @@ class TestAutoDevice:
     # ``WindowsWorkload.*``) produced it. Iteration precedence between the
     # two channels comes for free from ``discover_all_eps`` order.
 
-    def test_msix_matches_ms_channel_entry(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_msix_matches_ms_channel_entry(self, fresh_registry: WinMLEPRegistry) -> None:
         """source='msix' matches an MicrosoftCorporationII MSIX entry."""
         entry = _msix_ms_channel_entry("QNNExecutionProvider")
         winml_ep = _winml_ep_with_device(entry, "NPU")
         fresh_registry._discovered = [entry]
 
-        with patch.object(
-            fresh_registry, "register_ep", return_value=winml_ep
-        ) as mock_register:
+        with patch.object(fresh_registry, "register_ep", return_value=winml_ep) as mock_register:
             target = EPDeviceTarget(ep="qnn", device="npu", source="msix")
             result = fresh_registry.auto_device(target)
 
         assert result.ep is winml_ep
         mock_register.assert_called_once_with(entry)
 
-    def test_msix_matches_workload_channel_entry(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_msix_matches_workload_channel_entry(self, fresh_registry: WinMLEPRegistry) -> None:
         """source='msix' matches a WindowsWorkload MSIX entry."""
         entry = _msix_workload_entry("QNNExecutionProvider")
         winml_ep = _winml_ep_with_device(entry, "NPU")
         fresh_registry._discovered = [entry]
 
-        with patch.object(
-            fresh_registry, "register_ep", return_value=winml_ep
-        ) as mock_register:
+        with patch.object(fresh_registry, "register_ep", return_value=winml_ep) as mock_register:
             target = EPDeviceTarget(ep="qnn", device="npu", source="msix")
             result = fresh_registry.auto_device(target)
 
         assert result.ep is winml_ep
         mock_register.assert_called_once_with(entry)
 
-    def test_msix_matches_any_msix_package(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_msix_matches_any_msix_package(self, fresh_registry: WinMLEPRegistry) -> None:
         """Both MSIX channels are eligible under ``source='msix'``.
 
         With both a ``MicrosoftCorporationII.*`` and a ``WindowsWorkload.*``
@@ -383,12 +340,8 @@ class TestAutoDevice:
         registers cleanly wins. The test only asserts either resolves —
         the tag no longer models a channel distinction.
         """
-        ms = _msix_ms_channel_entry(
-            "QNNExecutionProvider", dll="C:/fake/ms-qnn.dll"
-        )
-        workload = _msix_workload_entry(
-            "QNNExecutionProvider", dll="C:/fake/workload-qnn.dll"
-        )
+        ms = _msix_ms_channel_entry("QNNExecutionProvider", dll="C:/fake/ms-qnn.dll")
+        workload = _msix_workload_entry("QNNExecutionProvider", dll="C:/fake/workload-qnn.dll")
         ms_ep = _winml_ep_with_device(ms, "NPU")
         workload_ep = _winml_ep_with_device(workload, "NPU")
 
@@ -400,18 +353,14 @@ class TestAutoDevice:
             raise AssertionError(f"unexpected entry: {entry.dll_path}")
 
         fresh_registry._discovered = [ms, workload]
-        with patch.object(
-            fresh_registry, "register_ep", side_effect=selective_register
-        ):
+        with patch.object(fresh_registry, "register_ep", side_effect=selective_register):
             target = EPDeviceTarget(ep="qnn", device="npu", source="msix")
             result = fresh_registry.auto_device(target)
 
         # Either channel is an acceptable resolution under the collapsed tag.
         assert result.ep in (ms_ep, workload_ep)
 
-    def test_msix_raises_when_no_msix_entries(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_msix_raises_when_no_msix_entries(self, fresh_registry: WinMLEPRegistry) -> None:
         """source='msix' raises UnknownListingPick when no MSIX row was discovered."""
         pypi_only = _pypi_entry("QNNExecutionProvider")
         fresh_registry._discovered = [pypi_only]
@@ -477,9 +426,7 @@ class TestAutoDevice:
             mock_ort.register_execution_provider_library = MagicMock()
 
             # First call: NPU — register_ep loads the DLL and succeeds.
-            first = fresh_registry.auto_device(
-                EPDeviceTarget(ep="qnn", device="npu")
-            )
+            first = fresh_registry.auto_device(EPDeviceTarget(ep="qnn", device="npu"))
             assert isinstance(first, WinMLEPDevice)
             assert first.device.device_type == "NPU"
 
@@ -487,9 +434,7 @@ class TestAutoDevice:
             # cached entry (idempotent) and the device-class loop must
             # surface DeviceNotFound, NOT WinMLEPRegistrationFailed.
             with pytest.raises(DeviceNotFound, match="GPU"):
-                fresh_registry.auto_device(
-                    EPDeviceTarget(ep="qnn", device="gpu")
-                )
+                fresh_registry.auto_device(EPDeviceTarget(ep="qnn", device="gpu"))
 
             # ORT's register call must have happened exactly once across
             # both auto_device invocations (idempotency guarantee).
@@ -512,9 +457,7 @@ class TestAutoDeviceBuiltIn:
     wrap the pre-loaded ORT handles directly.
     """
 
-    def test_cpu_built_in_returns_winml_ep_device(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_cpu_built_in_returns_winml_ep_device(self, fresh_registry: WinMLEPRegistry) -> None:
         """auto_device(EP=cpu, device=cpu) returns a WinMLEPDevice
         bound to the CPU EP — no WinMLEPNotDiscovered."""
         from winml.modelkit.ep_path import BuiltinSource
@@ -538,9 +481,7 @@ class TestAutoDeviceBuiltIn:
         assert result.ep.source.ep_name == "CPUExecutionProvider"
         assert result.device.device_type == "CPU"
 
-    def test_dml_built_in_returns_winml_ep_device(
-        self, fresh_registry: WinMLEPRegistry
-    ) -> None:
+    def test_dml_built_in_returns_winml_ep_device(self, fresh_registry: WinMLEPRegistry) -> None:
         """Same shape for DmlExecutionProvider/gpu."""
         from winml.modelkit.ep_path import BuiltinSource
 
@@ -581,10 +522,13 @@ class TestAutoDeviceBuiltIn:
         fake_cpu = _fake_ort_device("CPUExecutionProvider", "CPU")
 
         target = EPDeviceTarget(ep="cpu", device="npu")
-        with patch(
-            "winml.modelkit.session.ep_registry.ort.get_ep_devices",
-            return_value=[fake_cpu],
-        ), pytest.raises(DeviceNotFound):
+        with (
+            patch(
+                "winml.modelkit.session.ep_registry.ort.get_ep_devices",
+                return_value=[fake_cpu],
+            ),
+            pytest.raises(DeviceNotFound),
+        ):
             fresh_registry.auto_device(target)
 
     def test_plugin_wins_precedence_over_built_in_same_ep_name(
@@ -608,9 +552,7 @@ class TestAutoDeviceBuiltIn:
         plugin_ep = _winml_ep_with_device(plugin_entry, "CPU")
 
         target = EPDeviceTarget(ep="cpu", device="cpu")
-        with patch.object(
-            fresh_registry, "register_ep", return_value=plugin_ep
-        ) as mock_register:
+        with patch.object(fresh_registry, "register_ep", return_value=plugin_ep) as mock_register:
             result = fresh_registry.auto_device(target)
 
         # Plugin entry was tried, not the built-in.

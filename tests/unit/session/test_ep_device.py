@@ -266,7 +266,7 @@ def test_ep_device_specs_count() -> None:
 
 def test_lookup_device_spec_qnn_npu() -> None:
     """lookup_device_spec returns the QNN-NPU entry with burst defaults."""
-    from winml.modelkit.session import lookup_device_spec
+    from winml.modelkit.session.ep_device import lookup_device_spec
 
     spec = lookup_device_spec("QNNExecutionProvider", "npu")
     assert spec is not None
@@ -278,7 +278,7 @@ def test_lookup_device_spec_qnn_npu() -> None:
 
 def test_lookup_device_spec_unknown_returns_none() -> None:
     """lookup_device_spec returns None for unknown (ep, device) pairs."""
-    from winml.modelkit.session import lookup_device_spec
+    from winml.modelkit.session.ep_device import lookup_device_spec
 
     assert lookup_device_spec("UnknownEP", "npu") is None
     assert lookup_device_spec("QNNExecutionProvider", "unknown_device") is None
@@ -289,7 +289,7 @@ def test_lookup_device_spec_empty_defaults() -> None:
 
     CUDA is intentionally omitted — dropped from EP_DEVICE_SPECS in v1.
     """
-    from winml.modelkit.session import lookup_device_spec
+    from winml.modelkit.session.ep_device import lookup_device_spec
 
     for ep, device in [
         ("DmlExecutionProvider", "gpu"),
@@ -305,28 +305,28 @@ def test_lookup_device_spec_empty_defaults() -> None:
 
 def test_default_device_for_ep_qnn() -> None:
     """default_device_for_ep returns 'npu' for QNN (first variant in catalog)."""
-    from winml.modelkit.session import default_device_for_ep
+    from winml.modelkit.session.ep_device import default_device_for_ep
 
     assert default_device_for_ep("QNNExecutionProvider") == "npu"
 
 
 def test_default_device_for_ep_dml() -> None:
     """default_device_for_ep returns 'gpu' for DML (single variant)."""
-    from winml.modelkit.session import default_device_for_ep
+    from winml.modelkit.session.ep_device import default_device_for_ep
 
     assert default_device_for_ep("DmlExecutionProvider") == "gpu"
 
 
 def test_default_device_for_ep_cpu() -> None:
     """default_device_for_ep returns 'cpu' for CPU EP."""
-    from winml.modelkit.session import default_device_for_ep
+    from winml.modelkit.session.ep_device import default_device_for_ep
 
     assert default_device_for_ep("CPUExecutionProvider") == "cpu"
 
 
 def test_default_device_for_ep_unknown_returns_none() -> None:
     """default_device_for_ep returns None for unknown EP."""
-    from winml.modelkit.session import default_device_for_ep
+    from winml.modelkit.session.ep_device import default_device_for_ep
 
     assert default_device_for_ep("UnknownExecutionProvider") is None
 
@@ -579,7 +579,7 @@ def test_ep_device_spec_is_frozen() -> None:
     """EPDeviceSpec is frozen — mutation raises FrozenInstanceError."""
     from dataclasses import FrozenInstanceError
 
-    from winml.modelkit.session import EPDeviceSpec
+    from winml.modelkit.session.ep_device import EPDeviceSpec
 
     spec = EPDeviceSpec(ep="QNNExecutionProvider", device="npu")
     with pytest.raises(FrozenInstanceError):
@@ -588,7 +588,7 @@ def test_ep_device_spec_is_frozen() -> None:
 
 def test_ep_device_spec_default_factory_is_fresh() -> None:
     """Each EPDeviceSpec with no options gets a new empty dict (not shared)."""
-    from winml.modelkit.session import EPDeviceSpec
+    from winml.modelkit.session.ep_device import EPDeviceSpec
 
     s1 = EPDeviceSpec(ep="DmlExecutionProvider", device="gpu")
     s2 = EPDeviceSpec(ep="CUDAExecutionProvider", device="gpu")
@@ -893,7 +893,7 @@ def test_default_ep_for_device_composes_l1_and_l2_filters() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-13: _ep_short_or_none — dedup driver for build.py + precision.py
+# T-13: ep_short_or_none — dedup driver for build.py + precision.py
 # ---------------------------------------------------------------------------
 
 
@@ -911,13 +911,14 @@ def test_valid_eps_matches_known_short_names() -> None:
     (``EP_DEVICE_SPECS`` → ``VALID_EPS``) is the single source of truth;
     ``_SHORT_TO_FULL`` only contains names the catalog also recognizes.
     """
-    from winml.modelkit.session import VALID_EPS, known_ep_short_names
+    from winml.modelkit.session import VALID_EPS
+    from winml.modelkit.session.ep_device import known_ep_short_names
 
     assert known_ep_short_names() == VALID_EPS
 
 
 class TestEpShortOrNone:
-    """Pin the ``_ep_short_or_none`` contract.
+    """Pin the ``ep_short_or_none`` contract.
 
     Both ``config/build.py`` and ``config/precision.py`` carried the same
     expression ``short_ep_name(canonical) if canonical is not None else None``
@@ -927,10 +928,10 @@ class TestEpShortOrNone:
 
     def test_returns_short_name_for_non_cpu(self) -> None:
         """A non-CPU full EP name maps to its short form."""
-        from winml.modelkit.session import _ep_short_or_none
+        from winml.modelkit.session import ep_short_or_none
 
-        assert _ep_short_or_none("QNNExecutionProvider") == "qnn"
-        assert _ep_short_or_none("OpenVINOExecutionProvider") == "openvino"
+        assert ep_short_or_none("QNNExecutionProvider") == "qnn"
+        assert ep_short_or_none("OpenVINOExecutionProvider") == "openvino"
 
     def test_returns_none_for_cpu_execution_provider(self) -> None:
         """``CPUExecutionProvider`` collapses to ``None``.
@@ -939,6 +940,6 @@ class TestEpShortOrNone:
         collapse, a CPU-only build would emit a non-None compile stage
         where the design contract says "no compile stage for CPU".
         """
-        from winml.modelkit.session import _ep_short_or_none
+        from winml.modelkit.session import ep_short_or_none
 
-        assert _ep_short_or_none("CPUExecutionProvider") is None
+        assert ep_short_or_none("CPUExecutionProvider") is None

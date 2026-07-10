@@ -234,7 +234,7 @@ def short_ep_name(full: str) -> str:
     return full.removesuffix("ExecutionProvider").lower()
 
 
-def _ep_short_or_none(ep_full: str) -> str | None:
+def ep_short_or_none(ep_full: str) -> str | None:
     """Map a full EP name to its short form, collapsing ``"cpu"`` to ``None``.
 
     ``CPUExecutionProvider`` has no compile step, so callers that wire
