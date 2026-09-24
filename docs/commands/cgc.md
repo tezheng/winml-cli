@@ -54,7 +54,7 @@ Shared by both subcommands:
 | `--adapter` | `-a` | string | `""` | The adapter to ask, by description substring (case-insensitive) or by index. A number that is not an index is tried as a substring, so `-a 5060` names an RTX 5060. Without it, every enumerated adapter is asked. Required by `--dump`. |
 | `--dump` | | flag | `false` | Write a dump under `./patterns`. The files depend on the response: text, bytecode, empty, or unsupported; see [Dump](#dump). Needs `-a`. |
 | `--overwrite/--no-overwrite` | | flag | `false` | Replace an existing dump directory. |
-| `--open` | | flag or path | — | Open the [pattern atlas](#browsing-a-dump) in a browser. With `--dump`, show this run's dump when available. Given a `patterns.json`, show that file. With neither a file nor `--dump`, open an empty atlas. Without `--dump`, no driver is queried, so neither a redist nor a GPU is needed. |
+| `--open` | | flag or path | — | Open the [pattern atlas](#browsing-a-dump) in a browser. With `--dump`, show this run's dump when available. Without `--dump`, given a `patterns.json`, show that file. With neither a file nor `--dump`, open an empty atlas. Without `--dump`, no driver is queried, so neither a redist nor a GPU is needed. |
 
 ## Usage scenarios
 
@@ -473,10 +473,11 @@ winml cgc patterns --open patterns.json   # show a dump taken earlier
 winml cgc patterns --open                 # open an empty page; no driver query
 ```
 
-Without `--dump`, `--open` bypasses adapter and redist selection. Use the file form
-without `--dump`: when `--dump` is present, the viewer uses this run's output rather
-than any filename passed to `--open`. If no `patterns.json` was written (bytecode,
-empty declaration, or unsupported adapter), the CLI warns and opens an empty atlas.
+Without `--dump`, `--open` bypasses adapter and redist selection. The file form is
+only for that case: `--dump` together with a filename is a usage error (exit 2), since
+there would be two dumps to show. With `--dump` and no filename, the viewer shows what
+that run wrote; if it wrote no `patterns.json` (bytecode, empty declaration, or
+unsupported adapter), the CLI warns and opens an empty atlas.
 
 An absent, unreadable, non-JSON, or wrong-format file is a usage error (exit 2). The
 CLI checks the format tag and metadata object; the browser validates the pattern
@@ -511,6 +512,12 @@ counts of declarations, not a compilation or execution test.
 
 Beware `apply_native_constraint "cgc_is_any_of"`, which is an op-family whitelist and
 not a rule multiplier at all. A substring search for `any_of` conflates the two.
+
+The dialect allows `any_of` only at the top level of a pattern -- never inside a
+branch -- so a pattern's rules are the cross product of its `any_of` groups: each one
+multiplies the count by its number of `all_of` branches. Comments and quoted strings are excluded
+from all of this, so a brace, a declaration or an `any_of` inside one counts for
+nothing.
 
 ## Finding the redist
 
@@ -653,7 +660,7 @@ Use separate invocations to compare redists.
 |---|---|
 | 0 | the CLI completed: includes an unsupported adapter, an empty declaration, no adapters found, `adapters` with support unknown, help, or a viewer launch request |
 | 1 | a live query could not complete, a dump was refused or could not be written, or the installed atlas asset is missing; an `adapters` listing through an unusable auto-discovered redist instead warns, shows `?`, and exits 0 |
-| 2 | bad arguments: an unknown flag, `--dump` without `-a`, an unmatched selector after redist resolution, or a file rejected by `--open` validation |
+| 2 | bad arguments: an unknown flag, `--dump` without `-a`, an unmatched selector after redist resolution, `--dump` with an `--open` filename, or a file rejected by `--open` validation |
 
 ## When something looks wrong
 

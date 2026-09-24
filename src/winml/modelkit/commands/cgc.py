@@ -43,7 +43,6 @@ import sys
 import sysconfig
 import tempfile
 import uuid
-import webbrowser
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -88,7 +87,8 @@ def guid(text: str) -> GUID:
 def vcall(this: ctypes.c_void_p, index: int, restype: Any, *argtypes: Any) -> Callable[..., Any]:
     """Bind vtable slot *index* of COM pointer *this*.
 
-    Replaces a comtypes dependency with six lines.
+    A ctypes prototype built from a slot index calls that slot of whatever interface
+    pointer it is given first, so no comtypes dependency is needed.
 
     Args:
         this: The COM interface pointer.
@@ -99,10 +99,7 @@ def vcall(this: ctypes.c_void_p, index: int, restype: Any, *argtypes: Any) -> Ca
     Returns:
         A callable that invokes the method, passing ``this`` automatically.
     """
-    vtbl = ctypes.cast(this, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
-    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
-    fn = proto(vtbl[index])
-
+    fn = ctypes.WINFUNCTYPE(restype, *argtypes)(index, f"slot{index}")
     return lambda *args: fn(this, *args)
 
 
@@ -274,52 +271,57 @@ def list_adapters() -> list[Adapter]:
         ctypes.POINTER(ctypes.c_void_p),
     )
 
+    # Every call from here on can fail part-way; whatever it acquired is released then.
     alist = ctypes.c_void_p()
-    hr(
-        "CreateAdapterList(GENERIC_ML)",
-        create_list(
-            1,
-            ctypes.byref(ATTR_GENERIC_ML),
-            ctypes.byref(IID_IDXCoreAdapterList),
-            ctypes.byref(alist),
-        ),
-    )
-    if vcall(alist, 4, ctypes.c_uint32)() == 0:
-        release(alist)
-        alist = ctypes.c_void_p()
-        hr(
-            "CreateAdapterList(CORE_COMPUTE)",
-            create_list(
-                1,
-                ctypes.byref(ATTR_CORE_COMPUTE),
-                ctypes.byref(IID_IDXCoreAdapterList),
-                ctypes.byref(alist),
-            ),
-        )
-
-    prefs = (ctypes.c_uint32 * 2)(PREF_HARDWARE, PREF_HIGH_PERFORMANCE)
-    vcall(alist, 7, ctypes.c_long, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))(2, prefs)
-
-    count = vcall(alist, 4, ctypes.c_uint32)()
-    get_adapter = vcall(
-        alist,
-        3,
-        ctypes.c_long,
-        ctypes.c_uint32,
-        ctypes.POINTER(GUID),
-        ctypes.POINTER(ctypes.c_void_p),
-    )
     adapters: list[Adapter] = []
-    for i in range(count):
-        ad = ctypes.c_void_p()
-        hr("GetAdapter", get_adapter(i, ctypes.byref(IID_IDXCoreAdapter), ctypes.byref(ad)))
-        props = read_adapter_props(ad)
-        props["index"] = i
-        props["ptr"] = ad
-        props["mlir"], props["ir_version"] = None, 0  # set by probe_mlir_support
-        adapters.append(props)
-    release(alist)
-    release(factory)
+    try:
+        # The adapters that advertise generic ML, or the core-compute ones when none do.
+        count = 0
+        for label, attribute in (
+            ("GENERIC_ML", ATTR_GENERIC_ML),
+            ("CORE_COMPUTE", ATTR_CORE_COMPUTE),
+        ):
+            # Unbound before it is released, so the finally cannot release it twice.
+            stale, alist = alist, ctypes.c_void_p()
+            release(stale)
+            hr(
+                f"CreateAdapterList({label})",
+                create_list(
+                    1,
+                    ctypes.byref(attribute),
+                    ctypes.byref(IID_IDXCoreAdapterList),
+                    ctypes.byref(alist),
+                ),
+            )
+            count = vcall(alist, 4, ctypes.c_uint32)()
+            if count:
+                break
+
+        prefs = (ctypes.c_uint32 * 2)(PREF_HARDWARE, PREF_HIGH_PERFORMANCE)
+        sort = vcall(alist, 7, ctypes.c_long, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))
+        sort(2, prefs)
+        get_adapter = vcall(
+            alist,
+            3,
+            ctypes.c_long,
+            ctypes.c_uint32,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        for i in range(count):
+            ad = ctypes.c_void_p()
+            hr("GetAdapter", get_adapter(i, ctypes.byref(IID_IDXCoreAdapter), ctypes.byref(ad)))
+            # Listed before it is read, so a failed read is released with the rest.
+            # mlir and ir_version are set by probe_mlir_support.
+            record: Adapter = {"index": i, "ptr": ad, "mlir": None, "ir_version": 0}
+            adapters.append(record)
+            record.update(read_adapter_props(ad))
+    except BaseException:
+        close_adapters(adapters)
+        raise
+    finally:
+        release(alist)
+        release(factory)
     return adapters
 
 
@@ -675,7 +677,9 @@ MLIR_EXCHANGE_SUBGRAPH_DECLARATION = 0
 # include/utilities/MlirInterfaceGuids.h:51 -- the one DXML-private constant here.
 GUID_SUBGRAPH_DECLARATION_REQUEST = guid("EB53032A-1116-4E71-8309-54347C1E5A26")
 
-CGC_MAX_IR_VERSION = (0, 7, 0, 0)  # cmake/version.cmake CGC_VERSION; an upper bound
+#: cmake/version.cmake CGC_VERSION 0.7.0.0, an upper bound, packed as a
+#: D3D12_VERSION_NUMBER: four 16-bit words, high first.
+CGC_MAX_IR_VERSION = 0x0000_0007_0000_0000
 
 
 class FeatureDataMLIRComputeGraphVersion(ctypes.Structure):
@@ -721,26 +725,6 @@ class FeatureDataMLIRInterfaceSupport720(ctypes.Structure):
         ("NumMlirInterfaces", ctypes.c_uint32),
         ("pMlirInterfacesRequested", ctypes.POINTER(GUID)),
         ("pMlirInterfacesSupported", ctypes.POINTER(ctypes.wintypes.BOOL)),
-    )
-
-
-def make_version_number(major: int, minor: int, build: int, rev: int) -> int:
-    """Pack four 16-bit parts into a ``D3D12_VERSION_NUMBER``.
-
-    Args:
-        major: High word.
-        minor: Second word.
-        build: Third word.
-        rev: Low word.
-
-    Returns:
-        The packed 64-bit value.
-    """
-    return (
-        ((major & 0xFFFF) << 48)
-        | ((minor & 0xFFFF) << 32)
-        | ((build & 0xFFFF) << 16)
-        | (rev & 0xFFFF)
     )
 
 
@@ -879,7 +863,7 @@ def supports_exchange(device: ctypes.c_void_p, sdk_version: int) -> tuple[bool, 
     """
     cfs = check_feature_support(device)
     if sdk_version >= 721:
-        data = FeatureDataMLIRComputeGraphVersion(make_version_number(*CGC_MAX_IR_VERSION))
+        data = FeatureDataMLIRComputeGraphVersion(CGC_MAX_IR_VERSION)
         rc = cfs(FEATURE_MLIR_70, ctypes.byref(data), ctypes.sizeof(data))
         # 70 is answered by the runtime, not the driver: WARP and Intel both return
         # S_OK here with HighestVersion == 0. The value is the answer.
@@ -1014,18 +998,6 @@ def normalize_text_payload(data: bytes) -> bytes:
     return _LINE_BREAK_RE.sub(b"\n", data.rstrip(b"\x00"))
 
 
-def is_mlir_bytecode(data: bytes) -> bool:
-    """Report whether *data* is MLIR bytecode rather than text.
-
-    Args:
-        data: The payload.
-
-    Returns:
-        True when it carries the bytecode magic (utilities/MlirEncoding.h).
-    """
-    return data.startswith(b"ML\xefR")
-
-
 # ------------------------------------------------------------- counting patterns
 # A pattern is one cgc_pattern.pattern declaration. A rule is one flat match
 # alternative after any_of expansion: an `any_of { all_of {..} all_of {..} }` block
@@ -1038,7 +1010,6 @@ PATTERN_DECL_RE = re.compile(rb"cgc_pattern\.pattern\s+@([A-Za-z0-9_.]+)")
 ANY_OF_RE = re.compile(rb"(?<![A-Za-z_])any_of\s*\{")
 #: A brace, or an ``all_of`` keyword together with the brace that opens its block.
 BRACE_TOKEN_RE = re.compile(rb"(?<![A-Za-z_])all_of\s*\{|[{}]")
-COMMENT_RE = re.compile(rb"//[^\n]*")
 #: A double-quoted string, or a comment. The string alternative comes first so that a
 #: "//" inside one -- a URL, a path, a loc() reference -- is not read as a comment,
 #: which would blank the rest of that line, closing brace included.
@@ -1080,66 +1051,64 @@ def _classify(body: bytes) -> str:
     return "rewrite"
 
 
-def _balanced(text: bytes, open_brace: int) -> int:
-    """Find the ``}`` closing the ``{`` at *open_brace*.
+def _block(structure: bytes, open_brace: int) -> tuple[int, int]:
+    """Walk the block that opens at *open_brace*.
 
     Args:
-        text: The haystack.
+        structure: The structure view from :func:`_blank_views`.
         open_brace: Index of the opening brace.
 
     Returns:
-        Index of the matching close brace, or the last index when unbalanced.
+        ``(close, all_of)``: the index of the matching close brace -- the last index
+        when unbalanced -- and how many ``all_of`` blocks sit directly inside it.
     """
-    depth = 0
-    for token in BRACE_TOKEN_RE.finditer(text, open_brace):
-        depth += -1 if token.group() == b"}" else 1
-        if depth == 0:
-            return token.start()
-    return len(text) - 1
-
-
-def _any_of_branches(body: bytes, open_brace: int) -> int:
-    """Count ``all_of`` branches directly inside an ``any_of`` block.
-
-    Args:
-        body: The pattern body.
-        open_brace: Index of the ``any_of`` block's opening brace.
-
-    Returns:
-        The branch count, at least 1.
-    """
-    depth = branches = 0
-    for token in BRACE_TOKEN_RE.finditer(body, open_brace):
+    depth = all_of = 0
+    for token in BRACE_TOKEN_RE.finditer(structure, open_brace):
         if token.group() == b"}":
             depth -= 1
             if depth == 0:
-                break
+                return token.start(), all_of
         else:
             depth += 1
             if depth == 2 and token.group() != b"{":  # an all_of block
-                branches += 1
-    return branches or 1
+                all_of += 1
+    return len(structure) - 1, all_of
 
 
-def _blank_comments(data: bytes) -> bytes:
-    """Replace every ``//`` comment outside a string with spaces of the same length.
+def _blank_views(data: bytes) -> tuple[bytes, bytes]:
+    """Return the payload as two views, both the same length as *data*.
 
-    Deleting comments would shift every offset after them. Blanking keeps offsets
-    valid, so a span found here also slices the original bytes -- comments intact,
-    for display -- and a brace inside a comment can no longer unbalance the match.
+    Deleting anything would shift every offset after it, so both views blank in
+    place: a span found in either one also slices the original bytes, comments and
+    strings intact, for display.
+
+    The *values* view blanks comments only. A driver names what a pattern does inside
+    strings -- ``apply_native_rewrite "cgc_mark_pattern_cluster_op"``, the kernel in
+    ``jitFunction = #cgc.string<"Name">`` -- so those have to stay readable, while a
+    commented-out one must not count.
+
+    The *structure* view blanks the inside of strings as well. Braces, declarations
+    and ``any_of`` keywords are structure; quoted ones are text a driver wrote. Left
+    visible, a quoted ``}`` ends a pattern early, a quoted declaration becomes a
+    record of its own, and a quoted ``any_of`` multiplies the rule count.
 
     Args:
         data: The MLIR text payload.
 
     Returns:
-        The same bytes with comment text replaced by spaces.
+        ``(values, structure)``.
     """
-    return STRING_OR_COMMENT_RE.sub(
-        lambda m: b" " * len(m.group()) if m.group().startswith(b"//") else m.group(), data
-    )
+    values, structure = bytearray(data), bytearray(data)
+    for m in STRING_OR_COMMENT_RE.finditer(data):
+        start, end = m.span()
+        if m.group().startswith(b"//"):
+            values[start:end] = structure[start:end] = b" " * (end - start)
+        else:  # the quotes stay, so the string is still delimited
+            structure[start + 1 : end - 1] = b" " * (end - start - 2)
+    return bytes(values), bytes(structure)
 
 
-def _pattern_spans(text: bytes) -> Iterator[tuple[re.Match[bytes], int, int]]:
+def _pattern_spans(structure: bytes) -> Iterator[tuple[re.Match[bytes], int, int]]:
     """Yield each declaration that has a body, with that body's bounds.
 
     Some patterns declare an ``attributes { depends = .. }`` block between the name and
@@ -1147,24 +1116,25 @@ def _pattern_spans(text: bytes) -> Iterator[tuple[re.Match[bytes], int, int]]:
     would be filed under rewrite.
 
     Args:
-        text: Comment-blanked MLIR text.
+        structure: The structure view from :func:`_blank_views`. Given the values
+            view instead, a quoted brace or declaration would count as structure.
 
     Yields:
         ``(declaration match, open brace, close brace)``.
     """
-    declarations = list(PATTERN_DECL_RE.finditer(text))
+    declarations = list(PATTERN_DECL_RE.finditer(structure))
     for index, m in enumerate(declarations):
         # The body has to start before the next declaration does. Without that bound a
         # declaration with no body of its own adopts the next one's, and both are then
         # reported, the first carrying two declarations' text.
-        limit = declarations[index + 1].start() if index + 1 < len(declarations) else len(text)
+        limit = declarations[index + 1].start() if index + 1 < len(declarations) else len(structure)
         try:
-            i = text.index(b"{", m.end(), limit)
-            if ATTRIBUTES_TAIL_RE.search(text[m.end() : i]):
-                i = text.index(b"{", _balanced(text, i) + 1, limit)
+            i = structure.index(b"{", m.end(), limit)
+            if ATTRIBUTES_TAIL_RE.search(structure[m.end() : i]):
+                i = structure.index(b"{", _block(structure, i)[0] + 1, limit)
         except ValueError:
             continue  # a declaration with no body: nothing to read
-        yield m, i, _balanced(text, i)
+        yield m, i, _block(structure, i)[0]
 
 
 def pattern_groups(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1248,18 +1218,21 @@ def split_patterns(data: bytes) -> list[dict[str, Any]]:
         ``short_name``, ``kind``, ``benefit``, ``rules``, ``source``, ``kernel``,
         ``lines`` and ``mlir``.
     """
-    text = _blank_comments(data)
+    text, structure = _blank_views(data)
     sections = [
         (m.start(), m.group(1).decode("utf-8", "replace")) for m in SECTION_RE.finditer(data)
     ]
     records: list[dict[str, Any]] = []
-    for index, (m, open_brace, close_brace) in enumerate(_pattern_spans(text), 1):
+    for index, (m, open_brace, close_brace) in enumerate(_pattern_spans(structure), 1):
         head, body = text[m.end() : open_brace], text[open_brace:close_brace]
         name = m.group(1).decode("ascii", "replace")
         benefit = BENEFIT_RE.search(head)
+        # The dialect allows any_of only at the top level of a pattern, never inside a
+        # branch (cgc_pattern_ops.td), so the rules are the cross product of its any_of
+        # groups: each multiplies the count by its number of all_of branches.
         rules = 1
-        for a in ANY_OF_RE.finditer(body):
-            rules *= _any_of_branches(body, a.end() - 1)
+        for a in ANY_OF_RE.finditer(structure, open_brace, close_brace):
+            rules *= _block(structure, a.end() - 1)[1] or 1
         kernel = KERNEL_RE.search(body)
         raw = data[m.start() : close_brace + 1]
         records.append(
@@ -1326,71 +1299,28 @@ def patterns_document(
     }
 
 
-def write_patterns_json(path: Path, document: dict[str, Any]) -> None:
-    """Write ``patterns.json``.
-
-    Args:
-        path: The file to write.
-        document: The document from :func:`patterns_document`.
-    """
-    path.write_text(
-        json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
-    )
+#: The ATTRIBUTES column: the DXCore attributes an adapter can advertise.
+ATTRIBUTE_FLAGS = (("ML", "generic_ml"), ("CC", "core_compute"), ("GFX", "d3d12_graphics"))
 
 
-def adapter_type(a: Adapter) -> str:
-    """Classify an adapter for the TYPE column.
-
-    Args:
-        a: The adapter record.
-
-    Returns:
-        ``hardware``, ``integrated`` or ``software``.
-    """
-    if not a["is_hardware"]:
-        return "software"
-    return "integrated" if a["is_integrated"] else "hardware"
-
-
-def adapter_attrs(a: Adapter) -> str:
-    """Render the DXCore attributes an adapter advertises.
-
-    Args:
-        a: The adapter record.
-
-    Returns:
-        A space-separated subset of ``ML CC GFX``, or ``-``.
-    """
-    return (
-        " ".join(
-            k
-            for k, v in (
-                ("ML", a["generic_ml"]),
-                ("CC", a["core_compute"]),
-                ("GFX", a["d3d12_graphics"]),
-            )
-            if v
-        )
-        or "-"
-    )
-
-
-def print_adapters(adapters: list[Adapter], stream: Any = None) -> None:
+def print_adapters(adapters: list[Adapter]) -> None:
     """Print the adapter table.
 
     Args:
         adapters: Every adapter found.
-        stream: Destination, defaulting to stdout.
     """
-    out = sys.stdout if stream is None else stream
-    hdr = f"{'IDX':<3} {'ADAPTER':<30} {'DRIVER':<17} {'TYPE':<10} {'ATTRIBUTES':<11} MLIR"
-    out.write(hdr + "\n")
-    out.write("-" * len(hdr) + "\n")
+    header = f"{'IDX':<3} {'ADAPTER':<30} {'DRIVER':<17} {'TYPE':<10} {'ATTRIBUTES':<11} MLIR"
+    click.echo(header)
+    click.echo("-" * len(header))
     for a in adapters:
+        kind = "integrated" if a["is_integrated"] else "hardware"
+        if not a["is_hardware"]:
+            kind = "software"  # even if it also calls itself integrated
+        attributes = " ".join(name for name, key in ATTRIBUTE_FLAGS if a[key]) or "-"
         mark = {True: "yes", False: "no", None: "?"}[a["mlir"]]
-        out.write(
+        click.echo(
             f"{a['index']:<3} {a['description'][:30]:<30} {a['driver_version']:<17} "
-            f"{adapter_type(a):<10} {adapter_attrs(a):<11} {mark}\n"
+            f"{kind:<10} {attributes:<11} {mark}"
         )
 
 
@@ -1446,20 +1376,6 @@ def write_metadata(
 DUMP_FILES = ("patterns.mlir", "patterns.mlirbc", "patterns.json", "metadata.txt")
 
 
-def clear_dump(dest: Path) -> None:
-    """Remove a previous dump's files from *dest*.
-
-    ``--overwrite`` REPLACES a dump. Without this, re-dumping a driver that now answers
-    in text leaves the previous run's ``patterns.mlirbc`` beside the new
-    ``patterns.mlir``, and the directory describes two different dumps at once.
-
-    Args:
-        dest: The dump directory.
-    """
-    for name in DUMP_FILES:
-        (dest / name).unlink(missing_ok=True)
-
-
 def dump_dir(adapter: Adapter) -> Path:
     """Return the directory a dump for *adapter* is filed under.
 
@@ -1471,25 +1387,8 @@ def dump_dir(adapter: Adapter) -> Path:
     """
     # Both parts fall back to a placeholder: an empty one would be joined away, and
     # the dump would lose a level of the layout that keeps captures apart.
-    version = str(adapter["driver_version"]) or "unknown-version"
+    version = adapter["driver_version"] or "unknown-version"
     return Path("patterns") / adapter_slug(adapter["description"]) / version
-
-
-def redist_line(redist: Path | None, sdk: int | None) -> str:
-    """Render the ``redist:`` line reported on every run.
-
-    Which core answered decides what the rest of the output means.
-
-    Args:
-        redist: The resolved redist directory, or None.
-        sdk: Its SDK version, or None.
-
-    Returns:
-        The line.
-    """
-    if redist is None:
-        return "redist: none -- MLIR support unknown (run with -v to see where cgc looked)"
-    return f"redist: {redist} (SDK {sdk}, {host_machine()})"
 
 
 #: The viewer for a patterns.json dump, shipped as package data beside this module.
@@ -1534,12 +1433,14 @@ def read_patterns_json(document: Path) -> dict[str, Any]:
         click.UsageError: When it is missing, unreadable, not JSON, or not a
             :data:`PATTERNS_JSON_FORMAT` document.
     """
-    if not document.is_file():
-        raise click.UsageError(f"--open: {document} is not a file")
     try:
-        raw = json.loads(document.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise click.UsageError(f"--open: {document} could not be read as JSON: {e}") from e
+        if not document.is_file():
+            raise click.UsageError(f"--open: {document} is not a file")
+        raw = json.loads(document.read_text(encoding="utf-8-sig"))  # a BOM is fine
+    except json.JSONDecodeError as e:
+        raise click.UsageError(f"--open: {document} is not JSON: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        raise click.UsageError(f"--open: {document} could not be read: {e}") from e
     # Anything that is not a mapping fails the format check below, and "meta" has to
     # be one too: open_atlas labels the page through it.
     data: dict[str, Any] = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
@@ -1551,7 +1452,7 @@ def read_patterns_json(document: Path) -> dict[str, Any]:
     return data
 
 
-def open_atlas(document: Path | None) -> None:
+def open_atlas(document: Path | None) -> Path:
     """Open the pattern atlas in a browser, showing *document* when there is one.
 
     The page reads a file the viewer picks, and a page opened from disk may not read
@@ -1560,9 +1461,15 @@ def open_atlas(document: Path | None) -> None:
     Args:
         document: A ``patterns.json`` to show, or None to open the empty page.
 
+    Returns:
+        The page that was opened.
+
     Raises:
         click.UsageError: When *document* is not a patterns.json.
     """
+    import hashlib  # only --open needs these, so no other run pays to load them
+    import webbrowser
+
     page = atlas_page()
     if document is not None:
         data = read_patterns_json(document)
@@ -1573,14 +1480,19 @@ def open_atlas(document: Path | None) -> None:
             '<script type="application/json" id="seed"></script>',
             f'<script type="application/json" id="seed">{payload}</script>',
         )
-        # Named after the dump, not a fresh temp file per run: the browser reads the
-        # page after this process is gone, so it cannot be cleaned up on the way out,
-        # and two dumps opened together must not land on the same name.
-        stem = adapter_slug(f"{document.parent.parent.name}-{document.parent.name}")
-        page = Path(tempfile.gettempdir()) / f"winml-{stem}-{ATLAS_PAGE}"
+        # The browser reads the page after this process is gone, so it cannot be
+        # cleaned up on the way out. Instead it is named after the dump: opening one
+        # dump again reuses its page however the path was typed, and a hash of the
+        # whole path keeps two captures of one driver from overwriting each other.
+        # os.fsencode, because a Windows path may hold a lone surrogate.
+        resolved = document.resolve()
+        stem = adapter_slug(f"{resolved.parent.parent.name}-{resolved.parent.name}")
+        digest = hashlib.sha256(os.fsencode(resolved)).hexdigest()[:8]
+        page = Path(tempfile.gettempdir()) / f"winml-{stem}-{digest}-{ATLAS_PAGE}"
         page.write_text(seeded, encoding="utf-8", newline="\n")
     click.echo(f"opening {page}")
     webbrowser.open(page.as_uri())
+    return page
 
 
 @dataclass(kw_only=True)
@@ -1605,8 +1517,8 @@ class Options:
     open_atlas: str | None = None
 
 
-# TODO(tests): nothing drives report_patterns end to end: the dumped, unsupported
-# and empty branches, the patterns.json write, --overwrite, and the refusal.
+# TODO(tests): the unsupported and empty branches, and the refusal of an existing
+# dump, are untested; TestDumpWrites covers the rest.
 def report_patterns(opts: Options, adapter: Adapter, redist: Path, sdk: int) -> Path | None:
     """Report, and optionally dump, what one adapter's driver declares.
 
@@ -1627,9 +1539,14 @@ def report_patterns(opts: Options, adapter: Adapter, redist: Path, sdk: int) -> 
 
     desc = adapter["description"]
     status, encoding, received, data, doc = "unsupported", "none", None, b"", None
+    # The answer is collected and printed only once any dump is written. Writing to
+    # stdout can fail part-way -- a reader that stops early, such as `| head` -- and
+    # by then --overwrite has cleared the previous dump, so a failed print must not
+    # cost the new one any of its files.
+    report: list[str] = []
     device = probe_mlir_support(adapter, redist, sdk, verbose=opts.verbose)
     if device is None:
-        click.echo(f"{desc}: driver does not implement MLIR programs")
+        report.append(f"{desc}: driver does not implement MLIR programs")
     else:
         try:
             payload, rc = mlir_exchange(device, sdk, adapter["ir_version"])
@@ -1641,47 +1558,57 @@ def report_patterns(opts: Options, adapter: Adapter, redist: Path, sdk: int) -> 
                 f"MLIR exchange failed after the driver claimed support: {hrs(rc)}"
             )
         received = len(payload)
-        bytecode = is_mlir_bytecode(payload)
+        bytecode = payload.startswith(b"ML\xefR")  # the MLIR bytecode magic, MlirEncoding.h
         # Normalised once, here, so a payload that is only its terminator is empty.
         data = payload if bytecode else normalize_text_payload(payload)
         if not data:
             status = "empty"
-            click.echo(f"{desc}: driver returned an empty subgraph declaration")
+            report.append(f"{desc}: driver returned an empty subgraph declaration")
         elif bytecode:
             status, encoding = "dumped", "bytecode"
-            click.echo(
+            report.append(
                 f"{desc}: {len(data)} bytes of MLIR bytecode; rendering it "
                 f"as text needs cgc-opt, so cgc cannot count it"
             )
         else:
             status, encoding = "dumped", "text"
             doc = patterns_document(data, adapter, sdk, redist)
-            click.echo(
+            report.append(
                 f"{desc}: {doc['summary']['patterns']} patterns / {doc['summary']['rules']} rules"
             )
             if opts.verbose:
-                click.echo("")
-                for line in format_pattern_listing(doc["patterns"]):
-                    click.echo(line)
+                report += ["", *format_pattern_listing(doc["patterns"])]
 
-    if not opts.dump:
-        return None
-    dest.mkdir(parents=True, exist_ok=True)
-    clear_dump(dest)
-    if status == "dumped":
-        name = "patterns.mlir" if encoding == "text" else "patterns.mlirbc"
-        (dest / name).write_bytes(data)
-        click.echo(f"wrote {dest / name} ({len(data)} bytes)")
-    counts = None
-    if doc is not None:
-        # Bytecode cannot be split without the real MLIR parser, so only a text dump
-        # gets the structured copy.
-        write_patterns_json(dest / "patterns.json", doc)
-        click.echo(f"wrote {dest / 'patterns.json'}")
-        counts = (doc["summary"]["patterns"], doc["summary"]["rules"])
-    write_metadata(dest / "metadata.txt", adapter, status, encoding, sdk, redist, counts, received)
-    click.echo(f"wrote {dest / 'metadata.txt'}")
-    return dest / "patterns.json" if doc is not None else None
+    try:
+        if opts.dump:
+            dest.mkdir(parents=True, exist_ok=True)
+            # --overwrite replaces a dump rather than merging into it: a stale
+            # patterns.mlirbc beside a new patterns.mlir would describe two dumps at once.
+            for stale in DUMP_FILES:
+                (dest / stale).unlink(missing_ok=True)
+            if status == "dumped":
+                name = "patterns.mlir" if encoding == "text" else "patterns.mlirbc"
+                (dest / name).write_bytes(data)
+                report.append(f"wrote {dest / name} ({len(data)} bytes)")
+            counts = None
+            if doc is not None:
+                # Bytecode cannot be split without the real MLIR parser, so only a
+                # text dump gets the structured copy.
+                text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+                (dest / "patterns.json").write_text(text, encoding="utf-8", newline="\n")
+                report.append(f"wrote {dest / 'patterns.json'}")
+                counts = (doc["summary"]["patterns"], doc["summary"]["rules"])
+            write_metadata(
+                dest / "metadata.txt", adapter, status, encoding, sdk, redist, counts, received
+            )
+            report.append(f"wrote {dest / 'metadata.txt'}")
+    except OSError as e:  # a read-only or locked destination, a full disk
+        raise click.ClickException(f"could not write the dump to {dest}: {e}") from e
+    finally:
+        # The driver's answer stands even when its dump could not be written.
+        for line in report:
+            click.echo(line)
+    return dest / "patterns.json" if opts.dump and doc is not None else None
 
 
 # TODO(tests): the Click exceptions raised on these paths are untested as a caller
@@ -1712,7 +1639,10 @@ def resolve_run(opts: Options) -> tuple[Path | None, int | None, tuple[str, Path
     # Which core answered decides what every other line means, so it is always
     # reported. When there is none the line says so, and the MLIR column reads ?
     # rather than no: the question cannot be asked, so it is left unanswered.
-    click.echo(redist_line(redist, sdk))
+    if redist is None:
+        click.echo("redist: none -- MLIR support unknown (run with -v to see where cgc looked)")
+    else:
+        click.echo(f"redist: {redist} (SDK {sdk}, {host_machine()})")
     return redist, sdk, named
 
 
@@ -1818,6 +1748,15 @@ def run_patterns(opts: Options) -> None:
         raise click.ClickException(f"could not ask: {', '.join(unanswered)}")
 
 
+#: --d3d12-dir, shared by both subcommands.
+_d3d12_dir_option = click.option(
+    "--d3d12-dir",
+    default="",
+    metavar="PATH",
+    help="Directory holding D3D12Core.dll ($WINML_D3D12_DIR, $D3D12_DIR).",
+)
+
+
 # A plain Group: the root LazyGroup already instruments `cgc` itself, and an
 # ActionGroup here would instrument the subcommand as well, so every run would count
 # twice where every other command counts once.
@@ -1845,12 +1784,7 @@ def cgc(ctx: click.Context) -> None:
 
 
 @cgc.command("adapters")
-@click.option(
-    "--d3d12-dir",
-    default="",
-    metavar="PATH",
-    help="Directory holding D3D12Core.dll ($WINML_D3D12_DIR, $D3D12_DIR).",
-)
+@_d3d12_dir_option
 @cli_utils.verbosity_options()
 @click.pass_context
 def adapters_cmd(ctx: click.Context, d3d12_dir: str, verbose: int, quiet: bool) -> None:
@@ -1891,12 +1825,7 @@ def adapters_cmd(ctx: click.Context, d3d12_dir: str, verbose: int, quiet: bool) 
     help="The adapter to ask, by description substring or index; --dump needs it. "
     "Without it, every adapter is asked.",
 )
-@click.option(
-    "--d3d12-dir",
-    default="",
-    metavar="PATH",
-    help="Directory holding D3D12Core.dll ($WINML_D3D12_DIR, $D3D12_DIR).",
-)
+@_d3d12_dir_option
 @click.option(
     "--dump",
     is_flag=True,
